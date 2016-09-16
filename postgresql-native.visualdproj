@@ -413,7 +413,9 @@
    <Folder name="org">
     <Folder name="postgresql">
      <Folder name="util">
+      <File path="source\org\postgresql\util\Base64.d" />
       <File path="source\org\postgresql\util\ByteConverter.d" />
+      <File path="source\org\postgresql\util\CanEstimateSize.d" />
       <File path="source\org\postgresql\util\HostSpec.d" />
      </Folder>
     </Folder>
