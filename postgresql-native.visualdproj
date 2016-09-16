@@ -419,6 +419,8 @@
       <File path="source\org\postgresql\util\HostSpec.d" />
       <File path="source\org\postgresql\util\JdbcBlackHole.d" />
       <File path="source\org\postgresql\util\MD5Digest.d" />
+      <File path="source\org\postgresql\util\PGbytea.d" />
+      <File path="source\org\postgresql\util\UnixCrypt.d" />
      </Folder>
     </Folder>
    </Folder>
