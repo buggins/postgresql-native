@@ -18,7 +18,7 @@ module postgresql.params;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
-import std.traits : isFloatingPoint, isIntegral, isSomeChar, isSomeString, OriginalType, Unqual;
+import std.traits : isDynamicArray, isFloatingPoint, isIntegral, isSomeChar, isSomeString, OriginalType, Unqual;
 import std.typecons : Nullable;
 import std.uuid : UUID;
 import std.variant : Variant;
@@ -29,6 +29,11 @@ import postgresql.exception : ClientException;
 import postgresql.types.floats : formatFloat4, formatFloat8;
 import postgresql.types.oids : Oid;
 import postgresql.types.temporal;
+import postgresql.types.bitstring : BitString;
+import postgresql.types.geometric;
+import postgresql.types.network : Inet;
+import postgresql.types.ranges : isRange;
+import postgresql.types.textformat : quoteHstore;
 
 /// Whether `Args` contain a `Variant`, whose copies are `@system`: calls copying them need `@trusted`.
 enum bool hasVariant(Args...) = anySatisfyVariant!Args;
@@ -57,11 +62,17 @@ Encodes `value` for a parameter of type `oid`.
 
 Supported D types: `bool`, integers, floating point, `Decimal`, strings and
 characters, `ubyte[]`, `Date`, `DateTime`, `SysTime`, `TimeOfDay`,
-`Duration`, `Interval`, `UUID`, enums, `Nullable!T` and
-`null` (NULL), and `Variant` holding one of these. Enums with an integer
-base type are sent as their value for numeric parameters and as their
-member name for the others (text, PostgreSQL enum types); other enums as
-their value.
+`Duration`, `Interval`, `UUID`, `Inet`, `BitString`, the geometric types
+(`Point`, `Line`, `LineSegment`, `Box`, `Path`, `Polygon`, `Circle`), enums,
+`Nullable!T` and `null` (NULL), and `Variant` holding one of these; and
+D arrays of them (arrays; nested D arrays for several dimensions),
+`Range!T` (ranges), `string[string]` and `Nullable!string[string]`
+(`hstore`), and other structs (composite values, fields as in struct
+mapping). Enums with an integer base type are sent as their value for
+numeric parameters and as their member name for the others (text,
+PostgreSQL enum types); other enums as their value. Arrays go in binary
+when the parameter is an array of a built-in type whose elements go in
+binary, else as text, as ranges, `hstore` values and composite values do.
 
 Throws: `ClientException` for an integer out of the target type's range or
 an unsupported D type.
@@ -172,6 +183,59 @@ Param encodeParam(T)(T value, uint oid)
         if (oid == Oid.uuid)
             return binary(value.data.idup);
         return text(value.toString());
+    }
+    else static if (is(U == Inet))
+    {
+        if (oid == Oid.inet || oid == Oid.cidr)
+            return binary(Inet(value.address, value.prefix, oid == Oid.cidr).toBinary());
+        return text(value.toString());
+    }
+    else static if (is(U == BitString))
+    {
+        if (oid == Oid.bit || oid == Oid.varbit)
+            return binary(value.toBinary());
+        return text(value.toString());
+    }
+    else static if (isGeometric!U)
+    {
+        if (oid == geometricOidOf!U)
+            return binary(geometricToBinary(value));
+        return text(value.toString());
+    }
+    else static if (isRange!U)
+    {
+        if (value.empty)
+            return text("empty");
+        return text((value.lowerInclusive ? "[" : "(") ~ (value.lowerInfinite ? "" : literalItem(value.lower)) ~ ","
+                ~ (
+                    value.upperInfinite ? "" : literalItem(value.upper)) ~ (value.upperInclusive ? "]" : ")"));
+    }
+    else static if (is(U : V[K], V, K))
+    {
+        // hstore: "key"=>"value", ...
+        static assert(is(K : const(char)[]), "Only maps with string keys (hstore) are supported parameters");
+        string literal;
+        foreach (k, v; value)
+        {
+            literal ~= (literal.length ? ", " : "") ~ quoteHstore(k) ~ "=>";
+            static if (is(V : Nullable!X, X))
+                literal ~= v.isNull ? "NULL" : quoteHstore(textOf(v.get));
+            else
+                literal ~= quoteHstore(textOf(v));
+        }
+        return text(literal);
+    }
+    else static if (isDynamicArray!U)
+        return encodeArray(value, oid);
+    else static if (is(U == struct))
+    {
+        // a composite value: (field,field,...)
+        import postgresql.attributes : mappedFields;
+
+        string literal = "(";
+        static foreach (i, name; mappedFields!U)
+            literal ~= (i ? "," : "") ~ literalItem(__traits(getMember, value, name));
+        return text(literal ~ ")");
     }
     else
         static assert(false, "Unsupported parameter type " ~ T.stringof);
@@ -336,6 +400,144 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
 
 private:
 
+// The text of a value, as the server parses it.
+string textOf(T)(T value)
+{
+    const p = encodeParam(value, Oid.text);
+    return p.isNull ? null : cast(string) p.data;
+}
+
+// A part of an array, range or record literal: quoted, `"` and `\` escaped; empty for NULL in records and
+// ranges (arrays use NULL).
+string literalItem(T)(T value)
+{
+    const p = encodeParam(value, Oid.text);
+    return p.isNull ? "" : quoteHstore(cast(string) p.data);
+}
+
+// An array parameter: binary when the parameter is an array of a built-in type and every element is sent in
+// binary; else array text.
+Param encodeArray(A)(A value, uint oid)
+{
+    import std.traits : isDynamicArray, isSomeString;
+    import postgresql.types.pgtype : builtinType, TypeKind;
+
+    enum bool isValue(X) = !isDynamicArray!X || isSomeString!X || is(X : const(ubyte)[]);
+    int[] lengths;
+    void measure(X)(X items, size_t level)
+    {
+        if (lengths.length <= level)
+            lengths ~= cast(int) items.length;
+        else if (lengths[level] != items.length)
+            throw new ClientException("Multidimensional arrays must have sub-arrays of the same size");
+        static if (!isValue!(typeof(X.init[0])))
+            foreach (item; items)
+                measure(item, level + 1);
+    }
+
+    measure(value, 0);
+    size_t total = 1;
+    foreach (l; lengths)
+        total *= l;
+    if (total == 0)
+        lengths = null;
+
+    const t = builtinType(oid);
+    const element = t !is null && t.kind == TypeKind.array ? t.element : null;
+    if (element !is null && element.kind == TypeKind.base)
+    {
+        // binary: dimensions, NULL flag, element OID, (length, lower bound) per dimension, elements
+        Param[] parts;
+        bool allBinary = true, hasNull;
+        void collect(X)(X items)
+        {
+            foreach (item; items)
+            {
+                static if (isValue!(typeof(X.init[0])))
+                {
+                    const p = encodeParam(item, element.oid);
+                    hasNull = hasNull || p.isNull;
+                    allBinary = allBinary && (p.isNull || p.format == 1);
+                    parts ~= p;
+                }
+                else
+                    collect(item);
+            }
+        }
+
+        collect(value);
+        if (allBinary)
+        {
+            ubyte[] data;
+            void int32(int v)
+            {
+                data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+            }
+
+            int32(cast(int) lengths.length);
+            int32(hasNull ? 1 : 0);
+            int32(cast(int) element.oid);
+            foreach (l; lengths)
+            {
+                int32(l);
+                int32(1);
+            }
+            foreach (p; parts)
+            {
+                if (p.isNull)
+                    int32(-1);
+                else
+                {
+                    int32(cast(int) p.data.length);
+                    data ~= p.data;
+                }
+            }
+            return binary((() @trusted => cast(immutable) data)()); // not referenced elsewhere
+        }
+    }
+    // text: {"a","b"}, NULL for NULL, nested braces for more dimensions
+    const delimiter = element !is null ? element.delimiter : ',';
+    string literal;
+    void write(X)(X items)
+    {
+        literal ~= "{";
+        foreach (i, item; items)
+        {
+            if (i)
+                literal ~= delimiter;
+            static if (isValue!(typeof(X.init[0])))
+            {
+                const p = encodeParam(item, Oid.text);
+                literal ~= p.isNull ? "NULL" : quoteHstore(cast(string) p.data);
+            }
+            else
+                write(item);
+        }
+        literal ~= "}";
+    }
+
+    write(value);
+    return text(literal);
+}
+
+template geometricOidOf(T)
+{
+    static if (is(T == Point))
+        enum geometricOidOf = Oid.point;
+    else static if (is(T == Line))
+        enum geometricOidOf = Oid.line;
+    else static if (is(T == LineSegment))
+        enum geometricOidOf = Oid.lseg;
+    else static if (is(T == Box))
+        enum geometricOidOf = Oid.box;
+    else static if (is(T == Path))
+        enum geometricOidOf = Oid.path;
+    else static if (is(T == Polygon))
+        enum geometricOidOf = Oid.polygon;
+    else
+        enum geometricOidOf = Oid.circle;
+}
+
 bool isNumericOid(uint oid) @safe pure nothrow
 {
     switch (oid)
@@ -408,7 +610,8 @@ Param encodeVariant(Variant value, uint oid) @trusted
         return Param(true);
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime,
-            SysTime, TimeOfDay, Duration, Interval, UUID, char, wchar, dchar))
+            SysTime, TimeOfDay, Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line,
+            LineSegment, Box, Path, Polygon, Circle))
     {
         if (value.type == typeid(T))
             return encodeParam(value.get!T, oid);

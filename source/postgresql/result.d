@@ -14,6 +14,9 @@ import postgresql.connection : Connection;
 import postgresql.exception : ClientException, ProtocolException;
 import postgresql.protocol.messages : MessageBody;
 import postgresql.value : Value;
+import std.typecons : Rebindable;
+
+import postgresql.types.pgtype : PgType;
 
 @safe:
 
@@ -41,6 +44,13 @@ struct ColumnInfo
     int typeModifier;
     /// Format of the values.
     ValueFormat format;
+    /++
+    The data type, when the client knows it: built-in types, and for
+    `Connection.query` the types of the database (enums, composite types,
+    domains, their arrays and ranges, extension types), looked up once per
+    connection. Null for other types (read as text).
+    +/
+    Rebindable!(const(PgType)) type;
 }
 
 /// Parses a RowDescription body.
@@ -127,13 +137,27 @@ struct Row
     static foreach (getter; [
         "getString", "getBool", "getLong", "getInt", "getDouble", "getDecimal", "getBytes",
         "getDate", "getDateTime", "getSysTime", "getMicrosecondsOfSecond", "getTimeOfDay",
-        "getDuration",
-        "getInterval", "getUUID", "getVariant"
+        "getDuration", "getInterval", "getUUID", "getVariant", "getArray", "getRange",
+        "getMultirange", "getRecord", "getInet", "getBitString", "getHstore"
     ])
     {
         mixin("/// Shortcut for `this[index]." ~ getter ~ "()` (see `Value`).\n"
                 ~ "auto " ~ getter ~ "(size_t index) const { return this[index]." ~ getter ~ "(); }\n"
                 ~ "/// ditto\n" ~ "auto " ~ getter ~ "(string name) const { return this[name]." ~ getter ~ "(); }");
+    }
+
+    /++
+    Shortcut for `this[index].get!T()`: the value converted to `T` (see `Value.get`).
+    +/
+    T get(T)(size_t index) const
+    {
+        return this[index].get!T();
+    }
+
+    /// ditto
+    T get(T)(string name) const
+    {
+        return this[name].get!T();
     }
 
     /// The bytes of the value in column `index` as the server sent them; null for NULL.

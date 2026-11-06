@@ -122,6 +122,27 @@ private Exact exact(T)(T value) @trusted
     return Exact(BigInt(cast(ulong) ldexp(cast(double) value, bits - e)), e - bits);
 }
 
+/++
+Reads a float8 as the server writes it (`1.5`, `1e+20`, `NaN`, `-Infinity`),
+correctly rounded.
+
+Throws: `ClientException` if `text` is not a number.
++/
+package double parseFloat8(string text) @trusted
+{
+    import core.stdc.stdlib : strtod;
+    import std.string : toStringz;
+    import postgresql.exception : ClientException;
+
+    // strtod reads the NUL-terminated copy and keeps no pointer to it
+    const z = text.toStringz;
+    immutable(char)* end;
+    const value = strtod(z, &end);
+    if (text.length == 0 || end != z + text.length)
+        throw new ClientException("Invalid number '" ~ text ~ "'");
+    return value;
+}
+
 // Reads a number as C's strtod/strtof do: correctly rounded, subnormals included, out of range = infinity.
 private T parseC(T)(string text) @trusted
 {

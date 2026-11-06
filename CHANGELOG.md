@@ -4,7 +4,25 @@ All notable changes to postgresql-native are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
-## 0.1.0 (unreleased)
+## Unreleased
+
+### Added
+
+- More types (#7): arrays of any element type and dimensions (lower bounds,
+  NULL elements), ranges and multiranges, composite types and records,
+  enums, domains, `inet`/`cidr`, `macaddr`/`macaddr8`, `bit`/`varbit`, the
+  geometric types, `pg_lsn`, `hstore`, `citext`, PostGIS
+  `geometry`/`geography`, decoded from binary with `getString` equal to the
+  server's text; `money`, `xml`, `tsvector`, `tsquery` and the rest stay
+  text. Types of the database are looked up in `pg_type` once per connection
+  (`ColumnInfo.type`, `PgType`, `clearTypeCache`). `Value.get!T` (and
+  `Row.get!T`) converts to any supported D type: D arrays (nested for more
+  dimensions), `Range!T`, structs from composite values, `Inet`,
+  `BitString`, `Point`..., `string[string]`; new getters `getArray`,
+  `getRange`, `getMultirange`, `getRecord`, `getInet`, `getBitString`,
+  `getHstore`. The same types work as parameters and in struct mapping.
+
+## 0.1.0 (2026-11-06)
 
 ### Added
 

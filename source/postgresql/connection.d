@@ -28,6 +28,8 @@ import postgresql.mapping : fieldPositions, hasVariantField, insertSql, mappedFi
 import postgresql.pipeline;
 import postgresql.settings;
 import postgresql.statement;
+import postgresql.types.oids : Oid;
+import postgresql.types.pgtype : PgType;
 
 @safe:
 
@@ -86,6 +88,9 @@ final class Connection : Poolable
     private StatementCache cache; // null when statementCacheSize is 0
     private string[] pendingCloses; // statements to close with the next extended-protocol request
     private ulong statementCounter;
+    private PgType[uint] types; // data types of the database, looked up (see resolveColumns)
+    private bool[uint] missingTypes; // OIDs pg_type didn't know
+    private bool typeQueryPrepared; // the pg_type query statement exists in the session
     private Encryption encryptionUsed; // how the session was encrypted, for cancel requests
     private bool responseDone = true; // ReadyForQuery of the current request was read
     private ServerMessage pendingError; // the first error of the current response
@@ -626,8 +631,6 @@ final class Connection : Poolable
     +/
     private StatementInfo describeStatement(string sql, string name)
     {
-        import postgresql.types.oids : hasBinaryDecoder;
-
         StatementInfo info;
         info.name = name;
         info.sql = sql;
@@ -684,8 +687,7 @@ final class Connection : Poolable
             finishResponse(); // throws the server's error
             throw new ProtocolException("The server reported a failure without an error");
         }
-        foreach (ref c; info.columns)
-            c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
+        resolveColumns([info.columns]);
         return info;
     }
 
@@ -721,7 +723,296 @@ final class Connection : Poolable
             if (cache !is null)
                 cache.clear();
             pendingCloses = null;
+            typeQueryPrepared = false;
         }
+    }
+
+    // --- data types of the database ---
+
+    /++
+    Forgets the data types of the database the connection has looked up
+    (enums, composite types, domains, ...), so they are looked up again when
+    next met: after `ALTER TYPE` changed a composite type, for example.
+    Statements in the statement cache keep the types they were described with.
+    +/
+    void clearTypeCache() pure nothrow
+    {
+        types = null;
+        missingTypes = null;
+    }
+
+    // Sets the type and the result format of each column: types of the database are looked up first (one round
+    // trip, in the middle of the extended-protocol exchange, before the Bind).
+    private void resolveColumns(ColumnInfo[][] lists)
+    {
+        import std.algorithm.searching : canFind;
+        import postgresql.types.pgtype : builtinType;
+
+        uint[] unknown;
+        foreach (columns; lists)
+            foreach (c; columns)
+                if (builtinType(c.typeOid) is null && (c.typeOid in types) is null
+                        && (c.typeOid in missingTypes) is null && !unknown.canFind(c.typeOid))
+                    unknown ~= c.typeOid;
+        if (unknown.length)
+            lookUpTypes(unknown);
+        foreach (columns; lists)
+            foreach (ref c; columns)
+            {
+                const t = typeOf(c.typeOid);
+                c.type = t;
+                c.format = t !is null && t.binaryDecodable ? ValueFormat.binary : ValueFormat.text;
+            }
+    }
+
+    // Sets the types of columns of the simple protocol (text format) that the connection knows; no lookup.
+    private void knownTypes(ColumnInfo[] columns) nothrow
+    {
+        foreach (ref c; columns)
+            c.type = typeOf(c.typeOid);
+    }
+
+    // The type with OID `oid`: built-in, or looked up; null if unknown.
+    private const(PgType) typeOf(uint oid) nothrow
+    {
+        import postgresql.types.pgtype : builtinType;
+
+        if (auto t = builtinType(oid))
+            return t;
+        if (auto t = oid in types)
+            return *t;
+        return null;
+    }
+
+    private static struct TypeRow
+    {
+        string name;
+        char kind; // pg_type.typtype, or 'a' for arrays
+        uint element; // array element, domain base, range subtype, multirange's range
+        char delimiter;
+        string[] fieldNames;
+        uint[] fieldTypes;
+    }
+
+    // Looks up types in pg_type, and the types they are made of, until all are known.
+    private void lookUpTypes(uint[] oids)
+    {
+        import std.algorithm.searching : canFind;
+        import postgresql.types.pgtype : builtinType, TypeKind;
+
+        TypeRow[uint] rows;
+        while (oids.length)
+        {
+            foreach (oid, row; queryTypes(oids))
+                rows[oid] = row;
+            uint[] next;
+            void need(uint oid)
+            {
+                if (oid != 0 && builtinType(oid) is null && (oid in types) is null && (oid in rows) is null
+                        && (oid in missingTypes) is null && !next.canFind(oid))
+                    next ~= oid;
+            }
+
+            foreach (oid; oids)
+            {
+                auto row = oid in rows;
+                if (row is null)
+                {
+                    missingTypes[oid] = true;
+                    continue;
+                }
+                need(row.element);
+                foreach (f; row.fieldTypes)
+                    need(f);
+            }
+            oids = next;
+        }
+
+        PgType build(uint oid)
+        {
+            if (auto t = builtinType(oid))
+                return t;
+            if (auto t = oid in types)
+                return *t;
+            auto row = oid in rows;
+            if (row is null)
+                return null;
+            TypeKind kind;
+            switch (row.kind)
+            {
+            case 'a':
+                kind = TypeKind.array;
+                break;
+            case 'c':
+                kind = TypeKind.composite;
+                break;
+            case 'd':
+                kind = TypeKind.domain;
+                break;
+            case 'e':
+                kind = TypeKind.enum_;
+                break;
+            case 'r':
+                kind = TypeKind.range;
+                break;
+            case 'm':
+                kind = TypeKind.multirange;
+                break;
+            case 'p':
+                kind = TypeKind.pseudo;
+                break;
+            default:
+                kind = TypeKind.base;
+            }
+            auto t = new PgType(oid, row.name, kind, row.element ? build(row.element) : null, row.delimiter);
+            types[oid] = t;
+            t.fieldNames = row.fieldNames;
+            foreach (f; row.fieldTypes)
+                t.fieldTypes ~= build(f);
+            return t;
+        }
+
+        foreach (oid, _; rows)
+            build(oid);
+    }
+
+    // Runs the pg_type query for `oids` (Bind, Execute, Flush; the statement is prepared once per session).
+    private TypeRow[uint] queryTypes(const uint[] oids)
+    {
+        TypeRow[uint] result;
+        bool failed;
+        guarded({
+            MessageBuilder b;
+            if (!typeQueryPrepared)
+            {
+                // a statement of that name left from before a DISCARD is closed first (no error if none)
+                b.begin(FrontendMessage.close);
+                b.putByte('S');
+                b.putCString(typeQueryName);
+                b.finish();
+                b.begin(FrontendMessage.parse);
+                b.putCString(typeQueryName);
+                b.putCString(typeQuerySql(serverVersionNumber >= 140_000));
+                b.putInt16(0);
+                b.finish();
+            }
+            b.begin(FrontendMessage.bind);
+            b.putCString("");
+            b.putCString(typeQueryName);
+            b.putInt16(1);
+            b.putInt16(1); // the parameter in binary: oid[]
+            b.putInt16(1);
+            auto array = oidArray(oids);
+            b.putInt32(cast(int) array.length);
+            b.putBytes(array);
+            b.putInt16(1);
+            b.putInt16(1); // all results in binary
+            b.finish();
+            b.begin(FrontendMessage.execute);
+            b.putCString("");
+            b.putInt32(0);
+            b.finish();
+            b.begin(FrontendMessage.flush);
+            b.finish();
+            stream.send(b.data);
+
+            static ColumnInfo[] columns;
+            if (columns is null)
+            {
+                import postgresql.types.pgtype : builtinType;
+
+                foreach (oid; [Oid.oid, Oid.name, Oid.text, Oid.oid, Oid.char_, 1009u, 1028u])
+                {
+                    ColumnInfo c;
+                    c.typeOid = oid;
+                    c.format = ValueFormat.binary;
+                    c.type = builtinType(oid);
+                    columns ~= c;
+                }
+            }
+            for (;;)
+            {
+                auto m = nextMessage();
+                switch (m.type)
+                {
+                case BackendMessage.parseComplete, BackendMessage.closeComplete:
+                    break;
+                case BackendMessage.bindComplete:
+                    typeQueryPrepared = true;
+                    break;
+                case BackendMessage.dataRow:
+                    const row = parseDataRow(m.body, columns);
+                    TypeRow t;
+                    t.name = row.getString(1);
+                    const kind = row.getString(2);
+                    t.kind = kind.length ? kind[0] : 'b';
+                    t.element = row.get!uint(3);
+                    const delimiter = row.getString(4);
+                    t.delimiter = delimiter.length ? delimiter[0] : ',';
+                    t.fieldNames = row.get!(string[])(5);
+                    t.fieldTypes = row.get!(uint[])(6);
+                    result[row.get!uint(0)] = t;
+                    break;
+                case BackendMessage.commandComplete:
+                    return;
+                case BackendMessage.errorResponse:
+                    handleResponseMessage(m);
+                    failed = true;
+                    return;
+                default:
+                    handleResponseMessage(m);
+                }
+            }
+        });
+        if (failed)
+        {
+            sync();
+            finishResponse(); // throws the server's error
+            throw new ProtocolException("The server reported a failure without an error");
+        }
+        return result;
+    }
+
+    // An oid[] in binary format.
+    private static immutable(ubyte)[] oidArray(const uint[] oids) pure
+    {
+        ubyte[] data;
+        void int32(uint v)
+        {
+            data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+        }
+
+        int32(1); // dimensions
+        int32(0); // no NULLs
+        int32(Oid.oid);
+        int32(cast(uint) oids.length);
+        int32(1); // lower bound
+        foreach (oid; oids)
+        {
+            int32(4);
+            int32(oid);
+        }
+        return (() @trusted => cast(immutable) data)(); // not referenced elsewhere
+    }
+
+    private enum typeQueryName = "pgn_types";
+
+    // The pg_type query: name, kind ('a' for arrays), element/base/subtype/range, delimiter, composite fields.
+    private static string typeQuerySql(bool multiranges) pure
+    {
+        enum multirangeCase = " WHEN t.typtype = 'm' THEN"
+            ~ " (SELECT r.rngtypid FROM pg_catalog.pg_range r WHERE r.rngmultitypid = t.oid)";
+        return "SELECT t.oid, t.typname, CASE WHEN t.typelem <> 0 AND t.typlen = -1 THEN 'a' ELSE t.typtype::text END,"
+            ~ " CASE WHEN t.typtype = 'd' THEN t.typbasetype"
+            ~ " WHEN t.typtype = 'r' THEN (SELECT r.rngsubtype FROM pg_catalog.pg_range r WHERE r.rngtypid = t.oid)"
+            ~ (
+                    multiranges ? multirangeCase : "") ~ " ELSE t.typelem END,"
+            ~ " t.typdelim,"
+            ~ " ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a"
+            ~ " WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum),"
+            ~ " ARRAY(SELECT a.atttypid FROM pg_catalog.pg_attribute a"
+            ~ " WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum)"
+            ~ " FROM pg_catalog.pg_type t WHERE t.oid = ANY($1::pg_catalog.oid[])";
     }
 
     /++
@@ -746,6 +1037,7 @@ final class Connection : Poolable
                 {
                 case BackendMessage.rowDescription:
                     columns = parseRowDescription(m.body);
+                    knownTypes(columns);
                     return;
                 case BackendMessage.commandComplete:
                     tag = m.body.readCString();
@@ -931,8 +1223,6 @@ final class Connection : Poolable
     // Parses and describes several statements in one round trip (pipelines); throws the first parse error.
     private void describeStatements(StatementInfo[] infos, const size_t[] indexes)
     {
-        import postgresql.types.oids : hasBinaryDecoder;
-
         bool failed;
         guarded({
             MessageBuilder b;
@@ -990,10 +1280,12 @@ final class Connection : Poolable
             finishResponse(); // throws the parse error
             throw new ProtocolException("The server reported a failure without an error");
         }
+        ColumnInfo[][] lists;
+        foreach (i; indexes)
+            lists ~= infos[i].columns;
+        resolveColumns(lists);
         foreach (i; indexes)
         {
-            foreach (ref c; infos[i].columns)
-                c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
             if (cache !is null)
                 closeStatementLater(cache.put(infos[i]));
         }
@@ -1265,6 +1557,7 @@ final class Connection : Poolable
                 {
                 case BackendMessage.rowDescription:
                     columns = parseRowDescription(m.body);
+                    knownTypes(columns);
                     found = true;
                     return;
                 case BackendMessage.commandComplete:
