@@ -13,3 +13,13 @@ project uses [semantic versioning](https://semver.org/).
   down to frontend 2.097, integration test runners (threads, vibe.d fibers,
   vibe-core 1.x) against PostgreSQL 13, 14, 16 and 18, lint and documentation
   checks.
+- Connecting (#2): the startup message (protocol 3.0, or 3.2 with
+  `max_protocol_version=3.2`, negotiated down by older servers); TLS through
+  SSLRequest or direct TLS (PostgreSQL 17+, ALPN `postgresql`) with libpq's
+  `sslmode` values, certificate verification and client certificates;
+  SCRAM-SHA-256 (with SASLprep), MD5 and cleartext passwords, `require_auth`
+  and `channel_binding` options; connection strings as URIs and `key=value`
+  with libpq's keywords; failover over several hosts; simple queries with
+  streamed text rows, command tags and affected-row counts; errors and notices
+  with all their fields; transaction status, run-time parameters reported by
+  the server.
