@@ -1,0 +1,12 @@
+{
+    "name": "integration-tests-vibe1",
+    "description": "Runs the vibe.d integration tests against vibe-core 1.x, the oldest supported vibe-core",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "sourcePaths": ["../integration-tests-vibe/source"],
+    "importPaths": ["../integration-tests-vibe/source"],
+    "dependencies": {
+        "postgresql-native:integration-tests": { "path": "../" },
+        "vibe-core": "1.22.6"
+    }
+}

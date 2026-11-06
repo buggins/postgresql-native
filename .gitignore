@@ -18,7 +18,16 @@
 .dub
 docs.json
 __dummy.html
-docs/
+# Generated API docs (dub build -b docs)
+/docs/
 
 # Code coverage
 *.lst
+
+# Library: dependency versions are not pinned. A root selections file listing
+# vibe-core would also silently enable the optional vibe support.
+dub.selections.json
+
+# Test executables
+/postgresql-native-test-*
+/integration-tests*/postgresql-native_integration-tests*

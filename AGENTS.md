@@ -1,0 +1,71 @@
+# AGENTS.md
+
+Guidance for AI coding agents working on **postgresql-native**, a native D client for PostgreSQL.
+
+## Project at a glance
+
+- **What:** a pure-D client for PostgreSQL over the **frontend/backend protocol 3.x** (TCP, port 5432; TLS through SSLRequest or direct TLS), for PostgreSQL 13–18 (tested; older servers probably work), with blocking (thread) and vibe.d (fiber) I/O. dub package `postgresql-native`, root module `postgresql`.
+- **Repo:** `git@github.com:buggins/postgresql-native.git`, default branch `main`. Author Vadim Lopatin (GitHub `buggins`). License BSL-1.0.
+- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10).
+- **Builds on dbwire** (`../dbwire`, 0.6): `dbwire:types` (exceptions, `Decimal`), `:io` (transports, I/O backends, buffers), `:tls` (OpenSSL loaded at run time; ALPN for direct TLS), `:client` (DSN, failover, pool core), `:crypto` (PBKDF2 for SCRAM, secure random). Anything not protocol-specific is added to dbwire (issue + PR there), not here.
+- **Sibling projects:** `../oracle-native` and `../mssql-native` (the closest models: message layer over a byte stream, result streaming, parameters, pool, mapping, tests) and `../clickhoused`. Follow their structure, API style, tests and conventions (their `AGENTS.md`).
+- **`PLAN.md` (local and optional):** the design plan (protocol overview, types, API, milestones, decisions) is a local, untracked file (excluded through `.git/info/exclude`). If present, read it before design-level changes and keep it up to date; never `git add` it.
+
+## Workflow
+
+- **Every change goes through an issue and a pull request. Never push to `main` directly.** One feature branch per issue; the PR says `Closes #N`. The author merges.
+- Commit, push and open PRs only when the user asks. Releases and tags only on request (version constants in `source/postgresql/package.d` and `CHANGELOG.md`; the author pushes the `vX.Y.Z` tag).
+
+## Key design rules
+
+1. **Pure D, zero C dependencies by default.** OpenSSL is loaded at run time through dbwire for TLS only; SCRAM and MD5 use Phobos and dbwire's pure-D crypto. No libpq.
+2. **Dual I/O.** Anything that can block goes through dbwire's `IoBackend`/`Transport`; never call `std.socket`, `core.sync`, `Thread.sleep` or vibe APIs from protocol, connection or pool code. vibe code under `version (Have_vibe_core)`.
+3. **Runtime interfaces, not templates**, for what a `Connection` holds; `Connection` stays one non-templated class (for the ddbc driver).
+4. **Connection invariants** (as in the sibling projects): one call at a time; a result holds the connection until drained or closed; cancel is the only call allowed from another thread or task; a broken stream or a FATAL error poisons the connection, which is never returned to a pool.
+5. **Robust decoding:** malformed or truncated input throws `ProtocolException`; never crash, never allocate from an unchecked length (message lengths come from the server).
+6. **Version checks:** behaviour that depends on the server (protocol 3.2 on 18, direct TLS on 17, numeric ±Infinity on 14, `in_hot_standby` on 14, ...) is checked against the negotiated protocol version or `server_version`, with constants named after the release.
+7. **Text:** the client always sends `client_encoding=UTF8` (and `DateStyle=ISO`), so all text is UTF-8.
+
+## Licensing rules (important)
+
+- **The protocol is publicly documented** (PostgreSQL manual, "Frontend/Backend Protocol" and "Message Formats"). Write from the manual and from facts verified against real servers (golden bytes). The binary formats of the types are the server's `*send`/`*recv` functions: facts may be taken from the server source (PostgreSQL License), not code.
+- **Other clients are reference only — never copy or translate their code:** libpq (PostgreSQL License), pgx (MIT), Npgsql (PostgreSQL License), pgjdbc (BSD-2-Clause), asyncpg (Apache-2.0), psycopg (LGPL). Line-by-line translation counts as copying. Wire-format facts are fine to reproduce.
+- **`buggins/postgresql-native-old`** (2016) is a translation of pgjdbc: never use it, not even as a reference.
+- If any third-party code or data seems necessary, **stop and ask the user first**.
+- The README says the project is unofficial and not affiliated with the PostgreSQL Global Development Group, and notes the trademark.
+
+## Decisions (2026-11-06)
+
+PostgreSQL 13–18 tested (CI on 13, 14, 16, 18); default `sslmode=prefer` as libpq (verify-ca/verify-full verify the certificate); native `$n` placeholders plus `?` rewritten to `$n` outside quotes, dollar quotes and comments (on by default, can be switched off for the jsonb `?` operators); binary formats for the built-in types; `numeric` as dbwire `Decimal` when it fits (longer values: dbwire decimal types later); the ddbc driver becomes a new configuration beside ddbc's libpq one.
+
+## Commands
+
+The recipe format is **`dub.json`**.
+
+```sh
+dub build                                                  # library
+dub test                                                   # unit tests
+dub run dscanner@0.15.2 -- --styleCheck .                  # lint (CI fails on any warning)
+dub run dfmt@0.15.2 -- --inplace $(git ls-files '*.d')     # format (CI fails if this changes files)
+dub build -b docs                                          # docs into /docs/ (git-ignored)
+dub run :integration-tests-phobos                          # integration tests, threads
+dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
+dub run :integration-tests-vibe1                           # ... with vibe-core 1.x
+POSTGRES_HOST=localhost:15418 POSTGRES_PASSWORD=Test_password123 dub run :integration-tests-phobos
+```
+
+Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). The server comes from `POSTGRES_HOST` (`host:port`), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (`integrationtests.server`); these are deliberately not libpq's `PG*` variables, which the library reads as defaults.
+
+Run lint and format before committing D code. dfmt 0.15.2 mangles lambdas with attributes (`() nothrow {` → `() nothrow{`): use named nested functions. It merges `@safe return` into `@safereturn`: avoid the `return` attribute. Run dfmt twice when it changes files. `dub.selections.json` files are git-ignored (a root one listing vibe-core would enable vibe support silently).
+
+## Local environment
+
+- WSL2 Linux. **LDC 1.36.0** (`ldc2`); DMD is not installed. Test the minimum frontend with LDC 1.27.1 (download `https://github.com/ldc-developers/ldc/releases/download/v1.27.1/ldc2-1.27.1-linux-x86_64.tar.xz` into the scratchpad, run dub with `--compiler=<path>/bin/ldc2`).
+- PostgreSQL in Docker: containers `pgnative-18` (`postgres:18`, port **15418**) and `pgnative-13` (`postgres:13`, port **15413**); user `testuser` / `Test_password123`, database `testdb`. `psql` is inside the containers: `docker exec -it pgnative-18 psql -U testuser -d testdb`. Other versions: `postgres:14`, `postgres:16` on ports 15414, 15416 by the same pattern.
+- The local `grep` is ugrep, which treats files with odd bytes as binary and prints nothing: use `grep -a` on wire dumps.
+
+## Conventions
+
+- `@safe` by default; small commented `@trusted` blocks only in I/O and reinterpret-cast hot paths.
+- **Every public symbol gets a Ddoc comment**; documented unittests as usage examples.
+- Every type gets golden-byte unit tests and server round trips in both I/O modes; cover NULLs, extremes, non-ASCII text, time zones, infinities and special values (NaN, ±infinity dates/timestamps).

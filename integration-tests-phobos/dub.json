@@ -1,0 +1,9 @@
+{
+    "name": "integration-tests-phobos",
+    "description": "Runs the postgresql-native integration tests with blocking Phobos sockets",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "dependencies": {
+        "postgresql-native:integration-tests": { "path": "../" }
+    }
+}

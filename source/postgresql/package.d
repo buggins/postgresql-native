@@ -1,0 +1,58 @@
+/++
+Native PostgreSQL client library for D.
+
+postgresql-native talks to PostgreSQL over its frontend/backend protocol and
+works both with blocking Phobos sockets (ordinary threads) and with vibe-core
+sockets (vibe.d fibers), through [dbwire](https://github.com/buggins/dbwire).
+
+This is an unofficial project, not affiliated with the PostgreSQL Global
+Development Group.
+
+Copyright: Copyright © 2026, Vadim Lopatin
+License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
+Authors:   Vadim Lopatin
++/
+module postgresql;
+
+/// Library version.
+enum uint postgresqlVersionMajor = 0;
+/// ditto
+enum uint postgresqlVersionMinor = 0;
+/// ditto
+enum uint postgresqlVersionPatch = 0;
+
+/// Library version as a string, e.g. `"0.1.0"`.
+enum string postgresqlVersion = versionString(postgresqlVersionMajor, postgresqlVersionMinor,
+            postgresqlVersionPatch);
+
+/// Default `application_name` reported to the server.
+enum string postgresqlClientName = "postgresql-native";
+
+version (Have_vibe_core)
+    private enum bool hasVibeCore = true;
+else
+    private enum bool hasVibeCore = false;
+
+/++
+True when vibe-core support is compiled in.
+
+dub defines `Have_vibe_core` when vibe-core is anywhere in the application's
+dependency graph. postgresql-native then supports fiber mode in addition to
+the always-available thread mode.
++/
+enum bool postgresqlHasVibe = hasVibeCore;
+
+private string versionString(uint major, uint minor, uint patch) pure @safe
+{
+    import std.conv : to;
+
+    return major.to!string ~ "." ~ minor.to!string ~ "." ~ patch.to!string;
+}
+
+///
+@safe unittest
+{
+    import std.algorithm.searching : count;
+
+    assert(postgresqlVersion.count('.') == 2 && postgresqlClientName == "postgresql-native");
+}
