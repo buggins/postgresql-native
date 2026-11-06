@@ -15,6 +15,7 @@ immutable TestCase[] vibeTests = [
     TestCase("fiber: statements run concurrently", &testConcurrentStatements, true),
     TestCase("fiber: cancel from another task", &testCancelFromTask, true),
     TestCase("fiber: a pool shared by tasks", &testPoolTasks, true),
+    TestCase("fiber: waiting for a notification lets other tasks run", &testNotifyTasks, true),
 ];
 
 /// Three tasks with their own connections sleep 0.5 s on the server at the same time: about 0.5 s in all.
@@ -112,4 +113,40 @@ void testPoolTasks()
     const elapsed = MonoTime.currTime - start;
     enforce(elapsed >= 850.msecs && elapsed < 2.seconds, "two at a time, concurrently");
     enforce(pool.activeConnections == 0 && pool.idleConnections == 2, "both returned");
+}
+
+/++
+A task waits for a notification without a time limit; another task, on the
+same thread, counts while it waits and then sends the notification.
++/
+void testNotifyTasks()
+{
+    auto listener = connectToServer();
+    scope (exit)
+        listener.close();
+    listener.listen("itest_task");
+    int ticks;
+    void notifier() nothrow
+    {
+        try
+        {
+            foreach (i; 0 .. 10)
+            {
+                sleep(30.msecs);
+                ticks++;
+            }
+            auto sender = connectToServer();
+            scope (exit)
+                sender.close();
+            sender.notify("itest_task", "from a task");
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    auto task = runTask(&notifier);
+    const n = listener.waitForNotification(10.seconds);
+    task.join();
+    enforce(!n.isNull && n.get.payload == "from a task" && ticks == 10, "the other task ran while waiting");
 }

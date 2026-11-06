@@ -8,6 +8,17 @@ project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- COPY and LISTEN/NOTIFY (#8): `copyIn` (`CopyIn`: raw `write`, `writeRow`
+  and `writeStruct` in text, CSV and binary formats, 64 KiB messages, server
+  errors noticed while writing, `finish`, `abort`), `copyInto` (column types
+  looked up for binary rows), `copyInsert` (structs by binary COPY);
+  `copyOut` (`CopyOut`: chunks, `readAll`/`readText`, rows parsed from text,
+  CSV and binary data, `columnTypes` for typed getters); `listen`,
+  `unlisten`, `unlistenAll`, `notify`, `pollNotifications`,
+  `waitForNotification` (timeout, thread and fiber mode), `onNotification`.
+  Fixed: a notice arriving alone while idle or during COPY IN no longer
+  blocks the reader.
+
 - More types (#7): arrays of any element type and dimensions (lower bounds,
   NULL elements), ranges and multiranges, composite types and records,
   enums, domains, `inet`/`cidr`, `macaddr`/`macaddr8`, `bit`/`varbit`, the
