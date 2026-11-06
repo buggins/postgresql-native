@@ -1,0 +1,10 @@
+{
+    "name": "integration-tests-vibe",
+    "description": "Runs the postgresql-native integration tests inside vibe.d tasks (fiber mode)",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "dependencies": {
+        "postgresql-native:integration-tests": { "path": "../" },
+        "vibe-core": "~>2.14"
+    }
+}

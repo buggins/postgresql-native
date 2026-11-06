@@ -1,0 +1,42 @@
+{
+    "name": "postgresql-native",
+    "description": "Native PostgreSQL client for D: pure-D frontend/backend protocol, blocking (Phobos) and fiber (vibe.d) I/O",
+    "authors": [
+        "Vadim Lopatin"
+    ],
+    "copyright": "Copyright © 2026, Vadim Lopatin",
+    "license": "BSL-1.0",
+    "homepage": "https://github.com/buggins/postgresql-native",
+    "targetType": "library",
+    "toolchainRequirements": {
+        "frontend": ">=2.097"
+    },
+    "subPackages": [
+        "./integration-tests",
+        "./integration-tests-phobos",
+        "./integration-tests-vibe",
+        "./integration-tests-vibe1"
+    ],
+    "dependencies": {
+        "dbwire:types": "~>0.6.0",
+        "dbwire:io": "~>0.6.0",
+        "dbwire:tls": "~>0.6.0",
+        "dbwire:client": "~>0.6.0",
+        "dbwire:crypto": "~>0.6.0",
+        "vibe-core": {
+            "version": ">=1.22.0 <3.0.0",
+            "optional": true
+        }
+    },
+    "buildTypes": {
+        "docs": {
+            "buildOptions": [
+                "syntaxOnly"
+            ],
+            "dflags": [
+                "-Dddocs",
+                "-oq"
+            ]
+        }
+    }
+}

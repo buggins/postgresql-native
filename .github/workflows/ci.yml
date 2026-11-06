@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.dc }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, dc: dmd-latest }
+          - { os: ubuntu-latest, dc: ldc-latest }
+          # Minimum supported D frontend: 2.097 (the same as ddbc)
+          - { os: ubuntu-latest, dc: dmd-2.097.2 }
+          - { os: ubuntu-latest, dc: ldc-1.27.1 }
+          - { os: windows-latest, dc: dmd-latest }
+          - { os: windows-latest, dc: ldc-latest }
+          # DMD does not target arm64 macOS runners
+          - { os: macos-latest, dc: ldc-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dlang-community/setup-dlang@v2.0.0
+        with:
+          compiler: ${{ matrix.dc }}
+      - name: Cache dub packages and builds
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.dub/packages
+            ~/.dub/cache
+            ~/AppData/Local/dub/packages
+            ~/AppData/Local/dub/cache
+          key: dub-${{ github.job }}-${{ runner.os }}-${{ matrix.dc }}-${{ hashFiles('**/dub.json') }}
+          restore-keys: dub-${{ github.job }}-${{ runner.os }}-${{ matrix.dc }}-
+      - name: Build
+        run: dub build
+      - name: Unit tests
+        run: dub test
+
+  integration:
+    name: server (PostgreSQL ${{ matrix.version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 13 is the oldest tested version (end of life, still common)
+        version: ["18", "16", "14", "13"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.version }}
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: Test_password123
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U testuser -d testdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      POSTGRES_HOST: localhost:5432
+      POSTGRES_DB: testdb
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: Test_password123
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dlang-community/setup-dlang@v2.0.0
+        with:
+          compiler: ldc-latest
+      - name: Server is reachable
+        run: docker exec ${{ job.services.postgres.id }} psql -U testuser -d testdb -c "SELECT version()"
+      - name: Integration tests (threads)
+        run: dub run :integration-tests-phobos
+      - name: Integration tests (vibe.d fibers)
+        run: dub run :integration-tests-vibe
+      - name: Integration tests (vibe-core 1.x)
+        run: dub run :integration-tests-vibe1
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dlang-community/setup-dlang@v2.0.0
+        with:
+          compiler: ldc-latest
+      - name: Cache dub packages and builds
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.dub/packages
+            ~/.dub/cache
+          key: dub-${{ github.job }}-${{ runner.os }}-ldc-latest-${{ hashFiles('**/dub.json') }}
+          restore-keys: dub-${{ github.job }}-${{ runner.os }}-ldc-latest-
+      - name: D-Scanner style check
+        run: dub run -q dscanner@0.15.2 -- --styleCheck .
+      - name: dfmt formatting check
+        run: |
+          dub run -q dfmt@0.15.2 -- --inplace $(git ls-files '*.d')
+          git diff --exit-code
+      - name: Documentation builds
+        run: dub build -b docs
