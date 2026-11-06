@@ -132,13 +132,28 @@ void testAuthMethods()
     new Connection(userOptions("saslpuser", SslMode.disable, "I­X pass")).close();
     new Connection(userOptions("saslpuser", SslMode.disable, "IX pass")).close();
 
-    // channel binding: SCRAM-SHA-256-PLUS needs dbwire's peer certificate access
+    // channel binding (tls-server-end-point): SCRAM-SHA-256-PLUS over TLS
     o = userOptions("scramuser", SslMode.require);
     o.channelBinding = ChannelBinding.require;
-    auto c = collectException(new Connection(o));
-    enforce(c is null || cast(ClientException) c, c is null ? "" : c.msg);
+    auto bound = new Connection(o);
+    enforce(bound.authMethod == AuthMethod.scramSha256Plus, "channel_binding=require: SCRAM-SHA-256-PLUS");
+    bound.close();
+    o.channelBinding = ChannelBinding.prefer; // the default: bound when possible
+    bound = new Connection(o);
+    enforce(bound.authMethod == AuthMethod.scramSha256Plus, "channel_binding=prefer over TLS");
+    bound.close();
     o.channelBinding = ChannelBinding.disable;
-    new Connection(o).close();
+    auto unbound = new Connection(o);
+    enforce(unbound.authMethod == AuthMethod.scramSha256, "channel_binding=disable");
+    unbound.close();
+    // without TLS there is nothing to bind to: require refuses, prefer logs in without
+    o = userOptions("scramuser", SslMode.disable);
+    o.channelBinding = ChannelBinding.require;
+    enforce(collectException!ClientException(new Connection(o)) !is null, "require without TLS");
+    o.channelBinding = ChannelBinding.prefer;
+    unbound = new Connection(o);
+    enforce(unbound.authMethod == AuthMethod.scramSha256, "prefer without TLS");
+    unbound.close();
 }
 
 /// TLS: the sslmode values, certificate verification, client certificates, direct TLS.

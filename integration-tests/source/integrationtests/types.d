@@ -154,19 +154,22 @@ void testDateTimes()
             ~ "('infinity'), ('-infinity')", "timestamp");
     compareText(conn, "SELECT '2000-01-01'::timestamp + random() * interval '200000 days' - interval '100000 days' "
             ~ "FROM generate_series(1, 2000)", "timestamp random");
-    // Phobos's zones give times before a zone's first transition the offset after it instead of the
-    // local mean time (Asia/Kathmandu before 1920), and ignore the rule for times after the last
-    // transition in the file (DST after 2037; buggins/dbwire#33): the values here are between those
+    // dbwire 0.7 reads the zones as the tz code does: local mean time before a zone's first transition
+    // (Asia/Kathmandu before 1920), the footer's rules after the last one (DST after 2037)
     foreach (zone; [
-        "UTC", "Asia/Kathmandu", "America/St_Johns", "Europe/Lisbon", "Australia/Lord_Howe"
+        "UTC", "Asia/Kathmandu", "America/St_Johns", "Europe/Lisbon", "Australia/Lord_Howe",
+        "America/New_York", "Europe/Dublin", "Antarctica/Rothera", "Australia/Sydney"
     ])
     {
         conn.exec("SET TimeZone = '" ~ zone ~ "'");
         compareText(conn, "VALUES ('2026-11-06 12:34:56.5+00'::timestamptz), ('1930-01-01 00:00:00+00'), "
                 ~ "('2026-07-01 00:00:00+00'), ('1985-01-01 00:00:00+00'), ('2038-01-19 03:14:08+00'), "
-                ~ "('infinity'), ('-infinity')", "timestamptz " ~ zone);
-        compareText(conn, "SELECT '1970-01-01'::timestamptz + random() * interval '24000 days' "
-                ~ "FROM generate_series(1, 1000)", "timestamptz random " ~ zone);
+                ~ "('1850-06-01 12:00:00+00'), ('1900-01-01 00:00:00+00'), ('2095-07-01 00:00:00+00'), "
+                ~ "('2200-01-01 00:00:00+00'), ('infinity'), ('-infinity')", "timestamptz " ~ zone);
+        // random instants from 1970 to 2200: the client's and the server's tz databases may be different
+        // releases, and new releases revise history (Europe/Dublin in 1925 changed in 2026)
+        compareText(conn, "SELECT '1970-01-01'::timestamptz + random() * interval '84000 days' "
+                ~ "FROM generate_series(1, 2000)", "timestamptz random " ~ zone);
     }
     conn.exec("SET TimeZone = 'UTC'");
     const infinityIntervals = conn.serverVersionNumber >= 170_000 ? ", ('infinity'), ('-infinity')" : "";

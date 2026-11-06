@@ -15,7 +15,7 @@ import std.variant : Variant;
 
 import dbwire.client.hosts : connectFirst, HostPort, orderHosts;
 import dbwire.client.pool : Poolable;
-import dbwire.io.backend : backendFor, IoBackend, PoolSync;
+import dbwire.io.backend : backendFor, IoBackend;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
 
@@ -90,7 +90,6 @@ final class Connection : Poolable
     private Notification[] notifications;
     private ulong notificationCount; // notifications read so far
     private Notification lastNotification;
-    private PoolSync waitSync; // a timed wait in the I/O mode of the connection (waitForNotification)
     private StatementCache cache; // null when statementCacheSize is 0
     private string[] pendingCloses; // statements to close with the next extended-protocol request
     private ulong statementCounter;
@@ -1704,21 +1703,20 @@ final class Connection : Poolable
     /++
     Waits up to `timeout` (`Duration.max`: without limit) for a notification
     and returns the first one not taken yet (with `onNotification` set: the
-    first one delivered to it while waiting); null on timeout. The wait checks
-    the connection every few milliseconds (at most 50) and lets other tasks
-    run in fiber mode.
+    first one delivered to it while waiting); null on timeout. It waits on the
+    socket (other tasks run meanwhile in fiber mode), so a notification is
+    returned as soon as it arrives.
 
     Throws: `ClientException` if the connection is busy or closed; `ServerException`; `ConnectionException`.
     +/
     Nullable!Notification waitForNotification(Duration timeout = Duration.max)
     {
-        import core.time : MonoTime, msecs;
-        import std.algorithm.comparison : min;
+        import core.time : MonoTime;
+        import dbwire.io.backend : waitForData;
 
         const forever = timeout == Duration.max;
         const deadline = forever ? MonoTime.max : MonoTime.currTime + timeout;
         const before = notificationCount;
-        auto step = 1.msecs;
         for (;;)
         {
             readIdleMessages();
@@ -1736,14 +1734,13 @@ final class Connection : Poolable
             const now = MonoTime.currTime;
             if (now >= deadline)
                 return Nullable!Notification.init;
-            const pause = forever ? step : min(step, deadline - now);
-            if (waitSync is null)
-                waitSync = backend.newPoolSync();
-            waitSync.lock();
-            scope (exit)
-                waitSync.unlock();
-            waitSync.wait(pause);
-            step = min(step * 2, 50.msecs);
+            // until the server sends something (a notification, or a notice, parameter change, FATAL error)
+            bool arrived;
+            guarded({
+                arrived = waitForData(transport, forever ? Duration.max : deadline - now, backend);
+            });
+            if (!arrived)
+                return Nullable!Notification.init;
         }
     }
 
