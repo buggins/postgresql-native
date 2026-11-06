@@ -6,6 +6,31 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.4.0 (2026-11-06)
+
+### Added
+
+- SCRAM-SHA-256-PLUS channel binding (`tls-server-end-point`, #13): over
+  TLS, logins bind the SCRAM exchange to the server's certificate, so a man
+  in the middle with another certificate can't relay them.
+  `channel_binding=prefer` (the default) uses it when the server offers it,
+  `require` refuses logins without it, `disable` never uses it.
+  `Connection.authMethod` reports `scramSha256Plus`.
+
+### Changed
+
+- dbwire 0.7 (`~>0.7.0`).
+- `waitForNotification` waits on the socket (dbwire's `waitForData`)
+  instead of checking every few milliseconds: a notification is returned as
+  soon as it arrives.
+- `timestamptz` text and `SysTime` local times follow the tz database's rules
+  everywhere: the local mean time before a zone's first transition (e.g.
+  Asia/Kathmandu before 1920) and daylight saving time after 2037 (from
+  dbwire 0.7, buggins/dbwire#33). The integration tests compare them with the
+  server's text from 1850 to 2200. Client and server each use their own tz
+  database: when their tzdata releases differ, historical values revised in
+  between (rare after 1970) differ too.
+
 ## 0.3.0 (2026-11-06)
 
 ### Added

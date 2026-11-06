@@ -4,7 +4,7 @@ A native client for **PostgreSQL** in D: the PostgreSQL frontend/backend
 protocol over TCP, written in pure D, for ordinary threads (blocking sockets)
 and vibe.d fibers. No libpq, no C libraries at build time.
 
-> **Status: 0.3.0.** The API may still change before 1.0; the plan is tracked
+> **Status: 0.4.0.** The API may still change before 1.0; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/postgresql-native/issues/11),
 > changes in the [changelog](CHANGELOG.md).
 
@@ -12,7 +12,7 @@ Add it to your `dub.json`:
 
 ```json
 "dependencies": {
-    "postgresql-native": "~>0.3.0"
+    "postgresql-native": "~>0.4.0"
 }
 ```
 
@@ -36,8 +36,8 @@ void main()
 Features:
 
 - PostgreSQL 13 to 18 (tested on 13, 14, 16 and 18), protocol 3.0 and 3.2;
-- password logins with SCRAM-SHA-256 (with SASLprep), MD5 or cleartext,
-  `require_auth`; TLS with certificate verification, client certificates,
+- password logins with SCRAM-SHA-256 (with SASLprep, and channel binding
+  over TLS: SCRAM-SHA-256-PLUS), MD5 or cleartext, `require_auth`; TLS with certificate verification, client certificates,
   libpq's `sslmode` values and PostgreSQL 17's direct TLS;
 - libpq-style connection strings (`postgresql://` URIs and `key=value`) with
   libpq's keywords, the `PG*` environment variables, the password file
@@ -59,10 +59,8 @@ Features:
 - struct mapping and a connection pool, in thread and fiber mode.
 
 Later: a [ddbc](https://github.com/buggins/ddbc) driver and
-[hibernated](https://github.com/buggins/hibernated) support. SCRAM channel
-binding is implemented and switches on with the next dbwire release (it needs
-the server's certificate from the TLS layer). GSSAPI, SSPI and Unix-domain
-sockets are not supported.
+[hibernated](https://github.com/buggins/hibernated) support. GSSAPI, SSPI and
+Unix-domain sockets are not supported.
 
 It builds on [dbwire](https://github.com/buggins/dbwire), the pure-D building
 blocks shared with [clickhoused](https://github.com/buggins/clickhoused),
@@ -239,8 +237,8 @@ listener.onNotification = (Notification x) { ... };    // or as they arrive
 ```
 
 Notifications also arrive with the responses to other statements
-(`takeNotifications`). `waitForNotification` checks the connection every few
-milliseconds; in fiber mode other tasks run meanwhile.
+(`takeNotifications`). `waitForNotification` waits on the socket; in fiber mode
+other tasks run meanwhile.
 
 ## Connection pool and vibe.d
 
