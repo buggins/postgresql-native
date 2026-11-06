@@ -19,6 +19,7 @@ import postgresql.protocol.codes;
 import postgresql.protocol.messages;
 import postgresql.result;
 import postgresql.params : hasVariant, Param, rewritePlaceholders;
+import postgresql.pipeline;
 import postgresql.settings;
 import postgresql.statement;
 
@@ -78,6 +79,7 @@ final class Connection
     private StatementCache cache; // null when statementCacheSize is 0
     private string[] pendingCloses; // statements to close with the next extended-protocol request
     private ulong statementCounter;
+    private Encryption encryptionUsed; // how the session was encrypted, for cancel requests
     private bool responseDone = true; // ReadyForQuery of the current request was read
     private ServerMessage pendingError; // the first error of the current response
     private bool hasPendingError;
@@ -393,33 +395,7 @@ final class Connection
         guarded({
             MessageBuilder b;
             appendPendingCloses(b);
-            b.begin(FrontendMessage.bind);
-            b.putCString(""); // the unnamed portal
-            b.putCString(info.name);
-            b.putInt16(cast(short) params.length);
-            foreach (p; params)
-                b.putInt16(p.format);
-            b.putInt16(cast(short) params.length);
-            foreach (p; params)
-            {
-                if (p.isNull)
-                    b.putInt32(-1);
-                else
-                {
-                    if (p.data.length > int.max)
-                        throw new ClientException("A parameter value is longer than 2 GB");
-                    b.putInt32(cast(int) p.data.length);
-                    b.putBytes(p.data);
-                }
-            }
-            b.putInt16(cast(short) info.columns.length);
-            foreach (c; info.columns)
-                b.putInt16(c.format);
-            b.finish();
-            b.begin(FrontendMessage.execute);
-            b.putCString("");
-            b.putInt32(0); // all rows
-            b.finish();
+            appendBindExecute(b, info, params);
             b.begin(FrontendMessage.sync);
             b.finish();
             stream.send(b.data);
@@ -453,7 +429,39 @@ final class Connection
         return Outcome(new QueryResult(this, info.columns, null, false), false);
     }
 
-    private static Param[] checkNoParameters(StatementInfo info)
+    // Bind (unnamed portal) and Execute (all rows) for a parsed statement.
+    private void appendBindExecute(ref MessageBuilder b, const StatementInfo info, const Param[] params)
+    {
+        b.begin(FrontendMessage.bind);
+        b.putCString(""); // the unnamed portal
+        b.putCString(info.name);
+        b.putInt16(cast(short) params.length);
+        foreach (p; params)
+            b.putInt16(p.format);
+        b.putInt16(cast(short) params.length);
+        foreach (p; params)
+        {
+            if (p.isNull)
+                b.putInt32(-1);
+            else
+            {
+                if (p.data.length > int.max)
+                    throw new ClientException("A parameter value is longer than 2 GB");
+                b.putInt32(cast(int) p.data.length);
+                b.putBytes(p.data);
+            }
+        }
+        b.putInt16(cast(short) info.columns.length);
+        foreach (c; info.columns)
+            b.putInt16(c.format);
+        b.finish();
+        b.begin(FrontendMessage.execute);
+        b.putCString("");
+        b.putInt32(0); // all rows
+        b.finish();
+    }
+
+    private static Param[] checkNoParameters(const StatementInfo info)
     {
         import std.conv : to;
 
@@ -616,6 +624,395 @@ final class Connection
             }
         });
         return new QueryResult(this, columns, tag, rowsDone);
+    }
+
+    // --- pipelines ---
+
+    /++
+    A pipeline for this connection: statements sent together and answered
+    in order (see `postgresql.pipeline`).
+    +/
+    Pipeline pipeline(PipelineMode mode = PipelineMode.transaction)
+    {
+        return new Pipeline(this, mode);
+    }
+
+    // Runs the statements of a pipeline (Pipeline.run).
+    package PipelineResult[] runPipeline(string[] sqls, ParamEncoder[] encoders, bool transactional)
+    {
+        startRequest();
+        auto infos = new StatementInfo[sqls.length];
+        size_t[] toDescribe;
+        string[] temporary; // statement names to close afterwards when there is no cache
+        size_t[string] described; // SQL text -> index of the statement described in this pipeline
+        foreach (i, sql; sqls)
+        {
+            if (cache !is null)
+                if (auto hit = cache.get(sql))
+                {
+                    infos[i] = *hit;
+                    continue;
+                }
+            if (auto earlier = sql in described)
+                continue; // filled in after the description below
+            infos[i].sql = sql;
+            infos[i].name = nextStatementName(cache !is null ? "pgn_s" : "pgn_t");
+            if (cache is null)
+                temporary ~= infos[i].name;
+            described[sql] = i;
+            toDescribe ~= i;
+        }
+        scope (exit)
+            foreach (name; temporary)
+                closeStatementLater(name);
+
+        if (toDescribe.length)
+            describeStatements(infos, toDescribe);
+        foreach (i, sql; sqls)
+            if (infos[i].name.length == 0 && infos[i].columns.length == 0 && infos[i].parameterTypes.length == 0)
+                if (auto first = sql in described)
+                    infos[i] = infos[*first];
+
+        // encode everything before sending anything
+        auto params = new Param[][sqls.length];
+        try
+            foreach (i; 0 .. sqls.length)
+                params[i] = encoders[i] is null ? checkNoParameters(infos[i]) : encoders[i](infos[i].parameterTypes);
+                catch (ClientException e)
+                {
+                    if (toDescribe.length)
+                    {
+                        sync();
+                        finishResponse();
+                    }
+                    else
+                        state = State.ready;
+                    throw e;
+                }
+
+        auto results = new PipelineResult[sqls.length];
+        guarded({
+            MessageBuilder b;
+            appendPendingCloses(b);
+            foreach (i, info; infos)
+            {
+                appendBindExecute(b, info, params[i]);
+                if (!transactional)
+                {
+                    b.begin(FrontendMessage.sync);
+                    b.finish();
+                }
+            }
+            if (transactional)
+            {
+                b.begin(FrontendMessage.sync);
+                b.finish();
+            }
+            stream.send(b.data);
+
+            const zone = parameterStatus("TimeZone");
+            bool aborted;
+            foreach (i, info; infos)
+            {
+                auto r = &results[i];
+                r.columns = info.columns;
+                if (aborted)
+                {
+                    r.skipped = true;
+                    continue;
+                }
+                readStatement: for (;;)
+                {
+                    auto m = nextMessage();
+                    switch (m.type)
+                    {
+                    case BackendMessage.bindComplete:
+                        break;
+                    case BackendMessage.dataRow:
+                        r.rows ~= parseDataRow(m.body, info.columns, zone);
+                        break;
+                    case BackendMessage.commandComplete:
+                        r.commandTag = m.body.readCString();
+                        noteCommandTag(r.commandTag);
+                        break readStatement;
+                    case BackendMessage.emptyQueryResponse, BackendMessage.portalSuspended:
+                        break readStatement;
+                    case BackendMessage.errorResponse:
+                        r.failed = true;
+                        r.error = ServerMessage.parse(m.body);
+                        if (r.error.isFatal)
+                        {
+                            close();
+                            throw new ServerException(r.error);
+                        }
+                        if (cache !is null && (r.error.sqlState == "26000" || r.error.sqlState == "0A000"))
+                            closeStatementLater(cache.remove(info.sql));
+                        aborted = transactional;
+                        break readStatement;
+                    default:
+                        throw new ProtocolException("Unexpected message '" ~ m.type ~ "' in a pipeline");
+                    }
+                }
+                if (!transactional)
+                    readSyncPoint(i + 1 == infos.length);
+            }
+            if (transactional)
+                readSyncPoint(true);
+        });
+        return results;
+    }
+
+    // Reads up to the ReadyForQuery of a Sync; the connection stays busy unless it is the last one.
+    private void readSyncPoint(bool last)
+    {
+        for (;;)
+        {
+            auto m = nextMessage();
+            if (m.type == BackendMessage.readyForQuery)
+            {
+                readyForQuery(m);
+                if (!last)
+                {
+                    state = State.busy;
+                    responseDone = false;
+                }
+                return;
+            }
+            if (m.type != BackendMessage.commandComplete && m.type != BackendMessage.emptyQueryResponse)
+                throw new ProtocolException("Unexpected message '" ~ m.type ~ "' before ReadyForQuery");
+        }
+    }
+
+    // Parses and describes several statements in one round trip (pipelines); throws the first parse error.
+    private void describeStatements(StatementInfo[] infos, const size_t[] indexes)
+    {
+        import postgresql.types.oids : hasBinaryDecoder;
+
+        bool failed;
+        guarded({
+            MessageBuilder b;
+            appendPendingCloses(b);
+            foreach (i; indexes)
+            {
+                b.begin(FrontendMessage.parse);
+                b.putCString(infos[i].name);
+                b.putCString(infos[i].sql);
+                b.putInt16(0);
+                b.finish();
+                b.begin(FrontendMessage.describe);
+                b.putByte('S');
+                b.putCString(infos[i].name);
+                b.finish();
+            }
+            b.begin(FrontendMessage.flush);
+            b.finish();
+            stream.send(b.data);
+            foreach (i; indexes)
+            {
+                describing: for (;;)
+                {
+                    auto m = nextMessage();
+                    switch (m.type)
+                    {
+                    case BackendMessage.parameterDescription:
+                        auto body = m.body;
+                        const count = body.readInt16();
+                        if (count < 0)
+                            throw new ProtocolException("Invalid parameter count");
+                        infos[i].parameterTypes = new uint[count];
+                        foreach (ref t; infos[i].parameterTypes)
+                            t = cast(uint)
+                            body.readInt32();
+                        break;
+                    case BackendMessage.rowDescription:
+                        infos[i].columns = parseRowDescription(m.body);
+                        break describing;
+                    case BackendMessage.noData:
+                        break describing;
+                    case BackendMessage.errorResponse:
+                        handleResponseMessage(m);
+                        failed = true;
+                        return;
+                    default:
+                        handleResponseMessage(m);
+                    }
+                }
+            }
+        });
+        if (failed)
+        {
+            sync();
+            finishResponse(); // throws the parse error
+            throw new ProtocolException("The server reported a failure without an error");
+        }
+        foreach (i; indexes)
+        {
+            foreach (ref c; infos[i].columns)
+                c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
+            if (cache !is null)
+                closeStatementLater(cache.put(infos[i]));
+        }
+    }
+
+    // --- transactions ---
+
+    /++
+    Starts a transaction block (`BEGIN`), with an isolation level, read-only
+    and deferrable (for `serializable` read-only transactions) when given.
+
+    Throws: `ServerException` (e.g. a warning-free `BEGIN` inside a block is
+    only a notice, so the server's state decides: check `inTransaction`).
+    +/
+    void begin(IsolationLevel level = IsolationLevel.default_, bool readOnly = false, bool deferrable = false)
+    {
+        exec("BEGIN" ~ transactionModes(level, readOnly, deferrable));
+    }
+
+    /// Commits the transaction block (`COMMIT`); a failed block is rolled back by the server.
+    void commit()
+    {
+        exec("COMMIT");
+    }
+
+    /// Rolls the transaction block back (`ROLLBACK`).
+    void rollback()
+    {
+        exec("ROLLBACK");
+    }
+
+    /// Sets a savepoint (`SAVEPOINT name`) in the current transaction block.
+    void savepoint(string name)
+    {
+        exec("SAVEPOINT " ~ quoteIdentifier(name));
+    }
+
+    /// Rolls back to a savepoint (`ROLLBACK TO SAVEPOINT name`); also ends a failed state since it.
+    void rollbackTo(string name)
+    {
+        exec("ROLLBACK TO SAVEPOINT " ~ quoteIdentifier(name));
+    }
+
+    /// Forgets a savepoint, keeping its changes (`RELEASE SAVEPOINT name`).
+    void releaseSavepoint(string name)
+    {
+        exec("RELEASE SAVEPOINT " ~ quoteIdentifier(name));
+    }
+
+    /++
+    Sets the defaults of the session's later transactions
+    (`SET SESSION CHARACTERISTICS AS TRANSACTION ...`).
+    +/
+    void setSessionDefaults(IsolationLevel level, bool readOnly = false, bool deferrable = false)
+    {
+        exec("SET SESSION CHARACTERISTICS AS TRANSACTION" ~ (level == IsolationLevel.default_
+                ? " ISOLATION LEVEL READ COMMITTED" : "") ~ transactionModes(level, readOnly, deferrable, true));
+    }
+
+    /// Whether a transaction block is open (it may be failed).
+    @property bool inTransaction() const pure nothrow
+    {
+        return txStatus != TransactionStatus.idle;
+    }
+
+    /// Whether the transaction block is failed: statements are refused until `rollback` (or `rollbackTo`).
+    @property bool transactionFailed() const pure nothrow
+    {
+        return txStatus == TransactionStatus.failed;
+    }
+
+    private static string transactionModes(IsolationLevel level, bool readOnly, bool deferrable,
+            bool explicitWrite = false) pure
+    {
+        string s;
+        final switch (level)
+        {
+        case IsolationLevel.default_:
+            break;
+        case IsolationLevel.readUncommitted:
+            s ~= " ISOLATION LEVEL READ UNCOMMITTED";
+            break;
+        case IsolationLevel.readCommitted:
+            s ~= " ISOLATION LEVEL READ COMMITTED";
+            break;
+        case IsolationLevel.repeatableRead:
+            s ~= " ISOLATION LEVEL REPEATABLE READ";
+            break;
+        case IsolationLevel.serializable:
+            s ~= " ISOLATION LEVEL SERIALIZABLE";
+            break;
+        }
+        if (readOnly)
+            s ~= (s.length ? "," : "") ~ " READ ONLY";
+        else if (explicitWrite)
+            s ~= (s.length ? "," : "") ~ " READ WRITE";
+        if (deferrable)
+            s ~= (s.length ? "," : "") ~ " DEFERRABLE";
+        else if (explicitWrite)
+            s ~= (s.length ? "," : "") ~ " NOT DEFERRABLE";
+        return s;
+    }
+
+    // --- cancel ---
+
+    /++
+    Asks the server to cancel the statement running on this connection: a
+    CancelRequest sent over a second connection (encrypted like this one).
+    The statement then fails with a `ServerException` of SQLSTATE 57014,
+    and the connection stays usable.
+
+    This is the one method that may be called from another thread or task
+    while the connection is busy. It does nothing if no request is running.
+    Like every PostgreSQL client's cancel, it races with the end of the
+    statement: if that ends first, the cancel may hit the next statement
+    of the session, or nothing.
+
+    Throws: `ConnectionException` if the server can't be reached.
+    +/
+    void cancel()
+    {
+        import dbwire.io.backend : IoMode;
+
+        if (state != State.busy || cancelKey.length == 0)
+            return;
+        auto io = backendFor(IoMode.auto_); // the caller's context: another thread or task
+        auto endpoint = connectedHost;
+        auto raw = options.transportFactory !is null
+            ? options.transportFactory(endpoint.host, endpoint.port, options.connectTimeout) : io.connect(
+                    endpoint.host, endpoint.port, options.connectTimeout);
+        Transport t = raw;
+        scope (exit)
+            t.close();
+        raw.setTimeouts(options.connectTimeout, options.connectTimeout);
+        if (encryptionUsed != Encryption.none)
+        {
+            const direct = encryptionUsed == Encryption.direct;
+            if (!direct)
+            {
+                static immutable ubyte[8] sslRequest = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
+                raw.write(sslRequest[]);
+                ubyte[1] answer;
+                if (raw.read(answer[]) != 1 || answer[0] != 'S' || raw.dataAvailable())
+                    throw new ConnectionException("The server refused TLS for the cancel request");
+            }
+            auto opts = tlsOptions(direct);
+            t = new TlsTransport(raw, io, TlsContext.client(opts), endpoint.host, opts, options.connectTimeout);
+        }
+        MessageBuilder b;
+        b.begin(0);
+        b.putInt32(RequestCode.cancel);
+        b.putInt32(backendPid);
+        b.putBytes(cancelKey);
+        b.finish();
+        t.write(b.data);
+        // the server answers nothing and closes the connection once it has handled the request
+        try
+        {
+            ubyte[1] none;
+            t.read(none[]);
+        }
+        catch (ConnectionException)
+        {
+        }
     }
 
     /// Checks that the server answers (an empty query).
@@ -1027,6 +1424,7 @@ final class Connection
         stream = new MessageStream(transport);
         startup();
         transport.setTimeouts(options.receiveTimeout, options.sendTimeout);
+        encryptionUsed = tls is null ? Encryption.none : encryption;
         state = State.ready;
     }
 
@@ -1070,6 +1468,14 @@ final class Connection
         param("DateStyle", "ISO");
         if (options.serverOptions.length)
             param("options", options.serverOptions);
+        if (options.statementTimeout > Duration.zero)
+        {
+            import std.conv : to;
+
+            param("statement_timeout", options.statementTimeout
+                    .total!"msecs"
+                    .to!string);
+        }
         foreach (name, value; options.runtimeParameters)
             param(name, value);
         b.putByte(0);

@@ -48,3 +48,11 @@ project uses [semantic versioning](https://semver.org/).
   `DISCARD ALL` are parsed again. `prepare` returns a `PreparedStatement`.
   `QueryResult.nextResult` moves through the result sets of a multi-statement
   `querySimple`.
+- Statements in depth (#5): transactions (`begin` with isolation level,
+  read-only and deferrable; `commit`, `rollback`, savepoints,
+  `setSessionDefaults`, `inTransaction`, `transactionFailed`); `cancel()` from
+  another thread or task through a CancelRequest on a second connection
+  (encrypted like the session, protocol 3.2 keys included);
+  `statementTimeout` (the server's `statement_timeout`); pipelines
+  (`Connection.pipeline`): statements sent together, parsed in one round trip
+  when new, answered in order, as one implicit transaction or independently.

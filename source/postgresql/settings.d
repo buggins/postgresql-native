@@ -146,8 +146,14 @@ struct ConnectionOptions
     Duration connectTimeout = 15.seconds;
     /// Time allowed for each write.
     Duration sendTimeout = 300.seconds;
-    /// Time allowed for each read; zero waits forever.
+    /// Time allowed for each read; zero waits forever. A read that times out closes the connection.
     Duration receiveTimeout;
+    /++
+    The server's `statement_timeout`, set at startup: a statement running
+    longer is cancelled by the server (SQLSTATE 57014) and the connection
+    stays usable. Zero keeps the server's setting.
+    +/
+    Duration statementTimeout;
 
     /// Threads (blocking sockets) or vibe.d fibers; `auto_` picks vibe.d inside a vibe.d task.
     IoMode ioMode = IoMode.auto_;
@@ -520,6 +526,42 @@ unittest
     assert(!parseRequireAuth("scram-sha-256").allows("none"));
     assert(parseRequireAuth("!password").allows("none") && !parseRequireAuth("!password").allows("password"));
     assert(parseRequireAuth("").allows("password"));
+}
+
+/// Transaction isolation levels (`Connection.begin`).
+enum IsolationLevel
+{
+    /// The session's default (`default_transaction_isolation`, normally read committed).
+    default_,
+    /// Read uncommitted (PostgreSQL runs it as read committed).
+    readUncommitted,
+    /// Read committed.
+    readCommitted,
+    /// Repeatable read (snapshot isolation).
+    repeatableRead,
+    /// Serializable.
+    serializable,
+}
+
+/++
+`name` as a quoted SQL identifier: `"name"`, with embedded double quotes doubled.
+
+Throws: `ClientException` for an empty name or one with a NUL character.
++/
+string quoteIdentifier(string name) pure
+{
+    import std.array : replace;
+    import std.string : indexOf;
+
+    if (name.length == 0 || name.indexOf('\0') >= 0)
+        throw new ClientException("Invalid identifier");
+    return `"` ~ name.replace(`"`, `""`) ~ `"`;
+}
+
+///
+unittest
+{
+    assert(quoteIdentifier("sp1") == `"sp1"` && quoteIdentifier(`a"b`) == `"a""b"`);
 }
 
 private:
