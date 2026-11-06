@@ -6,6 +6,18 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- `hostaddr` (and `PGHOSTADDR`, `ConnectionOptions.hostAddress`, #19):
+  connect to numeric addresses while the host names serve TLS name checks,
+  the password file and messages (`Connection.host` is the name,
+  `Connection.address` the address); one address per host for failover.
+- Connection services (#19): `service` and `servicefile` keywords,
+  `PGSERVICE` and `PGSERVICEFILE`; `pg_service.conf` sections from the
+  user's file, then the system's (`PGSYSCONFDIR`). The service's keywords
+  come after the connection string's and before the environment's, as in
+  libpq.
+
 ## 0.4.0 (2026-11-06)
 
 ### Added

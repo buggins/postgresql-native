@@ -382,3 +382,107 @@ private void makePrivate(string path)
         setAttributes(path, octal!"600");
     }
 }
+
+/// hostaddr (connect to an address, keep the host name) and connection services (pg_service.conf).
+void testHostaddrAndServices()
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.process : environment, thisProcessID;
+    import std.socket : getAddress;
+
+    // the server's address, so hostaddr can be numeric
+    const ip = serverHost() == "localhost" ? "127.0.0.1" : getAddress(serverHost())[0].toAddrString();
+
+    // the name is reported and used; the connection goes to the address
+    auto o = serverOptions(SslMode.disable);
+    o.host = "pg.invalid"; // a name that can't be resolved: only hostaddr can reach the server
+    o.hostAddress = ip;
+    auto conn = new Connection(o);
+    enforce(conn.host == HostPort("pg.invalid", serverPort()) && conn.address == HostPort(ip, serverPort()),
+            "host name and address");
+    enforce(scalar(conn, "SELECT 1") == "1", "connected through hostaddr");
+    conn.close();
+
+    // failover: an unreachable address first, the names follow their addresses
+    o = serverOptions(SslMode.disable);
+    o.hosts = [HostPort("first.invalid", 1), HostPort("second.invalid", serverPort())];
+    o.hostAddress = "127.0.0.1," ~ ip;
+    conn = new Connection(o);
+    enforce(conn.host.host == "second.invalid" && conn.address.host == ip, "failover with hostaddr");
+    conn.close();
+    o.hostAddress = ip;
+    enforce(collectException!ClientException(new Connection(o)) !is null, "one address for two hosts");
+
+    // the password file is looked up by the host name, not the address
+    const dir = buildPath(tempDir, "pgn-itest-svc-" ~ thisProcessID.to!string);
+    mkdirRecurse(dir);
+    scope (exit)
+        rmdirRecurse(dir);
+    if (password().length)
+    {
+        const passFile = buildPath(dir, "pgpass");
+        write(passFile, "named.invalid:" ~ serverPort().to!string ~ ":*:" ~ userName() ~ ":" ~ password() ~ "\n");
+        version (Posix)
+        {
+            import std.conv : octal;
+            import std.file : setAttributes;
+
+            setAttributes(passFile, octal!"600");
+        }
+        o = serverOptions(SslMode.disable);
+        o.host = "named.invalid";
+        o.hostAddress = ip;
+        o.password = null;
+        o.passFile = passFile;
+        new Connection(o).close();
+    }
+
+    // TLS checks the certificate against the host name, not the address
+    if (serverSetUp())
+    {
+        o = serverOptions(SslMode.verifyFull);
+        o.tls.caFile = tlsFile("ca.pem");
+        o.host = "localhost"; // in the certificate
+        o.hostAddress = ip;
+        conn = new Connection(o);
+        enforce(conn.isEncrypted, "verify-full with hostaddr");
+        conn.close();
+        o.host = "wrong.invalid";
+        enforce(collectException!ConnectionException(new Connection(o)) !is null, "name checked, not the address");
+    }
+
+    // services: keywords from the service file; the string's win
+    const serviceFile = buildPath(dir, "pg_service.conf");
+    write(serviceFile, "# test services\n[itest]\nhost=" ~ serverHost() ~ "\nport=" ~ serverPort()
+            .to!string
+            ~ "\ndbname=" ~ databaseName() ~ "\nuser=" ~ userName() ~ "\npassword=" ~ password()
+            ~ "\nsslmode=disable\napplication_name=from-service\n");
+    conn = new Connection("service=itest servicefile=" ~ serviceFile);
+    enforce(scalar(conn, "SHOW application_name") == "from-service", "service");
+    conn.close();
+    conn = new Connection("service=itest servicefile=" ~ serviceFile ~ " application_name=from-string");
+    enforce(scalar(conn, "SHOW application_name") == "from-string", "the string wins");
+    conn.close();
+    enforce(collectException!ClientException(
+            new Connection("service=missing servicefile=" ~ serviceFile)) !is null,
+            "unknown service");
+
+    // PGSERVICE / PGSERVICEFILE: the service wins over the other PG* variables
+    const saved = environment.toAA();
+    scope (exit)
+        foreach (v; ["PGSERVICE", "PGSERVICEFILE", "PGAPPNAME"])
+        {
+            if (auto value = v in saved)
+                environment[v] = *value;
+            else
+                environment.remove(v);
+        }
+    environment["PGSERVICE"] = "itest";
+    environment["PGSERVICEFILE"] = serviceFile;
+    environment["PGAPPNAME"] = "from-env";
+    conn = new Connection(fromEnvironment());
+    enforce(scalar(conn, "SHOW application_name") == "from-service", "PGSERVICE");
+    conn.close();
+}

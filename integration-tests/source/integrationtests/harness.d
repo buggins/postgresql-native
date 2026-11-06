@@ -68,6 +68,7 @@ immutable TestCase[] allTests = [
     TestCase("pool: reuse, session reset, limits", &testPool, true),
     TestCase("target_session_attrs, load_balance_hosts", &testTargetSessionAttrs, true),
     TestCase("PG* environment, password file, ~/.postgresql files", &testEnvironmentAndUserFiles, true),
+    TestCase("hostaddr and connection services", &testHostaddrAndServices, true),
     TestCase("arrays", &testArrays, true),
     TestCase("ranges and multiranges", &testRanges, true),
     TestCase("composite types, enums, domains", &testCompositesEnumsDomains, true),

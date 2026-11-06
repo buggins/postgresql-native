@@ -94,8 +94,10 @@ auto conn2 = new Connection("host=db1 dbname=sales user=app application_name=rep
 auto conn3 = new Connection(fromEnvironment());   // PGHOST, PGUSER, PGDATABASE, PGSSLMODE, ...
 ```
 
-Keywords are libpq's: `host`, `port` (several, comma-separated, for
-failover), `dbname`, `user`, `password`, `passfile`, `options`,
+Keywords are libpq's: `host`, `hostaddr` (numeric addresses to connect to,
+keeping `host` for TLS name checks and the password file), `port` (several,
+comma-separated, for failover), `service` and `servicefile` (connection services,
+`pg_service.conf`), `dbname`, `user`, `password`, `passfile`, `options`,
 `application_name`, `connect_timeout`, `sslmode` (`disable`, `allow`,
 `prefer` (the default), `require`, `verify-ca`, `verify-full`),
 `sslnegotiation`, `sslrootcert` (`system` for the system's store), `sslcert`,
@@ -108,8 +110,13 @@ failover), `dbname`, `user`, `password`, `passfile`, `options`,
 plus the timeouts, `statementTimeout` and run-time parameters for the startup
 message.
 
-`ConnectionOptions.parse` reads only the string; `fromEnvironment` starts from
-the `PG*` variables, as `psql` does. Without a password, one from the password
+`ConnectionOptions.parse` reads only the string (and the service file a
+`service` names); `fromEnvironment` adds the `PG*` variables, as `psql` does:
+the string's keywords first, then the service's (`PGSERVICE`), then the
+environment's. Service files are the user's (`servicefile`, `PGSERVICEFILE`,
+else `~/.pg_service.conf`) and then the system's (`pg_service.conf` in
+`PGSYSCONFDIR`, else in `/etc/postgresql-common`, `/etc/sysconfig/pgsql` or
+`/etc`). Without a password, one from the password
 file is used when the server asks (`passfile`, `PGPASSFILE`, else
 `~/.pgpass`; `%APPDATA%\postgresql\pgpass.conf` on Windows). The TLS files
 default to `root.crt`, `postgresql.crt` and `postgresql.key` in
