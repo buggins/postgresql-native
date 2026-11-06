@@ -58,6 +58,7 @@ immutable TestCase[] allTests = [
     TestCase("placeholders, client and server errors, RETURNING", &testPlaceholdersAndErrors, true),
     TestCase("statement cache: reuse, eviction, invalidation", &testStatementCache, true),
     TestCase("prepared statements", &testPreparedStatements, true),
+    TestCase("Variant[] parameters (run-time values)", &testVariantParameters, true),
     TestCase("several result sets", &testMultipleResults, true),
     TestCase("transactions and savepoints", &testTransactions, true),
     TestCase("statement_timeout, idle cancel", &testStatementTimeout, true),

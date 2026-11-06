@@ -325,6 +325,10 @@ unittest
 
     assert(readValue!int(v(Oid.int8, [0, 0, 0, 0, 0, 0, 0, 7])) == 7);
     assertThrown!ClientException(readValue!ubyte(v(Oid.int4, [0, 0, 1, 0])));
+    assertThrown!ClientException(readValue!ulong(v(Oid.int4, [0xFF, 0xFF, 0xFF, 0xFF]))); // -1
+    assertThrown!ClientException(readValue!uint(v(Oid.int8, [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+    ])));
     assert(readValue!Color(v(Oid.int4, [0, 0, 0, 2])) == Color.green);
     assert(readValue!Color(v(Oid.unknown, cast(immutable(ubyte)[]) "red", ValueFormat.text)) == Color.red);
     assert(readValue!Color(v(Oid.text, cast(immutable(ubyte)[]) "2", ValueFormat.text)) == Color.green);

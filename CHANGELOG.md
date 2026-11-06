@@ -6,6 +6,27 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.3.0 (2026-11-06)
+
+### Added
+
+- Parameter values known only at run time, for drivers such as ddbc's
+  (#24): `Connection.query(sql, Variant[])`, `exec(sql, Variant[])`,
+  `PreparedStatement.query(Variant[])` and `exec(Variant[])`; an empty
+  `Variant` or `null` is NULL; `byte[]` values are sent as `bytea`.
+
+### Changed
+
+- Values of text types (`text`, `varchar`, `char(n)`, `name`, enums,
+  `citext`) are read by the other getters as text-format values are:
+  `getLong` of `'17'`, `getBool` of `'t'`, `getDate` of `'2026-11-06'`
+  (before, only text-format values were parsed).
+
+### Fixed
+
+- `get!ulong` and the other unsigned integer conversions accepted negative
+  values (a signed/unsigned comparison).
+
 ## 0.2.0 (2026-11-06)
 
 ### Added

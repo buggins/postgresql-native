@@ -276,3 +276,44 @@ void testMultipleResults()
     enforce(e !is null && e.sqlState == "22012" && !conn.isBusy, "error in the second statement");
     enforce(firstRow(conn, "SELECT 'fine'").getString(0) == "fine", "usable");
 }
+
+/// Parameter values known at run time: `Variant[]` for `query`, `exec` and prepared statements.
+void testVariantParameters()
+{
+    import std.datetime.date : Date;
+    import std.variant : Variant;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    Variant[] args = [
+        Variant(42), Variant("text"), Variant(Decimal.fromString("1.50")), Variant(Date(2026, 11, 6)),
+        Variant(), Variant(null), Variant(cast(byte[])[1, 2])
+    ];
+    auto r = conn.query("SELECT ?::int8, ?::text, ?::numeric, ?::date, ?::int4, ?::text, ?::bytea", args);
+    const row = r.front;
+    enforce(row.getLong(0) == 42 && row.getString(1) == "text" && row.getString(2) == "1.50"
+            && row.getDate(3) == Date(2026, 11, 6) && row.isNull(4) && row.isNull(5) && row.getBytes(6) == [
+                1, 2
+    ],
+            "Variant parameters");
+    r.close();
+    auto none = conn.query("SELECT 1", new Variant[0]);
+    enforce(none.front.getInt(0) == 1, "no parameters");
+    none.close();
+    assertThrown!ClientException(conn.query("SELECT ?::int", new Variant[0]));
+    assertThrown!ClientException(conn.query("SELECT ?::int", [Variant(1), Variant(2)]));
+
+    conn.exec("CREATE TEMP TABLE itest_variant (id int, name text)");
+    enforce(conn.exec("INSERT INTO itest_variant VALUES (?, ?)", [Variant(1), Variant("one")]) == 1, "exec");
+    auto stmt = conn.prepare("INSERT INTO itest_variant VALUES ($1, $2)");
+    enforce(stmt.exec([Variant(2), Variant()]) == 1, "prepared exec");
+    enforce(stmt.query([Variant(3), Variant("three")]).commandTag == "INSERT 0 1", "prepared query");
+    stmt.close();
+    enforce(conn.queryValue!long("SELECT count(*) FROM itest_variant WHERE name IS NULL") == 1, "NULL inserted");
+
+    // text values (binary format: their text) read by the other getters, as text-format values are
+    const text = firstRow(conn, "SELECT '17'::text, 't'::varchar, '2026-11-06'::text, '1.5'::name");
+    enforce(text.getLong(0) == 17 && text.getBool(1) && text.getDate(2) == Date(2026, 11, 6)
+            && text.getDouble(3) == 1.5, "getters on text values");
+}

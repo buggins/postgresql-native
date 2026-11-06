@@ -86,9 +86,19 @@ struct Value
         return null_ ? null : data;
     }
 
-    private @property bool binary() const @safe pure nothrow
+    // Whether the value is in a binary form to decode. The binary form of text types (text, varchar, char(n),
+    // name, enums, citext) is their text, so they are read as text: getLong parses '17', getBool 't'.
+    private @property bool binary() const @safe nothrow
     {
-        return column.format == ValueFormat.binary;
+        if (column.format != ValueFormat.binary)
+            return false;
+        switch (codec)
+        {
+        case Oid.text, Oid.varchar, Oid.bpchar, Oid.name, Oid.unknown:
+            return false;
+        default:
+            return true;
+        }
     }
 
     private @property const(char)[] text() const @safe pure nothrow
@@ -860,7 +870,11 @@ struct Value
                 }
             }
             const n = getLong();
-            if (n < U.min || (U.max <= long.max && n > cast(long) U.max))
+            static if (U.min == 0)
+                const below = n < 0; // (comparing with ulong's 0 would compare as unsigned)
+            else
+                const below = n < U.min;
+            if (below || (U.max <= long.max && n > cast(long) U.max))
                 throw new ClientException("Value " ~ n.to!string ~ " does not fit in " ~ U.stringof);
             return cast(T) n;
         }
