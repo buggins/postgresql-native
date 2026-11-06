@@ -11,10 +11,10 @@ import std.format : format;
 import postgresql;
 import integrationtests.server;
 
-/// The first row of `sql`; the result is closed.
-Row firstRow(Connection conn, string sql)
+/// The first row of `sql` run with `args`; the result is closed.
+Row firstRow(Args...)(Connection conn, string sql, Args args)
 {
-    auto r = conn.query(sql);
+    auto r = conn.query(sql, args);
     scope (exit)
         r.close();
     enforce(!r.empty, "no row");

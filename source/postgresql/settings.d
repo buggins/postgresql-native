@@ -128,6 +128,20 @@ struct ConnectionOptions
     /// The highest protocol version to ask for.
     ProtocolVersion maxProtocolVersion = ProtocolVersion.v30;
 
+    /++
+    How many statements of `Connection.query`/`exec` with parameters the
+    connection keeps prepared, by SQL text (keyword `statement_cache_size`).
+    0 parses every statement again (the unnamed statement), as needed behind
+    poolers that don't keep prepared statements (PgBouncer in transaction
+    mode before 1.21).
+    +/
+    size_t statementCacheSize = 100;
+    /++
+    Whether `?` placeholders are rewritten to `$1`, `$2`, ... when a query
+    has parameters (keyword `rewrite_placeholders`); `??` is a literal `?`.
+    +/
+    bool rewritePlaceholders = true;
+
     /// Time allowed to connect, start TLS and log in.
     Duration connectTimeout = 15.seconds;
     /// Time allowed for each write.
@@ -171,7 +185,7 @@ struct ConnectionOptions
     +/
     static ConnectionOptions fromParams(const string[string] params)
     {
-        import dbwire.client.dsn : parseSeconds;
+        import dbwire.client.dsn : parseFlag, parseSeconds;
         import std.array : split;
         import std.conv : ConvException, to;
         import std.string : strip, toLower;
@@ -247,6 +261,15 @@ struct ConnectionOptions
             case "client_encoding":
                 if (value.toLower != "utf8" && value.toLower != "utf-8")
                     throw new ClientException("Only client_encoding=UTF8 is supported");
+                break;
+            case "statement_cache_size":
+                try
+                    o.statementCacheSize = value.strip.to!size_t;
+                catch (ConvException)
+                    throw new ClientException("Invalid statement_cache_size '" ~ value ~ "'");
+                break;
+            case "rewrite_placeholders":
+                o.rewritePlaceholders = parseFlag(key, value);
                 break;
             case "io_mode":
                 o.ioMode = parseKeyword!IoMode(key, value, ["auto", "phobos", "vibe"]);

@@ -10,6 +10,7 @@ import std.stdio : stderr, writefln;
 
 import integrationtests.basic;
 import integrationtests.connect;
+import integrationtests.params;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
 import integrationtests.types;
@@ -49,6 +50,11 @@ immutable TestCase[] allTests = [
     TestCase("numeric", &testNumeric, true),
     TestCase("dates, times, timestamps, intervals", &testDateTimes, true),
     TestCase("text fallback, variants, simple-protocol values", &testTextFallbackAndVariants, true),
+    TestCase("parameters of every D type", &testParameterTypes, true),
+    TestCase("placeholders, client and server errors, RETURNING", &testPlaceholdersAndErrors, true),
+    TestCase("statement cache: reuse, eviction, invalidation", &testStatementCache, true),
+    TestCase("prepared statements", &testPreparedStatements, true),
+    TestCase("several result sets", &testMultipleResults, true),
 ];
 
 /// Runner identity, for reports.

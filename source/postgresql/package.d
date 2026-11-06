@@ -22,6 +22,8 @@ public import postgresql.settings;
 public import postgresql.types.temporal : Interval;
 public import postgresql.types.oids : Oid;
 public import postgresql.value;
+public import postgresql.statement : PreparedStatement;
+public import postgresql.params : Param, encodeParam, rewritePlaceholders;
 public import dbwire.types.decimal : Decimal;
 
 /// Library version.

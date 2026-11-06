@@ -235,6 +235,8 @@ final class QueryResult
     private bool rowsDone; // no more rows of this result
     private string tag;
     private string timeZone;
+    private ColumnInfo[] nextColumns; // the next result of a multi-statement query, already described
+    private bool hasNext;
 
     package this(Connection conn, ColumnInfo[] columns, string tag, bool rowsDone)
     {
@@ -244,7 +246,12 @@ final class QueryResult
         this.tag = tag;
         this.rowsDone = rowsDone;
         if (rowsDone)
-            finish();
+        {
+            if (conn.nextResult(nextColumns))
+                hasNext = true;
+            else
+                finish();
+        }
         else
             advance();
     }
@@ -290,11 +297,36 @@ final class QueryResult
     void close()
     {
         hasCurrent = false;
+        hasNext = false;
         if (!done)
         {
             rowsDone = true;
             finish();
         }
+    }
+
+    /++
+    Moves to the rows of the next statement of a multi-statement query
+    (`Connection.querySimple`), once the current rows are read: returns
+    false when there are no more statements with rows. Statements without
+    rows in between are skipped. The connection stays busy while another
+    result may follow.
+
+    Throws: `ClientException` if the current rows aren't all read yet.
+    +/
+    bool nextResult()
+    {
+        if (hasCurrent)
+            throw new ClientException("Read the rows of the current result before moving to the next one");
+        if (!hasNext)
+            return false;
+        hasNext = false;
+        columns_ = nextColumns;
+        nextColumns = null;
+        tag = null;
+        rowsDone = false;
+        advance();
+        return true;
     }
 
     private void advance()
@@ -306,7 +338,10 @@ final class QueryResult
         if (!hasCurrent)
         {
             rowsDone = true;
-            finish();
+            if (conn.nextResult(nextColumns))
+                hasNext = true; // the connection stays busy for it
+            else
+                finish();
         }
     }
 
