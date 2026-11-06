@@ -75,6 +75,7 @@ jobs:
       POSTGRES_DB: testdb
       POSTGRES_USER: testuser
       POSTGRES_PASSWORD: Test_password123
+      POSTGRES_SETUP: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dlang-community/setup-dlang@v2.0.0
@@ -82,6 +83,8 @@ jobs:
           compiler: ldc-latest
       - name: Server is reachable
         run: docker exec ${{ job.services.postgres.id }} psql -U testuser -d testdb -c "SELECT version()"
+      - name: TLS and a user per authentication method
+        run: sh integration-tests/setup-server.sh ${{ job.services.postgres.id }}
       - name: Integration tests (threads)
         run: dub run :integration-tests-phobos
       - name: Integration tests (vibe.d fibers)

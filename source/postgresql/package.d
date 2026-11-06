@@ -14,6 +14,12 @@ Authors:   Vadim Lopatin
 +/
 module postgresql;
 
+public import postgresql.connection;
+public import postgresql.exception;
+public import postgresql.protocol.codes : TransactionStatus, protocol30, protocol32;
+public import postgresql.result;
+public import postgresql.settings;
+
 /// Library version.
 enum uint postgresqlVersionMajor = 0;
 /// ditto

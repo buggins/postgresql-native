@@ -8,6 +8,8 @@ module integrationtests.harness;
 import core.exception : AssertError;
 import std.stdio : stderr, writefln;
 
+import integrationtests.basic;
+import integrationtests.connect;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
 
@@ -29,6 +31,18 @@ struct TestCase
 immutable TestCase[] allTests = [
     TestCase("library version", &testVersion, false),
     TestCase("server answers an SSLRequest", &testSslRequestProbe, true),
+    TestCase("connect, session information, ping", &testConnect, true),
+    TestCase("URI and key=value strings, startup parameters", &testConnectionStrings, true),
+    TestCase("failed logins", &testLoginErrors, true),
+    TestCase("authentication methods, require_auth, SASLprep", &testAuthMethods, true),
+    TestCase("TLS: sslmode, verification, client certificates, direct TLS", &testTls, true),
+    TestCase("protocol version 3.2", &testProtocolVersion, true),
+    TestCase("failover to the next host", &testFailover, true),
+    TestCase("simple queries: text rows, tags, streaming", &testSimpleQuery, true),
+    TestCase("exec: affected rows, several statements", &testExec, true),
+    TestCase("errors keep the connection usable", &testErrors, true),
+    TestCase("notices", &testNotices, true),
+    TestCase("busy connections, FATAL errors", &testBusyAndFatal, true),
 ];
 
 /// Runner identity, for reports.

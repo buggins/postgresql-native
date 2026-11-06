@@ -6,7 +6,7 @@ Guidance for AI coding agents working on **postgresql-native**, a native D clien
 
 - **What:** a pure-D client for PostgreSQL over the **frontend/backend protocol 3.x** (TCP, port 5432; TLS through SSLRequest or direct TLS), for PostgreSQL 13–18 (tested; older servers probably work), with blocking (thread) and vibe.d (fiber) I/O. dub package `postgresql-native`, root module `postgresql`.
 - **Repo:** `git@github.com:buggins/postgresql-native.git`, default branch `main`. Author Vadim Lopatin (GitHub `buggins`). License BSL-1.0.
-- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10).
+- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold) and P1 (connect, TLS, authentication, simple queries) done.
 - **Builds on dbwire** (`../dbwire`, 0.6): `dbwire:types` (exceptions, `Decimal`), `:io` (transports, I/O backends, buffers), `:tls` (OpenSSL loaded at run time; ALPN for direct TLS), `:client` (DSN, failover, pool core), `:crypto` (PBKDF2 for SCRAM, secure random). Anything not protocol-specific is added to dbwire (issue + PR there), not here.
 - **Sibling projects:** `../oracle-native` and `../mssql-native` (the closest models: message layer over a byte stream, result streaming, parameters, pool, mapping, tests) and `../clickhoused`. Follow their structure, API style, tests and conventions (their `AGENTS.md`).
 - **`PLAN.md` (local and optional):** the design plan (protocol overview, types, API, milestones, decisions) is a local, untracked file (excluded through `.git/info/exclude`). If present, read it before design-level changes and keep it up to date; never `git add` it.
@@ -52,16 +52,49 @@ dub run :integration-tests-phobos                          # integration tests, 
 dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
 dub run :integration-tests-vibe1                           # ... with vibe-core 1.x
 POSTGRES_HOST=localhost:15418 POSTGRES_PASSWORD=Test_password123 dub run :integration-tests-phobos
+sh integration-tests/setup-server.sh pgnative-18      # TLS + a user per authentication method, then add:
+POSTGRES_SETUP=1
 ```
 
 Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). The server comes from `POSTGRES_HOST` (`host:port`), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (`integrationtests.server`); these are deliberately not libpq's `PG*` variables, which the library reads as defaults.
 
 Run lint and format before committing D code. dfmt 0.15.2 mangles lambdas with attributes (`() nothrow {` → `() nothrow{`): use named nested functions. It merges `@safe return` into `@safereturn`: avoid the `return` attribute. Run dfmt twice when it changes files. `dub.selections.json` files are git-ignored (a root one listing vibe-core would enable vibe support silently).
 
+`integration-tests/setup-server.sh <container>` prepares a server of the official image: TLS with the test certificates in `integration-tests/tls` (CA `ca.pem`, server certificate for `localhost` and `127.0.0.1`, client certificate `CN=certuser`, an unrelated `other-ca.pem`), users `scramuser`, `md5user`, `clearuser` (passwords `<name>_pw`), `trustuser`, `tlsuser` (hostssl only), `certuser` (client certificate), `saslpuser` (a password SASLprep changes), and the matching `pg_hba.conf`. Tests that need it run when `POSTGRES_SETUP=1` (CI sets it).
+
+## Layout
+
+```
+source/postgresql/
+  package.d            public imports, version constants, postgresqlHasVibe
+  connection.d         Connection: hosts/failover, SSLRequest or direct TLS, startup, authentication,
+                       simple query (exec, query), response reading, async messages (notices, ParameterStatus,
+                       notifications), close; AuthMethod, Notification
+  auth.d               SCRAM-SHA-256 client (+ -PLUS data: tls-server-end-point), MD5, SASLprep
+  settings.d           ConnectionOptions, SslMode, ...; URI and key=value parsing (libpq keywords), require_auth
+  result.d             ColumnInfo (RowDescription), Row (text values for now), QueryResult (streamed rows)
+  exception.d          ServerMessage (error/notice fields), ServerException + dbwire's exceptions
+  protocol/            codes.d (message types, auth codes, request codes), messages.d (framing: Message,
+                       MessageBody, MessageBuilder, MessageStream)
+integration-tests/     shared harness (dub subpackage `:integration-tests`), setup-server.sh, tls/ (test certificates)
+integration-tests-phobos/, integration-tests-vibe/, integration-tests-vibe1/   runners
+```
+
+## Protocol behaviour learned from real servers
+
+Checked on 13, 14, 16 and 18 (official Docker images).
+
+- **NegotiateProtocolVersion:** asked for 3.2, PostgreSQL 13 answers with the full version `0x00030000`, not only the minor version as the protocol documentation says; both forms are accepted. 18 accepts 3.2 (no NegotiateProtocolVersion).
+- **pg_hba rejections** are FATAL errors with SQLSTATE 28000 (`no pg_hba.conf entry ...`, `pg_hba.conf rejects connection ... no encryption`); `sslmode=allow` retries with TLS on any server error of the unencrypted attempt. Wrong passwords: 28P01; unknown database: 3D000.
+- **Direct TLS** to a server before 17: the server closes the connection during the handshake.
+- **SASLprep:** the server stores the prepared form of a password (`I\u00ADX\u00A0pass` → `IX pass`); both forms then log in.
+- **The image's defaults:** 14+ store passwords as SCRAM (`password_encryption`), 13 as MD5; an `md5` pg_hba rule uses SCRAM for a SCRAM-stored password. PostgreSQL 18 warns that MD5 passwords are deprecated.
+- **pg_terminate_backend** of the own session: FATAL 57P01, then the server closes the connection.
+
 ## Local environment
 
 - WSL2 Linux. **LDC 1.36.0** (`ldc2`); DMD is not installed. Test the minimum frontend with LDC 1.27.1 (download `https://github.com/ldc-developers/ldc/releases/download/v1.27.1/ldc2-1.27.1-linux-x86_64.tar.xz` into the scratchpad, run dub with `--compiler=<path>/bin/ldc2`).
-- PostgreSQL in Docker: containers `pgnative-18` (`postgres:18`, port **15418**) and `pgnative-13` (`postgres:13`, port **15413**); user `testuser` / `Test_password123`, database `testdb`. `psql` is inside the containers: `docker exec -it pgnative-18 psql -U testuser -d testdb`. Other versions: `postgres:14`, `postgres:16` on ports 15414, 15416 by the same pattern.
+- PostgreSQL in Docker: containers `pgnative-18`, `pgnative-16`, `pgnative-14`, `pgnative-13` (`postgres:<version>`, ports **15418**, 15416, 15414, 15413), prepared with `setup-server.sh`; user `testuser` / `Test_password123`, database `testdb`. `psql` is inside the containers: `docker exec -it pgnative-18 psql -U testuser -d testdb`.
 - The local `grep` is ugrep, which treats files with odd bytes as binary and prints nothing: use `grep -a` on wire dumps.
 
 ## Conventions
