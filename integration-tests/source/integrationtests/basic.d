@@ -48,7 +48,7 @@ void testSimpleQuery()
     enforce(r.empty, "empty query");
 }
 
-/// exec: affected rows, several statements, the rows of the first statement of a multi-statement query.
+/// exec and querySimple: affected rows, several statements, the rows of the first statement.
 void testExec()
 {
     auto conn = connectToServer();
@@ -62,10 +62,15 @@ void testExec()
     enforce(conn.exec("UPDATE itest_exec SET name = 'even' WHERE id % 2 = 0") == 5, "UPDATE");
     enforce(conn.exec("DELETE FROM itest_exec WHERE id > 8; SELECT * FROM itest_exec") == 8, "last statement counts");
 
-    auto r = conn.query("SELECT count(*) FROM itest_exec; SELECT 'second'");
+    auto r = conn.querySimple("SELECT count(*) FROM itest_exec; SELECT 'second'");
     enforce(r.front.getString(0) == "8", "first statement's rows");
     r.close();
     enforce(!conn.isBusy && scalar(conn, "SELECT 'next'") == "next", "rest discarded");
+    auto e = collectException!ServerException(conn.query("SELECT 1; SELECT 2"));
+    enforce(e !is null && e.sqlState == "42601", "query() refuses several statements");
+    auto seven = conn.querySimple("SELECT 7");
+    enforce(seven.front.getInt(0) == 7, "querySimple: text values through the getters");
+    seven.close();
 }
 
 /// Errors: fields, the connection stays usable, failed transactions, errors in the middle of rows.

@@ -232,14 +232,105 @@ final class Connection
     }
 
     /++
-    Runs a query with the simple query protocol and returns its rows, read as
-    the result is iterated. Values come in text format. For several
-    statements, the rows of the first one are returned and the rest of the
-    response is read and discarded when the result ends.
+    Runs one SQL statement and returns its rows, read as the result is
+    iterated (extended query protocol). Values of the types this client
+    decodes come in binary format, the others in text; the getters on each
+    row convert them (see `postgresql.value.Value`).
+
+    The statement is parsed and described first (one round trip), then
+    bound and executed. Several statements in one string are refused by the
+    server: use `querySimple` or `exec` for those.
 
     Throws: `ServerException`, from here or from the result.
     +/
     QueryResult query(string sql)
+    {
+        import postgresql.types.oids : hasBinaryDecoder;
+
+        startRequest();
+        ColumnInfo[] columns;
+        bool failed;
+        guarded({
+            MessageBuilder b;
+            b.begin(FrontendMessage.parse);
+            b.putCString(""); // the unnamed statement
+            b.putCString(sql);
+            b.putInt16(0); // the server infers parameter types
+            b.finish();
+            b.begin(FrontendMessage.describe);
+            b.putByte('S');
+            b.putCString("");
+            b.finish();
+            b.begin(FrontendMessage.flush);
+            b.finish();
+            stream.send(b.data);
+
+            // ParseComplete, ParameterDescription, then RowDescription or NoData
+            for (;;)
+            {
+                auto m = nextMessage();
+                if (m.type == BackendMessage.rowDescription)
+                {
+                    columns = parseRowDescription(m.body);
+                    break;
+                }
+                if (m.type == BackendMessage.noData)
+                    break;
+                if (m.type == BackendMessage.errorResponse)
+                {
+                    handleResponseMessage(m);
+                    failed = true;
+                    break;
+                }
+                handleResponseMessage(m);
+            }
+            if (failed)
+            {
+                // the server skips everything up to a Sync
+                MessageBuilder sync;
+                sync.begin(FrontendMessage.sync);
+                sync.finish();
+                stream.send(sync.data);
+                return;
+            }
+
+            foreach (ref c; columns)
+                c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
+            MessageBuilder e;
+            e.begin(FrontendMessage.bind);
+            e.putCString(""); // the unnamed portal
+            e.putCString("");
+            e.putInt16(0); // parameter formats
+            e.putInt16(0); // parameters
+            e.putInt16(cast(short) columns.length);
+            foreach (c; columns)
+                e.putInt16(c.format);
+            e.finish();
+            e.begin(FrontendMessage.execute);
+            e.putCString("");
+            e.putInt32(0); // all rows
+            e.finish();
+            e.begin(FrontendMessage.sync);
+            e.finish();
+            stream.send(e.data);
+        });
+        if (failed)
+        {
+            finishResponse(); // throws the server's error
+            throw new ProtocolException("The server reported a failure without an error");
+        }
+        return new QueryResult(this, columns, null, false);
+    }
+
+    /++
+    Runs one or more SQL statements with the simple query protocol and
+    returns the rows of the first one, read as the result is iterated. All
+    values are in text format (the getters parse them). The rest of the
+    response is read and discarded when the result ends.
+
+    Throws: `ServerException`, from here or from the result.
+    +/
+    QueryResult querySimple(string sql)
     {
         startSimpleQuery(sql);
         ColumnInfo[] columns;
@@ -308,7 +399,7 @@ final class Connection
     // --- results ---
 
     /// Reads the next row of the current result; `has` is false at its end (CommandComplete or an error).
-    package void nextRow(const(ColumnInfo)[] columns, ref Row row, ref bool has, ref string tag)
+    package void nextRow(const(ColumnInfo)[] columns, string timeZone, ref Row row, ref bool has, ref string tag)
     {
         has = false;
         guarded({
@@ -318,11 +409,13 @@ final class Connection
                 switch (m.type)
                 {
                 case BackendMessage.dataRow:
-                    row = parseDataRow(m.body, columns);
+                    row = parseDataRow(m.body, columns, timeZone);
                     has = true;
                     return;
                 case BackendMessage.commandComplete:
                     tag = m.body.readCString();
+                    return;
+                case BackendMessage.emptyQueryResponse, BackendMessage.portalSuspended:
                     return;
                 case BackendMessage.readyForQuery:
                     readyForQuery(m);
@@ -360,16 +453,22 @@ final class Connection
 
     // --- message handling ---
 
-    private void startSimpleQuery(string sql)
+    // Marks the connection busy with a new request.
+    private void startRequest()
     {
         checkReady();
+        state = State.busy;
+        responseDone = false;
+        hasPendingError = false;
+    }
+
+    private void startSimpleQuery(string sql)
+    {
         MessageBuilder b;
         b.begin(FrontendMessage.query);
         b.putCString(sql);
         b.finish();
-        state = State.busy;
-        responseDone = false;
-        hasPendingError = false;
+        startRequest();
         guarded({ stream.send(b.data); });
     }
 
@@ -422,8 +521,10 @@ final class Connection
             }
             break;
         case BackendMessage.rowDescription, BackendMessage.dataRow, BackendMessage.commandComplete,
-            BackendMessage.emptyQueryResponse:
-            break; // results not asked for
+            BackendMessage.emptyQueryResponse, BackendMessage.parseComplete, BackendMessage.bindComplete,
+            BackendMessage.closeComplete, BackendMessage.parameterDescription, BackendMessage.noData,
+            BackendMessage.portalSuspended:
+            break; // results not asked for, extended-protocol acknowledgements
         case BackendMessage.copyInResponse:
             // COPY FROM STDIN needs data the caller didn't give: abort it (the server answers with an error)
             MessageBuilder b;

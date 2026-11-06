@@ -6,7 +6,7 @@ Guidance for AI coding agents working on **postgresql-native**, a native D clien
 
 - **What:** a pure-D client for PostgreSQL over the **frontend/backend protocol 3.x** (TCP, port 5432; TLS through SSLRequest or direct TLS), for PostgreSQL 13–18 (tested; older servers probably work), with blocking (thread) and vibe.d (fiber) I/O. dub package `postgresql-native`, root module `postgresql`.
 - **Repo:** `git@github.com:buggins/postgresql-native.git`, default branch `main`. Author Vadim Lopatin (GitHub `buggins`). License BSL-1.0.
-- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold) and P1 (connect, TLS, authentication, simple queries) done.
+- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold), P1 (connect, TLS, authentication, simple queries) and P2 (extended-protocol results, binary types, getters) done.
 - **Builds on dbwire** (`../dbwire`, 0.6): `dbwire:types` (exceptions, `Decimal`), `:io` (transports, I/O backends, buffers), `:tls` (OpenSSL loaded at run time; ALPN for direct TLS), `:client` (DSN, failover, pool core), `:crypto` (PBKDF2 for SCRAM, secure random). Anything not protocol-specific is added to dbwire (issue + PR there), not here.
 - **Sibling projects:** `../oracle-native` and `../mssql-native` (the closest models: message layer over a byte stream, result streaming, parameters, pool, mapping, tests) and `../clickhoused`. Follow their structure, API style, tests and conventions (their `AGENTS.md`).
 - **`PLAN.md` (local and optional):** the design plan (protocol overview, types, API, milestones, decisions) is a local, untracked file (excluded through `.git/info/exclude`). If present, read it before design-level changes and keep it up to date; never `git add` it.
@@ -72,7 +72,11 @@ source/postgresql/
                        notifications), close; AuthMethod, Notification
   auth.d               SCRAM-SHA-256 client (+ -PLUS data: tls-server-end-point), MD5, SASLprep
   settings.d           ConnectionOptions, SslMode, ...; URI and key=value parsing (libpq keywords), require_auth
-  result.d             ColumnInfo (RowDescription), Row (text values for now), QueryResult (streamed rows)
+  result.d             ColumnInfo (RowDescription), Row (values + getter shortcuts), QueryResult (streamed rows)
+  value.d              Value: one value, binary or text, and its typed getters (getString = the server's text)
+  types/               oids.d (built-in OIDs, which are decoded from binary), numeric.d (binary numeric, exact
+                       text, Decimal), floats.d (shortest float text as the server prints it), temporal.d
+                       (date/time/timestamp(tz)/interval: calendar over the whole range, text output and parsing)
   exception.d          ServerMessage (error/notice fields), ServerException + dbwire's exceptions
   protocol/            codes.d (message types, auth codes, request codes), messages.d (framing: Message,
                        MessageBody, MessageBuilder, MessageStream)
@@ -90,6 +94,10 @@ Checked on 13, 14, 16 and 18 (official Docker images).
 - **SASLprep:** the server stores the prepared form of a password (`I\u00ADX\u00A0pass` → `IX pass`); both forms then log in.
 - **The image's defaults:** 14+ store passwords as SCRAM (`password_encryption`), 13 as MD5; an `md5` pg_hba rule uses SCRAM for a SCRAM-stored password. PostgreSQL 18 warns that MD5 passwords are deprecated.
 - **pg_terminate_backend** of the own session: FATAL 57P01, then the server closes the connection.
+- **query()** = Parse (unnamed) + Describe statement + Flush, then Bind with per-column result formats + Execute + Sync. After an error before the Bind the client sends Sync and reads to ReadyForQuery. Parse refuses several statements (42601).
+- **Float text** (12+, `extra_float_digits=1`): shortest exact digits, plain notation for decimal exponents -4 ≤ X < 15 (`float8`) / 6 (`float4`), else `d.ddde+XX` (two exponent digits at least). A decimal exactly halfway between two doubles is not used even when round-half-even would read it back (`-3.6681927456064224e+16`, not `-3.668192745606422e+16`).
+- **Text forms:** `bool::text` is `true`/`false`, but a bool column's text is `t`/`f`; `bytea` is hex (`\x00ff`); `"char"` with the high bit is `\ooo`, the zero byte empty. Interval (postgres style): `1 year 2 mons 3 days 04:05:06.789`, plural unless 1 (`-1 days`), a `+` before a positive part that follows a negative one. Dates `0044-03-15 BC`, years past 9999 unpadded; `timestamptz` offsets `+05:45`, `+00`, historical `+05:41:16`. Interval infinities from 17; numeric infinities from 14. PostgreSQL 13 and 14 refuse the largest interval literal (`2562047788:00:54.775807`).
+- **Time zones:** `timestamptz` text uses the session's `TimeZone` (ParameterStatus) through dbwire's `resolveTimeZone` (Phobos `PosixTimeZone`), which differs from the server before a zone's first transition (local mean time, e.g. Asia/Kathmandu before 1920) and after the last transition in the tz file (DST rules after 2037); buggins/dbwire#33.
 
 ## Local environment
 
