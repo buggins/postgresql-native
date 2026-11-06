@@ -603,11 +603,13 @@ ClientException outOfRange(string value, string type) @safe pure
     return new ClientException("The value " ~ value ~ " is out of the range of the parameter's type " ~ type);
 }
 
-Param encodeVariant(Variant value, uint oid) @trusted
+package Param encodeVariant(Variant value, uint oid) @trusted
 {
     // Variant's accessors aren't @safe; each branch copies a plain value out of it
-    if (!value.hasValue)
+    if (!value.hasValue || value.type == typeid(typeof(null)))
         return Param(true);
+    if (value.type == typeid(byte[]))
+        return encodeParam(cast(const(ubyte)[]) value.get!(byte[]), oid);
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime,
             SysTime, TimeOfDay, Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line,

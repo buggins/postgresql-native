@@ -18,6 +18,8 @@ import postgresql.exception : ClientException;
 import postgresql.params : encodeParam, hasVariant, Param;
 import postgresql.result : ColumnInfo, QueryResult;
 
+import std.variant : Variant;
+
 @safe:
 
 /// What the server told about a parsed statement.
@@ -52,6 +54,37 @@ package ParamEncoder makeEncoder(Args...)(Args args)
             holder.args[i] = args[i];
     }
     return &holder.encode;
+}
+
+/++
+Makes the encoder for values known only at run time: each `Variant` holds
+a parameter type of `encodeParam` (an empty `Variant` or `null`: NULL).
++/
+package ParamEncoder makeVariantEncoder(const Variant[] values) @trusted
+{
+    // copies of Variants holding plain values
+    auto holder = new VariantHolder;
+    holder.values = (cast(Variant[]) values).dup;
+    return &holder.encode;
+}
+
+private final class VariantHolder
+{
+    Variant[] values;
+
+    Param[] encode(const(uint)[] types) @trusted // Variant accessors; plain values
+    {
+        import std.conv : to;
+        import postgresql.params : encodeVariant;
+
+        if (types.length != values.length)
+            throw new ClientException("The statement has " ~ types.length.to!string ~ " parameter(s), but "
+                    ~ values.length.to!string ~ " value(s) were given");
+        auto params = new Param[values.length];
+        foreach (i, v; values)
+            params[i] = encodeVariant(v, types[i]);
+        return params;
+    }
 }
 
 private final class ArgsHolder(Args...)
@@ -221,6 +254,24 @@ final class PreparedStatement
             return (() @trusted => conn.runStatement(info, makeEncoder(args)))(); // Variant copies
         else
             return conn.runStatement(info, makeEncoder(args));
+    }
+
+    /++
+    Runs the statement with values known at run time, one `Variant` per
+    parameter (an empty `Variant` or `null` for NULL), and returns its rows.
+
+    Throws: as `query`.
+    +/
+    QueryResult query(const Variant[] args)
+    {
+        checkOpen();
+        return conn.runStatement(info, makeVariantEncoder(args));
+    }
+
+    /// ditto, returning the number of rows affected (see `Connection.exec`).
+    ulong exec(const Variant[] args)
+    {
+        return Connection.drainCount(query(args));
     }
 
     /// Runs the statement with `args` and returns the number of rows it affected (see `Connection.exec`).

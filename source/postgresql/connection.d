@@ -11,6 +11,7 @@ import core.time : Duration;
 import std.range.primitives : ElementType, empty, front, isInputRange, popFront;
 import std.traits : Unqual;
 import std.typecons : Nullable;
+import std.variant : Variant;
 
 import dbwire.client.hosts : connectFirst, HostPort, orderHosts;
 import dbwire.client.pool : Poolable;
@@ -296,6 +297,28 @@ final class Connection : Poolable
             else
                 return runSql(text, makeEncoder(args));
         }
+    }
+
+    /++
+    Runs one SQL statement with parameter values known only at run time
+    (for drivers and other generic code): one `Variant` per placeholder,
+    holding a type `encodeParam` takes (an empty `Variant` or `null` for
+    NULL). Otherwise as `query(sql, args...)`; a `Variant[]` given alone is
+    always taken as this list, not as one array parameter.
+
+    Throws: as `query`.
+    +/
+    QueryResult query(string sql, const Variant[] args)
+    {
+        size_t count;
+        const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
+        return runSql(text, makeVariantEncoder(args));
+    }
+
+    /// ditto, returning the number of rows affected (see `exec(sql, args...)`).
+    ulong exec(string sql, const Variant[] args)
+    {
+        return drainCount(query(sql, args));
     }
 
     /++
