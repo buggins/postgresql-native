@@ -6,6 +6,8 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.2.0 (2026-11-06)
+
 ### Added
 
 - COPY and LISTEN/NOTIFY (#8): `copyIn` (`CopyIn`: raw `write`, `writeRow`
@@ -16,9 +18,6 @@ project uses [semantic versioning](https://semver.org/).
   CSV and binary data, `columnTypes` for typed getters); `listen`,
   `unlisten`, `unlistenAll`, `notify`, `pollNotifications`,
   `waitForNotification` (timeout, thread and fiber mode), `onNotification`.
-  Fixed: a notice arriving alone while idle or during COPY IN no longer
-  blocks the reader.
-
 - More types (#7): arrays of any element type and dimensions (lower bounds,
   NULL elements), ranges and multiranges, composite types and records,
   enums, domains, `inet`/`cidr`, `macaddr`/`macaddr8`, `bit`/`varbit`, the
@@ -32,6 +31,23 @@ project uses [semantic versioning](https://semver.org/).
   `BitString`, `Point`..., `string[string]`; new getters `getArray`,
   `getRange`, `getMultirange`, `getRecord`, `getInet`, `getBitString`,
   `getHstore`. The same types work as parameters and in struct mapping.
+
+### Changed
+
+- Values of `inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit`, the
+  geometric types, `pg_lsn`, arrays, ranges, multiranges, composite types
+  and enum arrays now come in binary format (`ColumnInfo.format`); their
+  `getString` is unchanged (the server's text). `getVariant` holds `Inet`,
+  `BitString` and the geometric structs for those types instead of their
+  text, and `getBytes` of a `macaddr`/`macaddr8` gives its 6 or 8 bytes.
+- The struct mapping attributes (`@column`, `@ignore`) moved to
+  `postgresql.attributes`; `postgresql.mapping` and `postgresql` still
+  export them.
+
+### Fixed
+
+- A notice or notification arriving alone, while the connection was idle or
+  during `COPY FROM STDIN`, made the reader wait for another message.
 
 ## 0.1.0 (2026-11-06)
 
