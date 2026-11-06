@@ -30,6 +30,7 @@ public import postgresql.types.textformat : HstorePair;
 public import postgresql.value;
 public import postgresql.statement : PreparedStatement;
 public import postgresql.pipeline;
+public import postgresql.copy : CopyFormat, CopyIn, CopyOut, parseCsvLine, parseTextLine;
 public import postgresql.mapping : column, ignore, RowRange, sqlColumnName;
 public import postgresql.pool;
 public import postgresql.params : Param, encodeParam, rewritePlaceholders;

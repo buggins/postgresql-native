@@ -209,3 +209,112 @@ unittest
     assertThrown!ProtocolException(Numeric.decode([0, 2, 0, 0, 0, 0, 0, 0, 0, 1])); // truncated
     assertThrown!ProtocolException(Numeric.decode([0, 0, 0, 0, 0x12, 0x34, 0, 0])); // sign
 }
+
+/++
+The binary format of the numeric written as `text` (`-12.340`, `1e3` is not
+accepted; `NaN`, `Infinity`, `-Infinity`): what `numeric_send` would send
+for it, the display scale being the number of digits after the point.
+
+Throws: `ClientException` if `text` is not a decimal number.
++/
+immutable(ubyte)[] encodeNumericText(string text) pure
+{
+    import std.string : strip;
+
+    const s = text.strip;
+    ushort sign = NumericSign.positive;
+    void header(ref ubyte[] data, int count, int weight, ushort signBits, int scale)
+    {
+        foreach (v; [count, weight, cast(int) signBits, scale])
+            data ~= [cast(ubyte)(v >> 8), cast(ubyte) v];
+    }
+
+    ubyte[] data;
+    switch (s)
+    {
+    case "NaN":
+        header(data, 0, 0, NumericSign.nan, 0);
+        return (() @trusted => cast(immutable) data)();
+    case "Infinity":
+        header(data, 0, 0, NumericSign.positiveInfinity, 0);
+        return (() @trusted => cast(immutable) data)();
+    case "-Infinity":
+        header(data, 0, 0, NumericSign.negativeInfinity, 0);
+        return (() @trusted => cast(immutable) data)();
+    default:
+        break;
+    }
+    string digits = s;
+    if (digits.length && (digits[0] == '-' || digits[0] == '+'))
+    {
+        if (digits[0] == '-')
+            sign = NumericSign.negative;
+        digits = digits[1 .. $];
+    }
+    string intPart = digits, fracPart;
+    foreach (i, c; digits)
+        if (c == '.')
+        {
+            intPart = digits[0 .. i];
+            fracPart = digits[i + 1 .. $];
+            break;
+        }
+    if (intPart.length + fracPart.length == 0)
+        throw new ClientException("Invalid numeric '" ~ text ~ "'");
+    foreach (c; intPart ~ fracPart)
+        if (c < '0' || c > '9')
+            throw new ClientException("Invalid numeric '" ~ text ~ "'");
+    const scale = cast(int) fracPart.length;
+    // align to groups of 4 digits around the point
+    const intPad = (4 - intPart.length % 4) % 4;
+    const fracPad = (4 - fracPart.length % 4) % 4;
+    string all;
+    foreach (k; 0 .. intPad)
+        all ~= '0';
+    all ~= intPart;
+    all ~= fracPart;
+    foreach (k; 0 .. fracPad)
+        all ~= '0';
+    const intGroups = cast(int)((intPad + intPart.length) / 4);
+    short[] groups;
+    for (size_t i = 0; i < all.length; i += 4)
+        groups ~= cast(short)((all[i] - '0') * 1000 + (all[i + 1] - '0') * 100 + (all[i + 2] - '0') * 10
+                + (
+                    all[i + 3] - '0'));
+    int weight = intGroups - 1;
+    // strip leading and trailing zero groups
+    size_t first;
+    while (first < groups.length && groups[first] == 0)
+    {
+        first++;
+        weight--;
+    }
+    size_t last = groups.length;
+    while (last > first && groups[last - 1] == 0)
+        last--;
+    if (first == last)
+    {
+        weight = 0;
+        sign = NumericSign.positive;
+    }
+    header(data, cast(int)(last - first), weight, sign, scale);
+    foreach (g; groups[first .. last])
+        data ~= [cast(ubyte)(g >> 8), cast(ubyte) g];
+    return (() @trusted => cast(immutable) data)(); // not referenced elsewhere
+}
+
+///
+unittest
+{
+    foreach (text; [
+        "0", "1", "-12.340", "12345678.9", "0.0001", "10000", "-0.5", "123456789012345678901234567890",
+        "NaN", "Infinity", "0.00", "100.000100"
+    ])
+    {
+        const n = Numeric.decode(encodeNumericText(text));
+        const expected = text == "-0.5" ? "-0.5" : text;
+        assert(n.toString() == expected, text ~ " -> " ~ n.toString());
+    }
+    // the server's own bytes for 2.5 (weight 0, scale 1, digits 2 and 5000)
+    assert(encodeNumericText("2.5") == [0, 2, 0, 0, 0, 0, 0, 1, 0, 2, 0x13, 0x88]);
+}

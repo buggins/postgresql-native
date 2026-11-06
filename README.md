@@ -54,10 +54,11 @@ Features:
   `macaddr`/`macaddr8`, `bit`/`varbit`, the geometric types, `pg_lsn`, and
   the extension types `hstore`, `citext` and PostGIS `geometry`/`geography`;
   the others (`money`, `xml`, `tsvector`, ...) as text;
+- `COPY FROM STDIN` and `COPY TO STDOUT` (text, CSV, binary; rows of D values or
+  structs, streamed), `LISTEN`/`NOTIFY` with waiting for notifications;
 - struct mapping and a connection pool, in thread and fiber mode.
 
-Later: `COPY`, `LISTEN`/`NOTIFY` helpers, a
-[ddbc](https://github.com/buggins/ddbc) driver and
+Later: a [ddbc](https://github.com/buggins/ddbc) driver and
 [hibernated](https://github.com/buggins/hibernated) support. SCRAM channel
 binding is implemented and switches on with the next dbwire release (it needs
 the server's certificate from the TLS layer). GSSAPI, SSPI and Unix-domain
@@ -196,6 +197,50 @@ anything `Value.get!T` reads. `insert` writes up to 1000 rows per statement; out
 transaction block, an insert of several statements runs in a transaction of
 its own. Column names that are plain identifiers are folded to lower case, as
 PostgreSQL folds unquoted names.
+
+## COPY
+
+```d
+// load: values in text, CSV or binary rows, or bytes as they are
+auto copy = conn.copyIn("COPY notes (id, text) FROM STDIN");
+copy.writeRow(1, "first\tline");               // escaped as the format needs
+copy.writeRow(2, null);                         // NULL
+copy.write("3\tthird\n");                       // raw data
+const loaded = copy.finish();                   // 3 (abort() cancels; nothing is loaded)
+
+conn.copyInsert("orders", orders);             // structs, binary COPY: the fastest load
+auto bin = conn.copyInto("orders", ["id", "amount"]);  // binary rows of values
+bin.writeRow(10, Decimal.fromString("9.90"));
+bin.finish();
+
+// read: chunks of bytes, or rows
+auto csv = conn.copyOut("COPY (SELECT id, text FROM notes) TO STDOUT WITH (FORMAT csv)", CopyFormat.csv);
+csv.columnTypes([Oid.int4, Oid.text]);          // for typed getters (binary data needs them)
+foreach (row; csv)
+    writeln(row.getInt(0), " ", row.getString(1));
+```
+
+Data is sent in 64 KiB messages; a server error during a load (a bad row,
+a constraint) is noticed while writing and thrown, and nothing is loaded.
+Binary rows need each value's binary form for its column (`copyInto`
+looks the column types up); `numeric`, `jsonb` and text types are converted,
+types without one (composite values, ranges) need text or CSV.
+
+## LISTEN / NOTIFY
+
+```d
+listener.listen("events");
+other.notify("events", "payload");             // pg_notify, delivered at commit
+auto n = listener.waitForNotification(5.seconds);   // null on timeout
+if (!n.isNull)
+    writeln(n.get.channel, ": ", n.get.payload);
+auto pending = listener.pollNotifications();   // without waiting
+listener.onNotification = (Notification x) { ... };    // or as they arrive
+```
+
+Notifications also arrive with the responses to other statements
+(`takeNotifications`). `waitForNotification` checks the connection every few
+milliseconds; in fiber mode other tasks run meanwhile.
 
 ## Connection pool and vibe.d
 

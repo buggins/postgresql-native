@@ -14,6 +14,7 @@ immutable TestCase[] threadTests = [
     TestCase("thread: one connection per thread", &testThreads, true),
     TestCase("thread: cancel from another thread", &testCancelFromThread, true),
     TestCase("thread: a pool shared by threads", &testPoolThreads, true),
+    TestCase("thread: a notification from another thread", &testNotifyFromThread, true),
 ];
 
 /// Four threads, each with its own connection, run queries at the same time.
@@ -127,4 +128,25 @@ void testPoolThreads()
         t.join();
     enforce(done == 8 && failed == 0, "threads failed");
     enforce(pool.activeConnections == 0 && pool.idleConnections <= 3, "all returned, at most 3 opened");
+}
+
+/// waitForNotification without a time limit returns when another thread's connection notifies.
+void testNotifyFromThread()
+{
+    auto listener = connectToServer();
+    scope (exit)
+        listener.close();
+    listener.listen("itest_thread");
+    auto notifier = new Thread({
+        Thread.sleep(300.msecs);
+        auto sender = connectToServer();
+        scope (exit)
+            sender.close();
+        sender.notify("itest_thread", "from a thread");
+    });
+    notifier.start();
+    const start = MonoTime.currTime;
+    const n = listener.waitForNotification();
+    notifier.join();
+    enforce(n.get.payload == "from a thread" && MonoTime.currTime - start >= 300.msecs, "notified");
 }

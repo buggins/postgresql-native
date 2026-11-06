@@ -190,6 +190,17 @@ struct Row
     }
 }
 
+/// A `Row` of `values` (null for NULL when `nulls` says so) for `columns`.
+package Row makeRow(const(ColumnInfo)[] columns, immutable(ubyte)[][] values, bool[] nulls, string timeZone)
+{
+    Row row;
+    row.columns_ = columns;
+    row.values = (() @trusted => cast(immutable) values)(); // the caller hands them over
+    row.nulls = (() @trusted => cast(immutable) nulls)(); // ditto
+    row.timeZone = timeZone;
+    return row;
+}
+
 /// Parses a DataRow body into a `Row` for `columns`.
 package Row parseDataRow(MessageBody body, const(ColumnInfo)[] columns, string timeZone = null)
 {

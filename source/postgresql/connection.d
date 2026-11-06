@@ -10,10 +10,11 @@ import core.time : Duration;
 
 import std.range.primitives : ElementType, empty, front, isInputRange, popFront;
 import std.traits : Unqual;
+import std.typecons : Nullable;
 
 import dbwire.client.hosts : connectFirst, HostPort, orderHosts;
 import dbwire.client.pool : Poolable;
-import dbwire.io.backend : backendFor, IoBackend;
+import dbwire.io.backend : backendFor, IoBackend, PoolSync;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
 
@@ -28,6 +29,7 @@ import postgresql.mapping : fieldPositions, hasVariantField, insertSql, mappedFi
 import postgresql.pipeline;
 import postgresql.settings;
 import postgresql.statement;
+import postgresql.copy : CopyFormat, CopyIn, CopyOut;
 import postgresql.types.oids : Oid;
 import postgresql.types.pgtype : PgType;
 
@@ -85,6 +87,9 @@ final class Connection : Poolable
     private uint protocol = protocol30;
     private AuthMethod auth;
     private Notification[] notifications;
+    private ulong notificationCount; // notifications read so far
+    private Notification lastNotification;
+    private PoolSync waitSync; // a timed wait in the I/O mode of the connection (waitForNotification)
     private StatementCache cache; // null when statementCacheSize is 0
     private string[] pendingCloses; // statements to close with the next extended-protocol request
     private ulong statementCounter;
@@ -101,6 +106,12 @@ final class Connection : Poolable
     output, ...); may be null.
     +/
     void delegate(ServerMessage notice) @safe onNotice;
+
+    /++
+    Called with each notification (`LISTEN`/`NOTIFY`) as it is read; when
+    set, notifications are not kept for `takeNotifications`. May be null.
+    +/
+    void delegate(Notification notification) @safe onNotification;
 
     /++
     Connects and logs in.
@@ -1452,6 +1463,285 @@ final class Connection : Poolable
         }
     }
 
+    // --- COPY ---
+
+    /++
+    Starts `COPY ... FROM STDIN` (`sql`) and returns its writer: write the
+    data, then `finish` (or `abort`). `rowFormat` says how `CopyIn.writeRow`
+    writes rows when the statement uses text format: `text` (the default) or
+    `csv` (with `FORMAT csv` in the statement); binary statements write binary.
+
+    Throws: `ClientException` if `sql` is not a `COPY ... FROM STDIN`;
+    `ServerException` if the server refuses it.
+    +/
+    CopyIn copyIn(string sql, CopyFormat rowFormat = CopyFormat.text)
+    {
+        CopyIn result;
+        startSimpleQuery(sql);
+        guarded({
+            for (;;)
+            {
+                auto m = nextMessage();
+                switch (m.type)
+                {
+                case BackendMessage.copyInResponse:
+                    auto b = m.body;
+                    const overall = b.readByte();
+                    const count = b.readInt16();
+                    const format = overall == 1 ? CopyFormat.binary : rowFormat == CopyFormat.binary
+                        ? CopyFormat.text : rowFormat;
+                    result = new CopyIn(this, format, count < 0 ? 0 : count, null);
+                    return;
+                case BackendMessage.readyForQuery:
+                    readyForQuery(m);
+                    return;
+                default:
+                    handleResponseMessage(m);
+                }
+            }
+        });
+        if (result is null)
+        {
+            throwPendingError();
+            throw new ClientException("The statement is not a COPY ... FROM STDIN");
+        }
+        return result;
+    }
+
+    /++
+    Starts a `COPY` into `table`'s `columns` (all columns if empty) in
+    `format`; for binary, the column types are looked up first (a statement
+    of the statement cache), so `CopyIn.writeRow` can write binary rows.
+    Column names are written as `sqlColumnName` writes them; `table` as given.
+
+    Throws: as `copyIn`.
+    +/
+    CopyIn copyInto(string table, const string[] columns, CopyFormat format = CopyFormat.binary)
+    {
+        import postgresql.mapping : sqlColumnName;
+
+        string list;
+        foreach (i, c; columns)
+            list ~= (i ? ", " : "") ~ sqlColumnName(c);
+        const(PgType)[] columnTypes;
+        if (format == CopyFormat.binary)
+        {
+            auto r = query("SELECT " ~ (list.length ? list : "*") ~ " FROM " ~ table ~ " WHERE false");
+            foreach (c; r.columns)
+                columnTypes ~= c.type.get;
+            r.close();
+        }
+        const options = format == CopyFormat.csv ? " WITH (FORMAT csv)" : format == CopyFormat.binary
+            ? " WITH (FORMAT binary)" : "";
+        auto copy = copyIn("COPY " ~ table ~ (list.length ? " (" ~ list ~ ")" : "") ~ " FROM STDIN" ~ options,
+                format);
+        copy.setTypes(columnTypes);
+        return copy;
+    }
+
+    /++
+    Loads structs into `table` with a binary `COPY`: one column per mapped
+    field (see `postgresql.mapping`), as `insert` does but faster for many
+    rows. The copy is atomic (all rows or none).
+
+    Returns: the number of rows loaded.
+    Throws: `ServerException` if the server refuses a row (nothing is
+    loaded); `ClientException` for a value that has no binary form for its
+    column (use `insert` or a text `copyInto` then).
+    +/
+    ulong copyInsert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
+    {
+        import postgresql.attributes : columnNames;
+
+        alias E = Unqual!(ElementType!R);
+        auto copy = copyInto(table, columnNames!E, CopyFormat.binary);
+        scope (failure)
+            copy.abort();
+        foreach (ref row; rows)
+        {
+            static if (hasVariantField!E)
+                (() @trusted => copy.writeStruct(row))(); // Variant copies
+            else
+                copy.writeStruct(row);
+        }
+        return copy.finish();
+    }
+
+    /++
+    Starts `COPY ... TO STDOUT` (`sql`, a table or a query) and returns its
+    reader. `rowFormat` says how rows are parsed when the statement uses
+    text format: `text` (the default) or `csv` (with `FORMAT csv`).
+
+    Throws: `ClientException` if `sql` is not a `COPY ... TO STDOUT`;
+    `ServerException` if the server refuses it.
+    +/
+    CopyOut copyOut(string sql, CopyFormat rowFormat = CopyFormat.text)
+    {
+        CopyOut result;
+        startSimpleQuery(sql);
+        guarded({
+            for (;;)
+            {
+                auto m = nextMessage();
+                switch (m.type)
+                {
+                case BackendMessage.copyOutResponse:
+                    auto b = m.body;
+                    const overall = b.readByte();
+                    const count = b.readInt16();
+                    const format = overall == 1 ? CopyFormat.binary : rowFormat == CopyFormat.binary
+                        ? CopyFormat.text : rowFormat;
+                    result = new CopyOut(this, format, count < 0 ? 0 : count, parameterStatus("TimeZone"));
+                    return;
+                case BackendMessage.readyForQuery:
+                    readyForQuery(m);
+                    return;
+                default:
+                    handleResponseMessage(m);
+                }
+            }
+        });
+        if (result is null)
+        {
+            throwPendingError();
+            throw new ClientException("The statement is not a COPY ... TO STDOUT");
+        }
+        return result;
+    }
+
+    // Whether the server sent something not read yet.
+    package bool serverDataAvailable()
+    {
+        return stream.hasBuffered || transport.dataAvailable();
+    }
+
+    // Whether the current request's ReadyForQuery was read.
+    package @property bool isReadyForQuery() const pure nothrow
+    {
+        return responseDone;
+    }
+
+    // Forgets the error of the current response (an expected one).
+    package void discardPendingError() pure nothrow
+    {
+        hasPendingError = false;
+    }
+
+    // --- LISTEN / NOTIFY ---
+
+    /++
+    Starts listening on `channel` (`LISTEN`): notifications sent to it
+    arrive with any later response, or with `pollNotifications` and
+    `waitForNotification` while idle. The name is quoted (case-sensitive).
+
+    Throws: `ServerException`.
+    +/
+    void listen(string channel)
+    {
+        exec("LISTEN " ~ quoteIdentifier(channel));
+    }
+
+    /// Stops listening on `channel` (`UNLISTEN`).
+    void unlisten(string channel)
+    {
+        exec("UNLISTEN " ~ quoteIdentifier(channel));
+    }
+
+    /// Stops listening on all channels (`UNLISTEN *`).
+    void unlistenAll()
+    {
+        exec("UNLISTEN *");
+    }
+
+    /++
+    Sends a notification (`pg_notify`) to the listeners of `channel` (when
+    the transaction commits).
+
+    Throws: `ServerException` (e.g. a payload of 8000 bytes or more).
+    +/
+    void notify(string channel, string payload = null)
+    {
+        exec("SELECT pg_catalog.pg_notify($1, $2)", channel, payload);
+    }
+
+    /++
+    Reads the notifications the server has sent while the connection was
+    idle (without waiting) and returns all those not taken yet, like
+    `takeNotifications`.
+
+    Throws: `ClientException` if the connection is busy or closed; `ServerException` (e.g. the session was
+    terminated); `ConnectionException`.
+    +/
+    Notification[] pollNotifications()
+    {
+        readIdleMessages();
+        return takeNotifications();
+    }
+
+    /++
+    Waits up to `timeout` (`Duration.max`: without limit) for a notification
+    and returns the first one not taken yet (with `onNotification` set: the
+    first one delivered to it while waiting); null on timeout. The wait checks
+    the connection every few milliseconds (at most 50) and lets other tasks
+    run in fiber mode.
+
+    Throws: `ClientException` if the connection is busy or closed; `ServerException`; `ConnectionException`.
+    +/
+    Nullable!Notification waitForNotification(Duration timeout = Duration.max)
+    {
+        import core.time : MonoTime, msecs;
+        import std.algorithm.comparison : min;
+
+        const forever = timeout == Duration.max;
+        const deadline = forever ? MonoTime.max : MonoTime.currTime + timeout;
+        const before = notificationCount;
+        auto step = 1.msecs;
+        for (;;)
+        {
+            readIdleMessages();
+            if (onNotification !is null)
+            {
+                if (notificationCount != before)
+                    return Nullable!Notification(lastNotification);
+            }
+            else if (notifications.length)
+            {
+                auto n = notifications[0];
+                notifications = notifications[1 .. $];
+                return Nullable!Notification(n);
+            }
+            const now = MonoTime.currTime;
+            if (now >= deadline)
+                return Nullable!Notification.init;
+            const pause = forever ? step : min(step, deadline - now);
+            if (waitSync is null)
+                waitSync = backend.newPoolSync();
+            waitSync.lock();
+            scope (exit)
+                waitSync.unlock();
+            waitSync.wait(pause);
+            step = min(step * 2, 50.msecs);
+        }
+    }
+
+    // Reads what the server sent to an idle connection: notifications, notices, parameter changes, a FATAL error.
+    private void readIdleMessages()
+    {
+        checkReady();
+        guarded({
+            while (serverDataAvailable())
+            {
+                auto m = stream.read();
+                if (handleAsync(m))
+                    continue;
+                if (m.type != BackendMessage.errorResponse)
+                    throw new ProtocolException("Unexpected message '" ~ m.type ~ "' on an idle connection");
+                handleResponseMessage(m); // FATAL: closes and throws
+                hasPendingError = false;
+            }
+        });
+    }
+
     /++
     Makes the session as a new one would be, except for the prepared
     statements of the statement cache, which stay valid: rolls back an open
@@ -1606,7 +1896,7 @@ final class Connection : Poolable
         hasPendingError = false;
     }
 
-    private void startSimpleQuery(string sql)
+    package void startSimpleQuery(string sql)
     {
         MessageBuilder b;
         b.begin(FrontendMessage.query);
@@ -1617,37 +1907,56 @@ final class Connection : Poolable
     }
 
     /// Reads the next message, handling asynchronous ones (notices, parameter changes, notifications).
-    private Message nextMessage()
+    package Message nextMessage()
     {
         for (;;)
         {
             auto m = stream.read();
-            switch (m.type)
-            {
-            case BackendMessage.noticeResponse:
-                notice(ServerMessage.parse(m.body));
-                break;
-            case BackendMessage.parameterStatus:
-                auto b = m.body;
-                const name = b.readCString();
-                parameters[name] = b.readCString();
-                break;
-            case BackendMessage.notificationResponse:
-                auto b = m.body;
-                Notification n;
-                n.processId = b.readInt32();
-                n.channel = b.readCString();
-                n.payload = b.readCString();
-                notifications ~= n;
-                break;
-            default:
+            if (!handleAsync(m))
                 return m;
-            }
+        }
+    }
+
+    // Reads one message; handles it and returns false if it is asynchronous (it may be the only one available).
+    package bool readMessage(ref Message m)
+    {
+        m = stream.read();
+        return !handleAsync(m);
+    }
+
+    // Handles an asynchronous message (notice, parameter change, notification); false for other messages.
+    private bool handleAsync(Message m)
+    {
+        switch (m.type)
+        {
+        case BackendMessage.noticeResponse:
+            notice(ServerMessage.parse(m.body));
+            return true;
+        case BackendMessage.parameterStatus:
+            auto b = m.body;
+            const name = b.readCString();
+            parameters[name] = b.readCString();
+            return true;
+        case BackendMessage.notificationResponse:
+            auto b = m.body;
+            Notification n;
+            n.processId = b.readInt32();
+            n.channel = b.readCString();
+            n.payload = b.readCString();
+            notificationCount++;
+            lastNotification = n;
+            if (onNotification !is null)
+                onNotification(n);
+            else
+                notifications ~= n;
+            return true;
+        default:
+            return false;
         }
     }
 
     // Handles a message of a response that the caller doesn't need.
-    private void handleResponseMessage(Message m)
+    package void handleResponseMessage(Message m)
     {
         switch (m.type)
         {
@@ -1684,7 +1993,7 @@ final class Connection : Poolable
         }
     }
 
-    private void readyForQuery(Message m)
+    package void readyForQuery(Message m)
     {
         auto b = m.body;
         const status = b.readByte();
@@ -1695,7 +2004,7 @@ final class Connection : Poolable
         state = State.ready;
     }
 
-    private void throwPendingError()
+    package void throwPendingError()
     {
         if (hasPendingError)
         {

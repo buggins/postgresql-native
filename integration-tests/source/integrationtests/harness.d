@@ -10,6 +10,7 @@ import std.stdio : stderr, writefln;
 
 import integrationtests.basic;
 import integrationtests.connect;
+import integrationtests.copynotify;
 import integrationtests.highlevel;
 import integrationtests.moretypes;
 import integrationtests.params;
@@ -73,6 +74,9 @@ immutable TestCase[] allTests = [
     TestCase("geometric types", &testGeometric, true),
     TestCase("hstore, citext, types read as text", &testExtensionAndTextTypes, true),
     TestCase("PostGIS geometry and geography (when installed)", &testPostgis, true),
+    TestCase("COPY FROM STDIN: text, CSV, binary, structs, errors", &testCopyIn, true),
+    TestCase("COPY TO STDOUT: text, CSV, binary", &testCopyOut, true),
+    TestCase("LISTEN/NOTIFY", &testListenNotify, true),
 ];
 
 /// Runner identity, for reports.
