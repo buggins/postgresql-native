@@ -13,6 +13,7 @@ import integrationtests.connect;
 import integrationtests.params;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
+import integrationtests.statements;
 import integrationtests.types;
 
 /// Integration test entry point. Throws on failure.
@@ -55,6 +56,9 @@ immutable TestCase[] allTests = [
     TestCase("statement cache: reuse, eviction, invalidation", &testStatementCache, true),
     TestCase("prepared statements", &testPreparedStatements, true),
     TestCase("several result sets", &testMultipleResults, true),
+    TestCase("transactions and savepoints", &testTransactions, true),
+    TestCase("statement_timeout, idle cancel", &testStatementTimeout, true),
+    TestCase("pipelines", &testPipelines, true),
 ];
 
 /// Runner identity, for reports.
