@@ -19,6 +19,10 @@ public import postgresql.exception;
 public import postgresql.protocol.codes : TransactionStatus, protocol30, protocol32;
 public import postgresql.result;
 public import postgresql.settings;
+public import postgresql.types.temporal : Interval;
+public import postgresql.types.oids : Oid;
+public import postgresql.value;
+public import dbwire.types.decimal : Decimal;
 
 /// Library version.
 enum uint postgresqlVersionMajor = 0;

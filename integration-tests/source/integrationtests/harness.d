@@ -12,6 +12,7 @@ import integrationtests.basic;
 import integrationtests.connect;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
+import integrationtests.types;
 
 /// Integration test entry point. Throws on failure.
 alias TestFunction = void function();
@@ -43,6 +44,11 @@ immutable TestCase[] allTests = [
     TestCase("errors keep the connection usable", &testErrors, true),
     TestCase("notices", &testNotices, true),
     TestCase("busy connections, FATAL errors", &testBusyAndFatal, true),
+    TestCase("integers, booleans, text, bytea, uuid, json", &testScalarTypes, true),
+    TestCase("float4 and float8", &testFloats, true),
+    TestCase("numeric", &testNumeric, true),
+    TestCase("dates, times, timestamps, intervals", &testDateTimes, true),
+    TestCase("text fallback, variants, simple-protocol values", &testTextFallbackAndVariants, true),
 ];
 
 /// Runner identity, for reports.

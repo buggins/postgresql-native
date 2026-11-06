@@ -23,3 +23,15 @@ project uses [semantic versioning](https://semver.org/).
   streamed text rows, command tags and affected-row counts; errors and notices
   with all their fields; transaction status, run-time parameters reported by
   the server.
+- Results and basic types (#3): `query` runs one statement with the extended
+  protocol (parse and describe, then bind and execute) and requests the binary
+  format for the types it decodes: `bool`, `int2`/`int4`/`int8`, `oid`,
+  `float4`/`float8`, `numeric` (exact, as dbwire `Decimal` when it fits; NaN
+  and infinities), text types, `bytea`, `"char"`, `uuid`, `json`/`jsonb`,
+  `date`, `time`, `timetz`, `timestamp`, `timestamptz` (microseconds,
+  infinities, BC years) and `interval`; other types come as text.
+  `querySimple` keeps the simple protocol (several statements, text values).
+  Typed getters on rows and values (`getString` gives the server's own text
+  for every decoded type, `getLong`, `getDouble`, `getDecimal`, `getBytes`,
+  `getDate`, `getDateTime`, `getSysTime`, `getTimeOfDay`, `getDuration`,
+  `getInterval`, `getUUID`, `getVariant`, ...), which also parse text values.

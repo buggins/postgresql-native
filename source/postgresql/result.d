@@ -13,6 +13,7 @@ module postgresql.result;
 import postgresql.connection : Connection;
 import postgresql.exception : ClientException, ProtocolException;
 import postgresql.protocol.messages : MessageBody;
+import postgresql.value : Value;
 
 @safe:
 
@@ -68,14 +69,15 @@ package ColumnInfo[] parseRowDescription(MessageBody body)
 }
 
 /++
-One row of a result. Values are kept as the server sent them; for now (text
-format) `getString` returns them as `psql` prints them.
+One row of a result. `row[i]` and `row["name"]` give a `Value`; the getters
+here are shortcuts for the same calls on it (see `postgresql.value.Value`).
 +/
 struct Row
 {
     private const(ColumnInfo)[] columns_;
-    private immutable(ubyte)[][] values;
-    private bool[] nulls;
+    private immutable(immutable(ubyte)[])[] values;
+    private immutable(bool)[] nulls;
+    private string timeZone;
 
     /// The columns of the result.
     @property const(ColumnInfo)[] columns() const pure nothrow
@@ -89,45 +91,55 @@ struct Row
         return values.length;
     }
 
-    /// Whether the value in column `index` is NULL.
-    bool isNull(size_t index) const
+    /++
+    The value in column `index`.
+
+    Throws: `ClientException` for an invalid index.
+    +/
+    Value opIndex(size_t index) const
     {
         check(index);
-        return nulls[index];
+        return Value(&columns_[index], values[index], nulls[index], timeZone);
+    }
+
+    /++
+    The value in the first column named `name`.
+
+    Throws: `ClientException` if there is no such column.
+    +/
+    Value opIndex(string name) const
+    {
+        return this[columnIndex(name)];
+    }
+
+    /// Whether the value in a column is NULL.
+    bool isNull(size_t index) const
+    {
+        return this[index].isNull;
     }
 
     /// ditto
     bool isNull(string name) const
     {
-        return isNull(columnIndex(name));
+        return this[name].isNull;
     }
 
-    /++
-    The value in column `index` as text; null for NULL.
-
-    Throws: `ClientException` for an invalid index, or a binary value (P2 brings typed getters).
-    +/
-    string getString(size_t index) const
+    static foreach (getter; [
+        "getString", "getBool", "getLong", "getInt", "getDouble", "getDecimal", "getBytes",
+        "getDate", "getDateTime", "getSysTime", "getMicrosecondsOfSecond", "getTimeOfDay",
+        "getDuration",
+        "getInterval", "getUUID", "getVariant"
+    ])
     {
-        check(index);
-        if (nulls[index])
-            return null;
-        if (columns_[index].format != ValueFormat.text)
-            throw new ClientException("Column " ~ columns_[index].name ~ " is in binary format");
-        return cast(string) values[index];
+        mixin("/// Shortcut for `this[index]." ~ getter ~ "()` (see `Value`).\n"
+                ~ "auto " ~ getter ~ "(size_t index) const { return this[index]." ~ getter ~ "(); }\n"
+                ~ "/// ditto\n" ~ "auto " ~ getter ~ "(string name) const { return this[name]." ~ getter ~ "(); }");
     }
 
-    /// ditto
-    string getString(string name) const
-    {
-        return getString(columnIndex(name));
-    }
-
-    /// The raw bytes of the value in column `index`, as sent by the server; null for NULL.
+    /// The bytes of the value in column `index` as the server sent them; null for NULL.
     immutable(ubyte)[] getRaw(size_t index) const
     {
-        check(index);
-        return nulls[index] ? null : values[index];
+        return this[index].raw;
     }
 
     /++
@@ -155,25 +167,28 @@ struct Row
 }
 
 /// Parses a DataRow body into a `Row` for `columns`.
-package Row parseDataRow(MessageBody body, const(ColumnInfo)[] columns)
+package Row parseDataRow(MessageBody body, const(ColumnInfo)[] columns, string timeZone = null)
 {
     const count = body.readInt16();
     if (count != columns.length)
         throw new ProtocolException("DataRow has a different number of values than the row description");
     Row row;
     row.columns_ = columns;
-    row.values = new immutable(ubyte)[][count];
-    row.nulls = new bool[count];
+    row.timeZone = timeZone;
+    auto values = new immutable(ubyte)[][count];
+    auto nulls = new bool[count];
     foreach (i; 0 .. count)
     {
         const length = body.readInt32();
         if (length == -1)
-            row.nulls[i] = true;
+            nulls[i] = true;
         else if (length < 0)
             throw new ProtocolException("Invalid value length");
         else
-            row.values[i] = body.readBytes(length).idup;
+            values[i] = body.readBytes(length).idup;
     }
+    row.values = (() @trusted => cast(immutable) values)(); // not referenced elsewhere
+    row.nulls = (() @trusted => cast(immutable) nulls)(); // ditto
     return row;
 }
 
@@ -202,6 +217,8 @@ unittest
 /++
 The rows of a query, read from the connection as the range advances.
 
+Typed getters are on each row (`Row`, `postgresql.value.Value`).
+
 The connection is busy until the range is empty or `close` is called; then
 the rest of the server's response (further statements of a multi-statement
 query included) is read and discarded. A server error in the middle of the
@@ -217,10 +234,12 @@ final class QueryResult
     private bool done; // the server's response has been read up to ReadyForQuery
     private bool rowsDone; // no more rows of this result
     private string tag;
+    private string timeZone;
 
     package this(Connection conn, ColumnInfo[] columns, string tag, bool rowsDone)
     {
         this.conn = conn;
+        this.timeZone = conn.parameterStatus("TimeZone");
         this.columns_ = columns;
         this.tag = tag;
         this.rowsDone = rowsDone;
@@ -283,7 +302,7 @@ final class QueryResult
         hasCurrent = false;
         if (rowsDone)
             return;
-        conn.nextRow(columns_, current, hasCurrent, tag);
+        conn.nextRow(columns_, timeZone, current, hasCurrent, tag);
         if (!hasCurrent)
         {
             rowsDone = true;
