@@ -91,6 +91,14 @@ jobs:
         run: dub run :integration-tests-vibe
       - name: Integration tests (vibe-core 1.x)
         run: dub run :integration-tests-vibe1
+      - name: Examples
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: testuser
+          PGPASSWORD: Test_password123
+          PGDATABASE: testdb
+        run: dub run :example-basic && dub run :example-vibe
 
   lint:
     runs-on: ubuntu-latest

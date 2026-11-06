@@ -1,0 +1,10 @@
+{
+    "name": "example-vibe",
+    "description": "postgresql-native example: a connection pool shared by vibe.d tasks",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "dependencies": {
+        "postgresql-native": { "path": "../../" },
+        "vibe-core": "~>2.14"
+    }
+}

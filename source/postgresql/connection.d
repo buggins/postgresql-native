@@ -8,7 +8,11 @@ module postgresql.connection;
 
 import core.time : Duration;
 
+import std.range.primitives : ElementType, empty, front, isInputRange, popFront;
+import std.traits : Unqual;
+
 import dbwire.client.hosts : connectFirst, HostPort, orderHosts;
+import dbwire.client.pool : Poolable;
 import dbwire.io.backend : backendFor, IoBackend;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
@@ -19,6 +23,8 @@ import postgresql.protocol.codes;
 import postgresql.protocol.messages;
 import postgresql.result;
 import postgresql.params : hasVariant, Param, rewritePlaceholders;
+import postgresql.mapping : fieldPositions, hasVariantField, insertSql, mappedFields, readStruct, readValue,
+    RowRange, RowsEncoder;
 import postgresql.pipeline;
 import postgresql.settings;
 import postgresql.statement;
@@ -53,7 +59,7 @@ One call at a time: a `QueryResult` holds the connection until it is read to
 the end or closed. Network errors, malformed data and `FATAL` errors close the
 connection.
 +/
-final class Connection
+final class Connection : Poolable
 {
     package enum State
     {
@@ -69,6 +75,7 @@ final class Connection
     private TlsTransport tls;
     package MessageStream stream;
     private HostPort connectedHost;
+    private HostPort attemptHost; // the host being connected to
     private string[string] parameters;
     private int backendPid;
     private immutable(ubyte)[] cancelKey;
@@ -288,6 +295,144 @@ final class Connection
             return (() @trusted => drainCount(query(sql, args)))(); // Variant copies
         else
             return drainCount(query(sql, args));
+    }
+
+    /++
+    Runs one SQL statement (see `query`) and returns its rows as structs of
+    type `T` (see `postgresql.mapping`): an input range that holds the
+    connection until all rows are read or it is closed.
+
+    Throws: `ClientException` if a field has no column, or a value can't be
+    read into its field; as `query`.
+    +/
+    RowRange!T query(T, Args...)(string sql, Args args) if (is(T == struct))
+    {
+        static if (hasVariant!Args)
+            return (() @trusted => RowRange!T(query(sql, args)))(); // Variant copies
+        else
+            return RowRange!T(query(sql, args));
+    }
+
+    /++
+    The first row of a query as a `T` (see `query!T`); the other rows are discarded.
+
+    Throws: `ClientException` if there is no row, a field has no column or a
+    value can't be read into its field; as `query`.
+    +/
+    T queryRow(T, Args...)(string sql, Args args) if (is(T == struct))
+    {
+        static if (hasVariant!Args)
+            auto result = (() @trusted => query(sql, args))(); // Variant copies
+        else
+            auto result = query(sql, args);
+        scope (exit)
+            result.close();
+        const positions = fieldPositions!T(result);
+        if (result.empty)
+            throw new ClientException("The query returned no rows");
+        static if (hasVariantField!T)
+            return (() @trusted => readStruct!T(result, positions))(); // Variant copies
+        else
+            return readStruct!T(result, positions);
+    }
+
+    /++
+    The first column of the first row of a query, as a `T` (a field type of
+    `postgresql.mapping`; `Nullable!T` to tell NULL apart), e.g.
+    `queryValue!long("SELECT count(*) FROM t")`.
+
+    Throws: `ClientException` if there is no row, or the value can't be
+    converted (NULL included, unless `T` can hold it); as `query`.
+    +/
+    T queryValue(T, Args...)(string sql, Args args)
+    {
+        static if (hasVariant!Args)
+            auto result = (() @trusted => query(sql, args))(); // Variant copies
+        else
+            auto result = query(sql, args);
+        scope (exit)
+            result.close();
+        if (result.empty || result.columns.length == 0)
+            throw new ClientException("The query returned no value");
+        static if (hasVariant!T)
+            return (() @trusted => readValue!T(result.front[0]))(); // Variant copies
+        else
+            return readValue!T(result.front[0]);
+    }
+
+    /++
+    Inserts structs as rows of `table`: one column per mapped field (see
+    `postgresql.mapping`), with multi-row `INSERT ... VALUES` statements of up
+    to 1000 rows (fewer for structs with more than 65 fields: at most 65535
+    parameters each).
+
+    The insert is atomic: outside a transaction block, an insert that needs
+    several statements runs in a transaction of its own; inside one, the rows
+    are part of it. `table` is used as given (e.g. `orders` or
+    `sales.orders`); column names as `sqlColumnName` writes them.
+
+    Returns: the number of rows inserted.
+    Throws: `ServerException` if the server refuses a row (then no row is
+    inserted, outside a transaction block); `ClientException` for a value
+    that can't be sent.
+    +/
+    ulong insert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
+    {
+        import std.algorithm.comparison : min;
+
+        alias E = Unqual!(ElementType!R);
+        enum width = mappedFields!E.length;
+        static assert(width > 0, E.stringof ~ " has no mapped fields");
+        enum batchRows = min(1000, 65_535 / width);
+
+        auto encoder = new RowsEncoder!E;
+        ulong inserted;
+        bool began;
+        scope (failure)
+        {
+            if (began && state == State.ready && txStatus != TransactionStatus.idle)
+            {
+                try
+                    rollback();
+                catch (Exception)
+                {
+                }
+            }
+        }
+        for (;;)
+        {
+            encoder.rows.length = 0;
+            while (!rows.empty && encoder.rows.length < batchRows)
+            {
+                static if (hasVariantField!E)
+                    (() @trusted { encoder.rows ~= rows.front; })(); // Variant copies
+                else
+                    encoder.rows ~= rows.front;
+                rows.popFront();
+            }
+            if (encoder.rows.length == 0)
+                break;
+            if (!rows.empty && !began && !inTransaction)
+            {
+                begin();
+                began = true;
+            }
+            inserted += drainCount(runSql(insertSql!E(table, encoder.rows.length), &encoder.encode));
+            if (rows.empty)
+                break;
+        }
+        if (began)
+            commit();
+        return inserted;
+    }
+
+    /// ditto
+    ulong insert(T)(string table, T row) if (is(T == struct) && !isInputRange!T)
+    {
+        static if (hasVariantField!T)
+            return (() @trusted => insert(table, [row]))(); // Variant copies
+        else
+            return insert(table, [row]);
     }
 
     /++
@@ -1015,6 +1160,30 @@ final class Connection
         }
     }
 
+    /++
+    Makes the session as a new one would be, except for the prepared
+    statements of the statement cache, which stay valid: rolls back an open
+    transaction, then does what `DISCARD ALL` does but `DEALLOCATE ALL`
+    (closes cursors, resets the session authorization and all run-time
+    parameters to their startup values, stops listening, releases advisory
+    locks, drops temporary tables and sequence state). Without a statement
+    cache it runs `DISCARD ALL`. Untaken notifications are dropped.
+    `ConnectionPool` calls it when a connection is returned.
+
+    Throws: `ServerException`, `ConnectionException`.
+    +/
+    void resetSession()
+    {
+        if (txStatus != TransactionStatus.idle)
+            exec("ROLLBACK");
+        if (cache is null)
+            exec("DISCARD ALL");
+        else
+            exec("CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; "
+                    ~ "SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD SEQUENCES; DISCARD TEMP");
+        notifications = null;
+    }
+
     /// Checks that the server answers (an empty query).
     void ping()
     {
@@ -1284,12 +1453,87 @@ final class Connection
         ];
         foreach (ref h; hosts)
             h.port = ConnectionOptions.effectivePort(h.port);
+        auto ordered = orderHosts(hosts, options.hostSelection);
+        auto target = options.targetSessionAttrs;
         void tryHost(HostPort endpoint) @safe
         {
             connectTo(endpoint);
+            checkSession(target);
         }
 
-        connectedHost = connectFirst(orderHosts(hosts, options.hostSelection), &tryHost, "PostgreSQL");
+        if (target == TargetSessionAttrs.preferStandby)
+        {
+            // as libpq: a standby first, then any server
+            target = TargetSessionAttrs.standby;
+            try
+            {
+                connectedHost = connectFirst(ordered, &tryHost, "PostgreSQL");
+                return;
+            }
+            catch (ConnectionException)
+                target = TargetSessionAttrs.any;
+        }
+        connectedHost = connectFirst(ordered, &tryHost, "PostgreSQL");
+    }
+
+    // Closes the connection with a ConnectionException (so the next host is tried) if
+    // the session doesn't match `target`.
+    private void checkSession(TargetSessionAttrs target)
+    {
+        final switch (target)
+        {
+        case TargetSessionAttrs.any:
+            return;
+        case TargetSessionAttrs.readWrite, TargetSessionAttrs.readOnly:
+            const readOnly = isReadOnly();
+            if (readOnly == (target == TargetSessionAttrs.readWrite))
+                rejectSession(readOnly ? "read-only" : "not read-only", target);
+            return;
+        case TargetSessionAttrs.primary, TargetSessionAttrs.standby, TargetSessionAttrs.preferStandby:
+            const standby = isStandby();
+            if (standby == (target == TargetSessionAttrs.primary))
+                rejectSession(standby ? "a standby" : "not a standby", target);
+            return;
+        }
+    }
+
+    private void rejectSession(string state, TargetSessionAttrs target)
+    {
+        import std.conv : to;
+
+        close();
+        throw new ConnectionException("The server at " ~ attemptHost.toString() ~ " is " ~ state
+                ~ " (target_session_attrs " ~ target.to!string ~ ")");
+    }
+
+    // Whether the session doesn't accept writes by default: a hot standby or
+    // default_transaction_read_only on (reported from PostgreSQL 14, else asked).
+    private bool isReadOnly()
+    {
+        auto standby = "in_hot_standby" in parameters;
+        auto defaultReadOnly = "default_transaction_read_only" in parameters;
+        if (standby && defaultReadOnly)
+            return *standby == "on" || *defaultReadOnly == "on";
+        return queryText("SHOW transaction_read_only") == "on";
+    }
+
+    // Whether the server is in recovery (in_hot_standby from PostgreSQL 14, else asked).
+    private bool isStandby()
+    {
+        if (auto standby = "in_hot_standby" in parameters)
+            return *standby == "on";
+        return queryText("SELECT pg_catalog.pg_is_in_recovery()") == "t";
+    }
+
+    // The first value of a simple query.
+    private string queryText(string sql)
+    {
+        auto r = querySimple(sql);
+        scope (exit)
+            r.close();
+        if (r.empty)
+            throw new ProtocolException("No row for " ~ sql);
+        return r.front.getString(0);
     }
 
     private enum Encryption
@@ -1356,7 +1600,20 @@ final class Connection
 
     private TlsOptions tlsOptions(bool direct)
     {
+        import postgresql.userfiles : userDirectory, userFile;
+
         TlsOptions t = options.tls;
+        // libpq's defaults: the files in ~/.postgresql, when they exist
+        if (t.caFile.length == 0)
+            t.caFile = userFile("root.crt");
+        if (t.certFile.length == 0)
+        {
+            import std.path : buildPath;
+
+            t.certFile = userFile("postgresql.crt");
+            if (t.certFile.length && t.keyFile.length == 0)
+                t.keyFile = buildPath(userDirectory(), "postgresql.key");
+        }
         if (t.caFile == "system")
         {
             if (options.sslMode != SslMode.verifyFull)
@@ -1391,6 +1648,7 @@ final class Connection
                     endpoint.host, endpoint.port, options.connectTimeout);
         transport = raw;
         tls = null;
+        attemptHost = endpoint;
         state = State.busy;
         scope (failure)
             close();
@@ -1559,9 +1817,15 @@ final class Connection
             stream.send(b.data);
         }
 
+        string password = options.password;
         void needPassword()
         {
-            if (options.password.length == 0)
+            import postgresql.userfiles : passwordFromFile;
+
+            if (password.length == 0)
+                password = passwordFromFile(options.passFile, attemptHost.host, attemptHost.port,
+                        options.database.length ? options.database : user, user);
+            if (password.length == 0)
                 throw new ClientException("The server asks for a password, but none was given");
         }
 
@@ -1588,19 +1852,19 @@ final class Connection
                 case AuthRequest.cleartextPassword:
                     allow("password", "cleartext password");
                     needPassword();
-                    sendPassword(options.password);
+                    sendPassword(password);
                     auth = AuthMethod.cleartext;
                     break;
                 case AuthRequest.md5Password:
                     allow("md5", "MD5 password");
                     needPassword();
-                    sendPassword(md5PasswordResponse(user, options.password, body.readBytes(4)));
+                    sendPassword(md5PasswordResponse(user, password, body.readBytes(4)));
                     auth = AuthMethod.md5;
                     break;
                 case AuthRequest.sasl:
                     allow("scram-sha-256", "SCRAM");
                     needPassword();
-                    scram = startScram(body);
+                    scram = startScram(body, password);
                     scramStarted = true;
                     break;
                 case AuthRequest.saslContinue:
@@ -1643,7 +1907,7 @@ final class Connection
     }
 
     // Chooses the SASL mechanism and sends the SASLInitialResponse.
-    private ScramClient startScram(MessageBody body)
+    private ScramClient startScram(MessageBody body, string password)
     {
         import std.algorithm.searching : canFind;
 
@@ -1662,7 +1926,7 @@ final class Connection
         if (binding.length)
         {
             mechanism = scramSha256Plus;
-            scram = ScramClient(options.password, mechanism, binding);
+            scram = ScramClient(password, mechanism, binding);
             auth = AuthMethod.scramSha256Plus;
         }
         else
@@ -1675,7 +1939,7 @@ final class Connection
                 throw new ClientException("The server offers no supported SASL mechanism");
             mechanism = scramSha256;
             // 'y': the client could bind but the server didn't offer it (a downgrade would show)
-            scram = ScramClient(options.password, mechanism, null, tls !is null && !offeredPlus
+            scram = ScramClient(password, mechanism, null, tls !is null && !offeredPlus
                     && channelBindingSupported);
             auth = AuthMethod.scramSha256;
         }

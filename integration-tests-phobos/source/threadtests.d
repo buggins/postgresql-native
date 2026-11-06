@@ -7,12 +7,13 @@ import std.exception : collectException, enforce;
 
 import postgresql;
 import integrationtests.harness : TestCase;
-import integrationtests.server : connectToServer, scalar, serverSetUp;
+import integrationtests.server : connectToServer, scalar, serverOptions, serverSetUp;
 
 /// Tests registered by the thread runner.
 immutable TestCase[] threadTests = [
     TestCase("thread: one connection per thread", &testThreads, true),
     TestCase("thread: cancel from another thread", &testCancelFromThread, true),
+    TestCase("thread: a pool shared by threads", &testPoolThreads, true),
 ];
 
 /// Four threads, each with its own connection, run queries at the same time.
@@ -89,4 +90,41 @@ void testCancelFromThread()
     check(SslMode.disable);
     if (serverSetUp())
         check(SslMode.require);
+}
+
+/// Eight threads share a pool of three connections; each statement waits for a free one.
+void testPoolThreads()
+{
+    import core.atomic : atomicOp;
+
+    PoolOptions p;
+    p.maxConnections = 3;
+    auto pool = new ConnectionPool(serverOptions(), p);
+    scope (exit)
+        pool.close();
+    shared int done;
+    shared int failed;
+    Thread[] threads;
+    foreach (i; 0 .. 8)
+    {
+        threads ~= new Thread({
+            try
+            {
+                foreach (k; 0 .. 10)
+                {
+                    auto conn = pool.lockConnection();
+                    if (conn.queryValue!long("SELECT count(*) FROM generate_series(1, ?)", 100 + k) != 100 + k)
+                        atomicOp!"+="(failed, 1);
+                }
+                atomicOp!"+="(done, 1);
+            }
+            catch (Exception)
+                atomicOp!"+="(failed, 1);
+        });
+        threads[$ - 1].start();
+    }
+    foreach (t; threads)
+        t.join();
+    enforce(done == 8 && failed == 0, "threads failed");
+    enforce(pool.activeConnections == 0 && pool.idleConnections <= 3, "all returned, at most 3 opened");
 }

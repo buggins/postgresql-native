@@ -15,7 +15,9 @@
         "./integration-tests",
         "./integration-tests-phobos",
         "./integration-tests-vibe",
-        "./integration-tests-vibe1"
+        "./integration-tests-vibe1",
+        "./examples/basic",
+        "./examples/vibe"
     ],
     "dependencies": {
         "dbwire:types": "~>0.6.0",
