@@ -76,6 +76,23 @@ enum ProtocolVersion
     v32,
 }
 
+/// Which servers to accept, by session state (libpq's `target_session_attrs`).
+enum TargetSessionAttrs
+{
+    /// Any server. The default.
+    any,
+    /// A server that accepts writes (not a standby, `default_transaction_read_only` off).
+    readWrite,
+    /// A server that doesn't accept writes by default (a standby, or `default_transaction_read_only` on).
+    readOnly,
+    /// A primary server (not in recovery).
+    primary,
+    /// A standby server (in recovery).
+    standby,
+    /// A standby if one of the hosts is; else any server.
+    preferStandby,
+}
+
 /// Creates the raw transport to a host instead of the I/O backend (tests, tunnels, logging).
 alias TransportFactory = Transport delegate(string host, ushort port, Duration timeout) @safe;
 
@@ -90,12 +107,28 @@ struct ConnectionOptions
     ushort port;
     /// Hosts to try in turn (failover); a port of 0 means 5432.
     HostPort[] hosts;
-    /// The order in which `hosts` are tried.
+    /// The order in which `hosts` are tried (libpq's `load_balance_hosts`: `disable` or `random`).
     HostSelection hostSelection = HostSelection.inOrder;
+    /++
+    Which servers to accept: hosts whose session doesn't match are skipped
+    (the next host is tried).
+    +/
+    TargetSessionAttrs targetSessionAttrs = TargetSessionAttrs.any;
     /// User name.
     string user;
-    /// Password; empty if the server doesn't ask for one.
+    /++
+    Password. When empty and the server asks for one, it is looked up in
+    the password file (`passFile`).
+    +/
     string password;
+    /++
+    The password file (libpq's `passfile`), with lines
+    `host:port:database:user:password` (`*` matches anything; `\:` and
+    `\\` escape). Empty: `~/.pgpass` (`%APPDATA%\postgresql\pgpass.conf`
+    on Windows). On POSIX systems a file that the group or others may read
+    is ignored, as libpq does.
+    +/
+    string passFile;
     /// Database; empty means the same as the user name.
     string database;
     /// `application_name` reported to the server (shown in `pg_stat_activity`).
@@ -112,8 +145,14 @@ struct ConnectionOptions
     /++
     TLS details: `caFile` (libpq's `sslrootcert`), `certFile`/`keyFile`
     (`sslcert`/`sslkey`, client certificate), `keyPassword` (`sslpassword`),
-    `serverName`. Verification follows `sslMode`; `skipVerify` and
-    `skipNameCheck` are set from it.
+    `serverName`, `minVersion`/`maxVersion` (`ssl_min_protocol_version`,
+    `ssl_max_protocol_version`). Verification follows `sslMode`;
+    `skipVerify` and `skipNameCheck` are set from it.
+
+    As libpq, the files default to those in `~/.postgresql`
+    (`%APPDATA%\postgresql` on Windows) when they exist: `root.crt` (then
+    `sslmode=require` verifies the certificate, as `verifyCa`),
+    `postgresql.crt` and `postgresql.key`.
     +/
     TlsOptions tls;
     /// Whether to use SCRAM channel binding.
@@ -204,6 +243,24 @@ struct ConnectionOptions
             {
             case "host":
                 hostList = value.split(",");
+                break;
+            case "load_balance_hosts":
+                o.hostSelection = parseKeyword!HostSelection(key, value, ["disable", "random"]);
+                break;
+            case "target_session_attrs":
+                o.targetSessionAttrs = parseKeyword!TargetSessionAttrs(key, value, [
+                    "any", "read-write", "read-only", "primary", "standby", "prefer-standby"
+                ]);
+                break;
+            case "passfile":
+                o.passFile = value;
+                break;
+            case "ssl_min_protocol_version":
+                o.tls.minVersion = parseTlsVersion(key, value);
+                break;
+            case "ssl_max_protocol_version":
+                if (value.length)
+                    o.tls.maxVersion = parseTlsVersion(key, value);
                 break;
             case "port":
                 portList = value.split(",");
@@ -325,6 +382,8 @@ unittest
 
     auto o = ConnectionOptions.parse("postgres://h1:1,h2:2/");
     assert(o.hosts == [HostPort("h1", 1), HostPort("h2", 2)] && o.database.length == 0);
+    o = ConnectionOptions.parse("postgresql://u:p@/db");
+    assert(o.user == "u" && o.password == "p" && o.database == "db" && o.hosts.length == 0 && o.host == "localhost");
     o = ConnectionOptions.parse("postgresql:///db?host=localhost&port=5999&channel_binding=require");
     assert(o.host == "localhost" && o.port == 5999 && o.database == "db"
             && o.channelBinding == ChannelBinding.require);
@@ -338,6 +397,118 @@ unittest
     assertThrown!ClientException(ConnectionOptions.parse("host=a,b port=1,2,3"));
     assertThrown!ClientException(ConnectionOptions.parse("host=h client_encoding=LATIN1"));
     assertThrown!ClientException(ConnectionOptions.parse("host='unterminated"));
+    o = ConnectionOptions.parse("host=h target_session_attrs=read-write ssl_min_protocol_version=TLSv1.3 passfile=/p");
+    assert(o.targetSessionAttrs == TargetSessionAttrs.readWrite && o.tls.minVersion == TlsVersion.tls13);
+    assert(o.passFile == "/p");
+    assertThrown!ClientException(ConnectionOptions.parse("host=h ssl_min_protocol_version=TLSv1.1"));
+    assertThrown!ClientException(ConnectionOptions.parse("host=h target_session_attrs=master"));
+}
+
+/++
+Options from the `PG*` environment variables, as libpq reads them
+(`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGPASSFILE`,
+`PGSSLMODE`, `PGSSLROOTCERT`, `PGTARGETSESSIONATTRS`, ...; `PGTZ` sets the
+session's `TimeZone`), overridden by the keywords of `connectionString`
+(a URI or `key=value` string; may be empty).
+
+`parse` and `fromParams` don't read the environment.
+
+Throws: `ClientException` as `parse`, also for invalid values in the environment.
++/
+ConnectionOptions fromEnvironment(string connectionString = null)
+{
+    import std.algorithm.searching : startsWith;
+    import std.process : environment;
+    import std.string : strip;
+
+    string[string] params;
+    foreach (variable, keyword; environmentKeywords)
+    {
+        const value = environment.get(variable);
+        if (value !is null)
+            params[keyword] = value;
+    }
+    const s = connectionString.strip;
+    if (s.length)
+    {
+        const given = s.startsWith("postgresql://") || s.startsWith("postgres://")
+            ? parseUri(s) : parseKeywordValue(s);
+        foreach (key, value; given)
+            params[key] = value;
+    }
+    auto o = ConnectionOptions.fromParams(params);
+    const tz = environment.get("PGTZ");
+    if (tz.length)
+        o.runtimeParameters["TimeZone"] = tz;
+    return o;
+}
+
+/// The `PG*` environment variables `fromEnvironment` reads, and their keywords.
+private immutable string[string] environmentKeywords;
+
+shared static this()
+{
+    environmentKeywords = [
+        "PGHOST": "host",
+        "PGPORT": "port",
+        "PGDATABASE": "dbname",
+        "PGUSER": "user",
+        "PGPASSWORD": "password",
+        "PGPASSFILE": "passfile",
+        "PGOPTIONS": "options",
+        "PGAPPNAME": "application_name",
+        "PGSSLMODE": "sslmode",
+        "PGSSLNEGOTIATION": "sslnegotiation",
+        "PGSSLCERT": "sslcert",
+        "PGSSLKEY": "sslkey",
+        "PGSSLROOTCERT": "sslrootcert",
+        "PGSSLSNI": "sslsni",
+        "PGSSLMINPROTOCOLVERSION": "ssl_min_protocol_version",
+        "PGSSLMAXPROTOCOLVERSION": "ssl_max_protocol_version",
+        "PGCHANNELBINDING": "channel_binding",
+        "PGREQUIREAUTH": "require_auth",
+        "PGMAXPROTOCOLVERSION": "max_protocol_version",
+        "PGCONNECT_TIMEOUT": "connect_timeout",
+        "PGCLIENTENCODING": "client_encoding",
+        "PGTARGETSESSIONATTRS": "target_session_attrs",
+        "PGLOADBALANCEHOSTS": "load_balance_hosts",
+    ];
+}
+
+///
+@system unittest
+{
+    import std.process : environment;
+
+    const saved = environment.toAA();
+    scope (exit)
+    {
+        foreach (variable, _; environmentKeywords)
+        {
+            if (auto v = variable in saved)
+                environment[variable] = *v;
+            else
+                environment.remove(variable);
+        }
+        if (auto v = "PGTZ" in saved)
+            environment["PGTZ"] = *v;
+        else
+            environment.remove("PGTZ");
+    }
+    foreach (variable, _; environmentKeywords)
+        environment.remove(variable);
+    environment["PGHOST"] = "db1,db2";
+    environment["PGPORT"] = "5433";
+    environment["PGUSER"] = "app";
+    environment["PGSSLMODE"] = "require";
+    environment["PGTZ"] = "Europe/Lisbon";
+    auto o = fromEnvironment("postgresql://other@/sales?sslmode=verify-full");
+    assert(o.hosts == [HostPort("db1", 5433), HostPort("db2", 5433)]);
+    assert(o.user == "other" && o.database == "sales" && o.sslMode == SslMode.verifyFull);
+    assert(o.runtimeParameters["TimeZone"] == "Europe/Lisbon");
+    o = fromEnvironment("dbname=x target_session_attrs=prefer-standby load_balance_hosts=random");
+    assert(o.user == "app" && o.sslMode == SslMode.require && o.database == "x");
+    assert(o.targetSessionAttrs == TargetSessionAttrs.preferStandby && o.hostSelection == HostSelection.random);
 }
 
 /++
@@ -426,11 +597,18 @@ string[string] parseUri(string uri)
 
     string scheme = uri.startsWith("postgres://") ? "postgres" : "postgresql";
     string text = uri;
-    // a URI without hosts: let Dsn see a placeholder host
+    // a URI without hosts (`postgresql:///db`, `postgresql://user@/db`): let Dsn see a placeholder host
+    import std.string : indexOfAny, lastIndexOf;
+
     const authorityStart = scheme.length + 3;
-    const noHost = text.length == authorityStart || text[authorityStart] == '/' || text[authorityStart] == '?';
+    auto authorityEnd = text.indexOfAny("/?", authorityStart);
+    if (authorityEnd < 0)
+        authorityEnd = text.length;
+    const at = text[0 .. authorityEnd].lastIndexOf('@');
+    const hostStart = at >= cast(ptrdiff_t) authorityStart ? at + 1 : authorityStart;
+    const noHost = hostStart == authorityEnd;
     if (noHost)
-        text = text[0 .. authorityStart] ~ "localhost" ~ text[authorityStart .. $];
+        text = text[0 .. hostStart] ~ "localhost" ~ text[hostStart .. $];
     const dsn = Dsn.parse(text, scheme);
 
     string[string] result;
@@ -572,6 +750,21 @@ E parseKeyword(E)(string key, string value, const string[] names)
         if (n == value)
             return cast(E) i;
     throw new ClientException("Invalid " ~ key ~ " '" ~ value ~ "'");
+}
+
+TlsVersion parseTlsVersion(string key, string value)
+{
+    switch (value)
+    {
+    case "TLSv1.2":
+        return TlsVersion.tls12;
+    case "TLSv1.3":
+        return TlsVersion.tls13;
+    case "TLSv1", "TLSv1.1":
+        throw new ClientException(key ~ " " ~ value ~ " is not supported: TLS 1.2 is the oldest version");
+    default:
+        throw new ClientException("Invalid " ~ key ~ " '" ~ value ~ "'");
+    }
 }
 
 ushort parsePort(string text)

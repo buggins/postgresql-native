@@ -1,0 +1,9 @@
+{
+    "name": "example-basic",
+    "description": "postgresql-native example: connect, parameters, structs, transactions, pipelines",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "dependencies": {
+        "postgresql-native": { "path": "../../" }
+    }
+}

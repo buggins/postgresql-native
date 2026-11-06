@@ -24,13 +24,15 @@ public import postgresql.types.oids : Oid;
 public import postgresql.value;
 public import postgresql.statement : PreparedStatement;
 public import postgresql.pipeline;
+public import postgresql.mapping : column, ignore, RowRange, sqlColumnName;
+public import postgresql.pool;
 public import postgresql.params : Param, encodeParam, rewritePlaceholders;
 public import dbwire.types.decimal : Decimal;
 
 /// Library version.
 enum uint postgresqlVersionMajor = 0;
 /// ditto
-enum uint postgresqlVersionMinor = 0;
+enum uint postgresqlVersionMinor = 1;
 /// ditto
 enum uint postgresqlVersionPatch = 0;
 

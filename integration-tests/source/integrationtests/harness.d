@@ -10,6 +10,7 @@ import std.stdio : stderr, writefln;
 
 import integrationtests.basic;
 import integrationtests.connect;
+import integrationtests.highlevel;
 import integrationtests.params;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
@@ -59,6 +60,11 @@ immutable TestCase[] allTests = [
     TestCase("transactions and savepoints", &testTransactions, true),
     TestCase("statement_timeout, idle cancel", &testStatementTimeout, true),
     TestCase("pipelines", &testPipelines, true),
+    TestCase("struct mapping: query!T, queryRow!T, queryValue!T, insert", &testStructMapping, true),
+    TestCase("bulk insert: several statements, atomic", &testBulkInsert, true),
+    TestCase("pool: reuse, session reset, limits", &testPool, true),
+    TestCase("target_session_attrs, load_balance_hosts", &testTargetSessionAttrs, true),
+    TestCase("PG* environment, password file, ~/.postgresql files", &testEnvironmentAndUserFiles, true),
 ];
 
 /// Runner identity, for reports.

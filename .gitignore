@@ -31,3 +31,4 @@ dub.selections.json
 # Test executables
 /postgresql-native-test-*
 /integration-tests*/postgresql-native_integration-tests*
+/examples/*/postgresql-native_example-*

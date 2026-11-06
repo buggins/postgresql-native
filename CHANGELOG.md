@@ -4,7 +4,7 @@ All notable changes to postgresql-native are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.1.0 (unreleased)
 
 ### Added
 
@@ -56,3 +56,15 @@ project uses [semantic versioning](https://semver.org/).
   `statementTimeout` (the server's `statement_timeout`); pipelines
   (`Connection.pipeline`): statements sent together, parsed in one round trip
   when new, answered in order, as one implicit transaction or independently.
+- High-level API, pool, connection strings (#6): struct mapping
+  (`query!T`, `queryRow!T`, `queryValue!T`, `insert` with multi-row `INSERT`s
+  of up to 1000 rows, atomic; `@column`, `@ignore`; enums by name or value,
+  `Nullable`, `Variant`); `ConnectionPool` for threads and vibe.d fibers on
+  dbwire's `PoolCore` (`pool_*` keywords), with `Connection.resetSession` on
+  release (as `DISCARD ALL`, keeping the statement cache);
+  `fromEnvironment` (the `PG*` variables, `PGTZ`); the password file
+  (`passfile`, `~/.pgpass`); the default TLS files in `~/.postgresql`;
+  `target_session_attrs`, `load_balance_hosts`, `ssl_min_protocol_version`,
+  `ssl_max_protocol_version`; URIs with a user but no host
+  (`postgresql://user@/db`). Integer enums are sent by name to non-numeric
+  parameters. Examples for threads and vibe.d.

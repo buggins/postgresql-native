@@ -6,7 +6,7 @@ Guidance for AI coding agents working on **postgresql-native**, a native D clien
 
 - **What:** a pure-D client for PostgreSQL over the **frontend/backend protocol 3.x** (TCP, port 5432; TLS through SSLRequest or direct TLS), for PostgreSQL 13–18 (tested; older servers probably work), with blocking (thread) and vibe.d (fiber) I/O. dub package `postgresql-native`, root module `postgresql`.
 - **Repo:** `git@github.com:buggins/postgresql-native.git`, default branch `main`. Author Vadim Lopatin (GitHub `buggins`). License BSL-1.0.
-- **Status:** under development; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold), P1 (connect, TLS, authentication, simple queries) P2 (extended-protocol results, binary types, getters) P3 (parameters, statement cache, prepared statements) and P4 (transactions, cancel, timeouts, pipelines) done.
+- **Status:** 0.1.0 prepared (P0–P5); roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold), P1 (connect, TLS, authentication, simple queries), P2 (extended-protocol results, binary types, getters), P3 (parameters, statement cache, prepared statements), P4 (transactions, cancel, timeouts, pipelines) and P5 (struct mapping, pool, connection strings, examples) done. Next: P6 types, P7 COPY/NOTIFY, P8 ddbc driver, P9 hibernated.
 - **Builds on dbwire** (`../dbwire`, 0.6): `dbwire:types` (exceptions, `Decimal`), `:io` (transports, I/O backends, buffers), `:tls` (OpenSSL loaded at run time; ALPN for direct TLS), `:client` (DSN, failover, pool core), `:crypto` (PBKDF2 for SCRAM, secure random). Anything not protocol-specific is added to dbwire (issue + PR there), not here.
 - **Sibling projects:** `../oracle-native` and `../mssql-native` (the closest models: message layer over a byte stream, result streaming, parameters, pool, mapping, tests) and `../clickhoused`. Follow their structure, API style, tests and conventions (their `AGENTS.md`).
 - **`PLAN.md` (local and optional):** the design plan (protocol overview, types, API, milestones, decisions) is a local, untracked file (excluded through `.git/info/exclude`). If present, read it before design-level changes and keep it up to date; never `git add` it.
@@ -56,7 +56,7 @@ sh integration-tests/setup-server.sh pgnative-18      # TLS + a user per authent
 POSTGRES_SETUP=1
 ```
 
-Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). The server comes from `POSTGRES_HOST` (`host:port`), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (`integrationtests.server`); these are deliberately not libpq's `PG*` variables, which the library reads as defaults.
+Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). The server comes from `POSTGRES_HOST` (`host:port`), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (`integrationtests.server`); these are deliberately not libpq's `PG*` variables, which `fromEnvironment` reads. Tests that change process environment variables (`HOME`, `PG*`) restore them.
 
 Run lint and format before committing D code. dfmt 0.15.2 mangles lambdas with attributes (`() nothrow {` → `() nothrow{`): use named nested functions. It merges `@safe return` into `@safereturn`: avoid the `return` attribute. Run dfmt twice when it changes files. `dub.selections.json` files are git-ignored (a root one listing vibe-core would enable vibe support silently).
 
@@ -77,6 +77,9 @@ source/postgresql/
   params.d             Param, encodeParam (D value → binary or text for the server's parameter type), ? rewriting
   statement.d          StatementInfo, StatementCache (LRU by SQL text), PreparedStatement, argument encoders
   pipeline.d           Pipeline, PipelineMode, PipelineResult (run by Connection.runPipeline)
+  mapping.d            struct mapping: @column, @ignore, readValue, RowRange (query!T), multi-row insert SQL and encoder
+  pool.d               ConnectionPool, PooledConnection (session reset on release) over dbwire's PoolCore
+  userfiles.d          the password file (.pgpass) and the default TLS files in ~/.postgresql
   types/               oids.d (built-in OIDs, which are decoded from binary), numeric.d (binary numeric, exact
                        text, Decimal), floats.d (shortest float text as the server prints it), temporal.d
                        (date/time/timestamp(tz)/interval: calendar over the whole range, text output and parsing)
@@ -85,6 +88,7 @@ source/postgresql/
                        MessageBody, MessageBuilder, MessageStream)
 integration-tests/     shared harness (dub subpackage `:integration-tests`), setup-server.sh, tls/ (test certificates)
 integration-tests-phobos/, integration-tests-vibe/, integration-tests-vibe1/   runners
+examples/              basic (`:example-basic`), vibe (`:example-vibe`); connect with fromEnvironment(args[1])
 ```
 
 ## Protocol behaviour learned from real servers
@@ -104,6 +108,8 @@ Checked on 13, 14, 16 and 18 (official Docker images).
 - **Pipelines:** statements between two Syncs form one implicit transaction (outside an explicit block): after an error the server skips to the Sync and the earlier statements are rolled back. A Sync after each statement makes them independent; each Sync gets its ReadyForQuery.
 - **Float text** (12+, `extra_float_digits=1`): shortest exact digits, plain notation for decimal exponents -4 ≤ X < 15 (`float8`) / 6 (`float4`), else `d.ddde+XX` (two exponent digits at least). A decimal exactly halfway between two doubles is not used even when round-half-even would read it back (`-3.6681927456064224e+16`, not `-3.668192745606422e+16`).
 - **Text forms:** `bool::text` is `true`/`false`, but a bool column's text is `t`/`f`; `bytea` is hex (`\x00ff`); `"char"` with the high bit is `\ooo`, the zero byte empty. Interval (postgres style): `1 year 2 mons 3 days 04:05:06.789`, plural unless 1 (`-1 days`), a `+` before a positive part that follows a negative one. Dates `0044-03-15 BC`, years past 9999 unpadded; `timestamptz` offsets `+05:45`, `+00`, historical `+05:41:16`. Interval infinities from 17; numeric infinities from 14. PostgreSQL 13 and 14 refuse the largest interval literal (`2562047788:00:54.775807`).
+- **Session reset (pool):** `DISCARD ALL` can't run in a multi-statement simple query (implicit transaction block), the rest of its parts can: the pool sends `CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD SEQUENCES; DISCARD TEMP` (all but `DEALLOCATE ALL`, so the statement cache stays valid). `RESET ALL` goes back to the startup-packet values (`statement_timeout`, `TimeZone` given at startup stay). Cached plans are re-planned when `search_path` changes.
+- **target_session_attrs:** PostgreSQL 14+ report `in_hot_standby` and `default_transaction_read_only` (ParameterStatus); older servers are asked (`SHOW transaction_read_only`, `pg_is_in_recovery()`). `default_transaction_read_only=on` (e.g. `options=-c ...`) makes a primary count as read-only.
 - **Time zones:** `timestamptz` text uses the session's `TimeZone` (ParameterStatus) through dbwire's `resolveTimeZone` (Phobos `PosixTimeZone`), which differs from the server before a zone's first transition (local mean time, e.g. Asia/Kathmandu before 1920) and after the last transition in the tz file (DST rules after 2037); buggins/dbwire#33.
 
 ## Local environment

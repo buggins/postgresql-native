@@ -57,8 +57,11 @@ Encodes `value` for a parameter of type `oid`.
 
 Supported D types: `bool`, integers, floating point, `Decimal`, strings and
 characters, `ubyte[]`, `Date`, `DateTime`, `SysTime`, `TimeOfDay`,
-`Duration`, `Interval`, `UUID`, enums (as their base type), `Nullable!T` and
-`null` (NULL), and `Variant` holding one of these.
+`Duration`, `Interval`, `UUID`, enums, `Nullable!T` and
+`null` (NULL), and `Variant` holding one of these. Enums with an integer
+base type are sent as their value for numeric parameters and as their
+member name for the others (text, PostgreSQL enum types); other enums as
+their value.
 
 Throws: `ClientException` for an integer out of the target type's range or
 an unsupported D type.
@@ -73,7 +76,18 @@ Param encodeParam(T)(T value, uint oid)
     else static if (is(U == Variant))
         return encodeVariant(value, oid);
     else static if (is(U == enum))
+    {
+        // integer enums: their value for numeric parameters, else their member name (text, varchar,
+        // PostgreSQL enum types); other enums: their value
+        static if (isIntegral!(OriginalType!U))
+        {
+            if (!isNumericOid(oid))
+                foreach (member; __traits(allMembers, U))
+                    if (__traits(getMember, U, member) == value)
+                        return text(member);
+        }
         return encodeParam(cast(OriginalType!U) value, oid);
+    }
     else static if (is(U == bool))
     {
         if (oid == Oid.bool_)
@@ -202,6 +216,8 @@ Param encodeParam(T)(T value, uint oid)
     }
 
     assert(encodeParam(Color.red, Oid.int2).data == [0, 3]);
+    assert(encodeParam(Color.red, Oid.text).data == cast(immutable(ubyte)[]) "red");
+    assert(encodeParam(cast(Color) 4, Oid.text).data == cast(immutable(ubyte)[]) "4");
     assert(encodeParam('é', Oid.text).data == cast(immutable(ubyte)[]) "é");
 }
 
@@ -319,6 +335,17 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
 }
 
 private:
+
+bool isNumericOid(uint oid) @safe pure nothrow
+{
+    switch (oid)
+    {
+    case Oid.int2, Oid.int4, Oid.int8, Oid.oid, Oid.numeric, Oid.float4, Oid.float8:
+        return true;
+    default:
+        return false;
+    }
+}
 
 Param binary(immutable(ubyte)[] data) @safe pure nothrow
 {
