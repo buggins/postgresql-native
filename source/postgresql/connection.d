@@ -18,7 +18,9 @@ import postgresql.exception;
 import postgresql.protocol.codes;
 import postgresql.protocol.messages;
 import postgresql.result;
+import postgresql.params : hasVariant, Param, rewritePlaceholders;
 import postgresql.settings;
+import postgresql.statement;
 
 @safe:
 
@@ -73,6 +75,9 @@ final class Connection
     private uint protocol = protocol30;
     private AuthMethod auth;
     private Notification[] notifications;
+    private StatementCache cache; // null when statementCacheSize is 0
+    private string[] pendingCloses; // statements to close with the next extended-protocol request
+    private ulong statementCounter;
     private bool responseDone = true; // ReadyForQuery of the current request was read
     private ServerMessage pendingError; // the first error of the current response
     private bool hasPendingError;
@@ -94,6 +99,8 @@ final class Connection
     this(ConnectionOptions options)
     {
         this.options = options;
+        if (options.statementCacheSize > 0)
+            cache = new StatementCache(options.statementCacheSize);
         connect();
     }
 
@@ -218,6 +225,7 @@ final class Connection
                 {
                 case BackendMessage.commandComplete:
                     lastTag = m.body.readCString();
+                    noteCommandTag(lastTag);
                     break;
                 case BackendMessage.readyForQuery:
                     readyForQuery(m);
@@ -237,29 +245,251 @@ final class Connection
     decodes come in binary format, the others in text; the getters on each
     row convert them (see `postgresql.value.Value`).
 
-    The statement is parsed and described first (one round trip), then
-    bound and executed. Several statements in one string are refused by the
-    server: use `querySimple` or `exec` for those.
+    `args` are the values of the placeholders: `$1`, `$2`, ..., or `?`
+    (rewritten to `$n` unless `ConnectionOptions.rewritePlaceholders` is
+    off; `??` is a literal `?`). Each value is encoded for the parameter type
+    the server infers (see `postgresql.params`).
 
-    Throws: `ServerException`, from here or from the result.
+    The statement is parsed once and kept in the connection's statement
+    cache (`ConnectionOptions.statementCacheSize`), so running the same SQL
+    again is one round trip. Several statements in one string are refused
+    by the server: use `querySimple` or `exec` without parameters for those.
+
+    Throws: `ClientException` for a wrong number of values or values that
+    don't fit the parameter types; `ServerException`, from here or from the result.
     +/
-    QueryResult query(string sql)
+    QueryResult query(Args...)(string sql, Args args)
     {
-        import postgresql.types.oids : hasBinaryDecoder;
+        static if (Args.length == 0)
+            return runSql(sql, null);
+        else
+        {
+            size_t count;
+            const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
+            static if (hasVariant!Args)
+                return (() @trusted => runSql(text, makeEncoder(args)))(); // Variant copies
+            else
+                return runSql(text, makeEncoder(args));
+        }
+    }
 
+    /++
+    Runs one SQL statement with parameters (see `query`) and returns the
+    number of rows it affected (`INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+    `SELECT`, ...; 0 for other commands). Rows are discarded.
+
+    Throws: `ClientException`, `ServerException`.
+    +/
+    ulong exec(Args...)(string sql, Args args) if (Args.length > 0)
+    {
+        static if (hasVariant!Args)
+            return (() @trusted => drainCount(query(sql, args)))(); // Variant copies
+        else
+            return drainCount(query(sql, args));
+    }
+
+    /++
+    Parses a statement on the server for running it many times (see
+    `PreparedStatement`). Placeholders are `$1`, `$2`, ..., or `?`.
+
+    Throws: `ServerException` if the server can't parse it.
+    +/
+    PreparedStatement prepare(string sql)
+    {
+        size_t count;
+        const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
         startRequest();
-        ColumnInfo[] columns;
+        auto info = describeStatement(text, nextStatementName("pgn_p"));
+        sync(); // ends the Parse/Describe batch
+        finishResponse();
+        return new PreparedStatement(this, info);
+    }
+
+    /// Number of statements in the statement cache.
+    @property size_t cachedStatements() const pure nothrow
+    {
+        return cache is null ? 0 : cache.length;
+    }
+
+    /// Reads a result to its end and returns the affected-row count of its command tag.
+    package static ulong drainCount(QueryResult r)
+    {
+        while (!r.empty)
+            r.popFront();
+        return affectedRows(r.commandTag);
+    }
+
+    // Closes a statement on the server with the next extended-protocol request.
+    package void closeStatementLater(string name) nothrow
+    {
+        if (state != State.closed && name.length)
+            pendingCloses ~= name;
+    }
+
+    // Runs `sql` (one statement) through the statement cache.
+    private QueryResult runSql(string sql, ParamEncoder encode)
+    {
+        foreach (attempt; 0 .. 2)
+        {
+            startRequest();
+            bool cached;
+            StatementInfo info;
+            if (cache !is null)
+            {
+                if (auto hit = cache.get(sql))
+                {
+                    info = *hit;
+                    cached = true;
+                }
+            }
+            if (!cached)
+            {
+                info = describeStatement(sql, cache !is null ? nextStatementName("pgn_s") : "");
+                if (cache !is null)
+                    closeStatementLater(cache.put(info));
+            }
+            auto outcome = execute(info, encode, cached && attempt == 0);
+            if (!outcome.retry)
+                return outcome.result;
+            // the cached statement was invalidated (schema change, DISCARD ALL): parse it again
+            closeStatementLater(cache.remove(sql));
+        }
+        assert(false, "a second attempt never asks to retry");
+    }
+
+    // Runs a prepared statement (PreparedStatement.query).
+    package QueryResult runStatement(StatementInfo info, ParamEncoder encode)
+    {
+        startRequest();
+        return execute(info, encode, false).result;
+    }
+
+    /++
+    Binds and executes a parsed statement: Bind, Execute, Sync (after any
+    pending Close messages), then reads up to BindComplete. When
+    `mayRetry` and the server reports that the statement no longer exists
+    or that its result type changed outside a transaction block, the
+    outcome asks for a retry instead.
+    +/
+    private static struct Outcome
+    {
+        QueryResult result;
+        bool retry;
+    }
+
+    private Outcome execute(StatementInfo info, ParamEncoder encode, bool mayRetry)
+    {
+        Param[] params;
+        try
+            params = encode is null ? checkNoParameters(info) : encode(info.parameterTypes);
+        catch (ClientException e)
+        {
+            // a Parse/Describe of this request may be waiting for its Sync
+            sync();
+            finishResponse();
+            throw e;
+        }
         bool failed;
         guarded({
             MessageBuilder b;
+            appendPendingCloses(b);
+            b.begin(FrontendMessage.bind);
+            b.putCString(""); // the unnamed portal
+            b.putCString(info.name);
+            b.putInt16(cast(short) params.length);
+            foreach (p; params)
+                b.putInt16(p.format);
+            b.putInt16(cast(short) params.length);
+            foreach (p; params)
+            {
+                if (p.isNull)
+                    b.putInt32(-1);
+                else
+                {
+                    if (p.data.length > int.max)
+                        throw new ClientException("A parameter value is longer than 2 GB");
+                    b.putInt32(cast(int) p.data.length);
+                    b.putBytes(p.data);
+                }
+            }
+            b.putInt16(cast(short) info.columns.length);
+            foreach (c; info.columns)
+                b.putInt16(c.format);
+            b.finish();
+            b.begin(FrontendMessage.execute);
+            b.putCString("");
+            b.putInt32(0); // all rows
+            b.finish();
+            b.begin(FrontendMessage.sync);
+            b.finish();
+            stream.send(b.data);
+
+            for (;;)
+            {
+                auto m = nextMessage();
+                if (m.type == BackendMessage.bindComplete)
+                    return;
+                handleResponseMessage(m);
+                if (m.type == BackendMessage.errorResponse)
+                {
+                    failed = true;
+                    return;
+                }
+            }
+        });
+        if (failed)
+        {
+            const error = pendingError;
+            try
+                finishResponse();
+            catch (ServerException e)
+            {
+                const invalidated = error.sqlState == "26000" || error.sqlState == "0A000";
+                if (mayRetry && invalidated && txStatus == TransactionStatus.idle)
+                    return Outcome(null, true);
+                throw e;
+            }
+        }
+        return Outcome(new QueryResult(this, info.columns, null, false), false);
+    }
+
+    private static Param[] checkNoParameters(StatementInfo info)
+    {
+        import std.conv : to;
+
+        if (info.parameterTypes.length)
+            throw new ClientException(
+                    "The statement has " ~ info.parameterTypes.length.to!string
+                    ~ " parameter(s), but no values were given");
+        return null;
+    }
+
+    /++
+    Parses and describes `sql` as statement `name` (Parse, Describe, Flush;
+    after any pending Close messages) and reads the parameter types and
+    columns. No Sync is sent on success: the caller binds or syncs next.
+
+    Throws: `ServerException` (after the Sync and the rest of the response).
+    +/
+    private StatementInfo describeStatement(string sql, string name)
+    {
+        import postgresql.types.oids : hasBinaryDecoder;
+
+        StatementInfo info;
+        info.name = name;
+        info.sql = sql;
+        bool failed;
+        guarded({
+            MessageBuilder b;
+            appendPendingCloses(b);
             b.begin(FrontendMessage.parse);
-            b.putCString(""); // the unnamed statement
+            b.putCString(name);
             b.putCString(sql);
             b.putInt16(0); // the server infers parameter types
             b.finish();
             b.begin(FrontendMessage.describe);
             b.putByte('S');
-            b.putCString("");
+            b.putCString(name);
             b.finish();
             b.begin(FrontendMessage.flush);
             b.finish();
@@ -269,57 +499,76 @@ final class Connection
             for (;;)
             {
                 auto m = nextMessage();
-                if (m.type == BackendMessage.rowDescription)
+                switch (m.type)
                 {
-                    columns = parseRowDescription(m.body);
+                case BackendMessage.parameterDescription:
+                    auto body = m.body;
+                    const count = body.readInt16();
+                    if (count < 0)
+                        throw new ProtocolException("Invalid parameter count");
+                    info.parameterTypes = new uint[count];
+                    foreach (ref t; info.parameterTypes)
+                        t = cast(uint)
+                        body.readInt32();
                     break;
-                }
-                if (m.type == BackendMessage.noData)
-                    break;
-                if (m.type == BackendMessage.errorResponse)
-                {
+                case BackendMessage.rowDescription:
+                    info.columns = parseRowDescription(m.body);
+                    return;
+                case BackendMessage.noData:
+                    return;
+                case BackendMessage.errorResponse:
                     handleResponseMessage(m);
                     failed = true;
-                    break;
+                    return;
+                default:
+                    handleResponseMessage(m);
                 }
-                handleResponseMessage(m);
             }
-            if (failed)
-            {
-                // the server skips everything up to a Sync
-                MessageBuilder sync;
-                sync.begin(FrontendMessage.sync);
-                sync.finish();
-                stream.send(sync.data);
-                return;
-            }
-
-            foreach (ref c; columns)
-                c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
-            MessageBuilder e;
-            e.begin(FrontendMessage.bind);
-            e.putCString(""); // the unnamed portal
-            e.putCString("");
-            e.putInt16(0); // parameter formats
-            e.putInt16(0); // parameters
-            e.putInt16(cast(short) columns.length);
-            foreach (c; columns)
-                e.putInt16(c.format);
-            e.finish();
-            e.begin(FrontendMessage.execute);
-            e.putCString("");
-            e.putInt32(0); // all rows
-            e.finish();
-            e.begin(FrontendMessage.sync);
-            e.finish();
-            stream.send(e.data);
         });
         if (failed)
         {
+            sync(); // the server skips everything up to a Sync
             finishResponse(); // throws the server's error
             throw new ProtocolException("The server reported a failure without an error");
         }
-        return new QueryResult(this, columns, null, false);
+        foreach (ref c; info.columns)
+            c.format = hasBinaryDecoder(c.typeOid) ? ValueFormat.binary : ValueFormat.text;
+        return info;
+    }
+
+    private void sync()
+    {
+        guarded({ MessageBuilder b; b.begin(FrontendMessage.sync); b.finish(); stream.send(b.data); });
+    }
+
+    private void appendPendingCloses(ref MessageBuilder b)
+    {
+        foreach (name; pendingCloses)
+        {
+            b.begin(FrontendMessage.close);
+            b.putByte('S');
+            b.putCString(name);
+            b.finish();
+        }
+        pendingCloses = null; // closing a statement that doesn't exist is not an error
+    }
+
+    private string nextStatementName(string prefix)
+    {
+        import std.conv : to;
+
+        return prefix ~ (++statementCounter).to!string;
+    }
+
+    // DISCARD ALL and DEALLOCATE ALL drop every prepared statement of the session.
+    private void noteCommandTag(string tag) nothrow
+    {
+        if (tag == "DISCARD ALL" || tag == "DEALLOCATE ALL")
+        {
+            if (cache !is null)
+                cache.clear();
+            pendingCloses = null;
+        }
     }
 
     /++
@@ -347,6 +596,7 @@ final class Connection
                     return;
                 case BackendMessage.commandComplete:
                     tag = m.body.readCString();
+                    noteCommandTag(tag);
                     rowsDone = true;
                     return;
                 case BackendMessage.emptyQueryResponse:
@@ -414,6 +664,7 @@ final class Connection
                     return;
                 case BackendMessage.commandComplete:
                     tag = m.body.readCString();
+                    noteCommandTag(tag);
                     return;
                 case BackendMessage.emptyQueryResponse, BackendMessage.portalSuspended:
                     return;
@@ -428,6 +679,40 @@ final class Connection
                 }
             }
         });
+    }
+
+    /++
+    After the rows of one statement: reads on to the next statement that
+    returns rows (true, its columns in `columns`) or to the end of the
+    response (false).
+    +/
+    package bool nextResult(ref ColumnInfo[] columns)
+    {
+        bool found;
+        if (state == State.closed)
+            return false;
+        guarded({
+            while (!responseDone)
+            {
+                auto m = nextMessage();
+                switch (m.type)
+                {
+                case BackendMessage.rowDescription:
+                    columns = parseRowDescription(m.body);
+                    found = true;
+                    return;
+                case BackendMessage.commandComplete:
+                    noteCommandTag(m.body.readCString());
+                    break;
+                case BackendMessage.readyForQuery:
+                    readyForQuery(m);
+                    break;
+                default:
+                    handleResponseMessage(m);
+                }
+            }
+        });
+        return found;
     }
 
     /++

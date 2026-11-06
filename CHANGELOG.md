@@ -35,3 +35,16 @@ project uses [semantic versioning](https://semver.org/).
   for every decoded type, `getLong`, `getDouble`, `getDecimal`, `getBytes`,
   `getDate`, `getDateTime`, `getSysTime`, `getTimeOfDay`, `getDuration`,
   `getInterval`, `getUUID`, `getVariant`, ...), which also parse text values.
+- Parameters and statements (#4): `query`/`exec` with parameter values
+  (`$1`... or `?`, rewritten outside quotes, dollar quotes and comments; `??`
+  is a literal `?`; option `rewritePlaceholders`). Values are encoded for the
+  parameter types the server infers: binary when the D type matches (integers
+  range-checked, floats, `bool`, `bytea`, dates, times, timestamps,
+  intervals, `uuid`), otherwise text the server parses (`Decimal`, strings
+  for any type); `null`/`Nullable`/`Variant` supported. A per-connection
+  statement cache (`statementCacheSize`, default 100; 0 for the unnamed
+  statement) makes repeated SQL one round trip; evicted statements are closed
+  with the next request, and statements invalidated by schema changes or
+  `DISCARD ALL` are parsed again. `prepare` returns a `PreparedStatement`.
+  `QueryResult.nextResult` moves through the result sets of a multi-statement
+  `querySimple`.
