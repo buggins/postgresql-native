@@ -459,14 +459,17 @@ void testHostaddrAndServices()
             .to!string
             ~ "\ndbname=" ~ databaseName() ~ "\nuser=" ~ userName() ~ "\npassword=" ~ password()
             ~ "\nsslmode=disable\napplication_name=from-service\n");
-    conn = new Connection("service=itest servicefile=" ~ serviceFile);
+    import std.array : replace;
+
+    const quotedFile = serviceFile.replace(`\`, `\\`); // a backslash escapes in key=value strings
+    conn = new Connection("service=itest servicefile=" ~ quotedFile);
     enforce(scalar(conn, "SHOW application_name") == "from-service", "service");
     conn.close();
-    conn = new Connection("service=itest servicefile=" ~ serviceFile ~ " application_name=from-string");
+    conn = new Connection("service=itest servicefile=" ~ quotedFile ~ " application_name=from-string");
     enforce(scalar(conn, "SHOW application_name") == "from-string", "the string wins");
     conn.close();
     enforce(collectException!ClientException(
-            new Connection("service=missing servicefile=" ~ serviceFile)) !is null,
+            new Connection("service=missing servicefile=" ~ quotedFile)) !is null,
             "unknown service");
 
     // PGSERVICE / PGSERVICEFILE: the service wins over the other PG* variables

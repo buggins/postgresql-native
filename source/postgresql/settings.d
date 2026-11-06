@@ -557,10 +557,13 @@ unittest
     write(file, "[sales]\nhost=svc.example\ndbname=sales\napplication_name=from-service\nsslmode=require\n");
     scope (exit)
         remove(file);
-    auto o = ConnectionOptions.parse("service=sales servicefile=" ~ file ~ " application_name=from-string");
+    import std.array : replace;
+
+    const quoted = file.replace(`\`, `\\`); // a backslash escapes in key=value strings (Windows paths)
+    auto o = ConnectionOptions.parse("service=sales servicefile=" ~ quoted ~ " application_name=from-string");
     assert(o.host == "svc.example" && o.database == "sales" && o.applicationName == "from-string");
     assert(o.sslMode == SslMode.require);
-    assertThrown!ClientException(ConnectionOptions.parse("service=nope servicefile=" ~ file));
+    assertThrown!ClientException(ConnectionOptions.parse("service=nope servicefile=" ~ quoted));
 
     const saved = environment.toAA();
     scope (exit)
