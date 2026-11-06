@@ -6,7 +6,7 @@ Guidance for AI coding agents working on **postgresql-native**, a native D clien
 
 - **What:** a pure-D client for PostgreSQL over the **frontend/backend protocol 3.x** (TCP, port 5432; TLS through SSLRequest or direct TLS), for PostgreSQL 13–18 (tested; older servers probably work), with blocking (thread) and vibe.d (fiber) I/O. dub package `postgresql-native`, root module `postgresql`.
 - **Repo:** `git@github.com:buggins/postgresql-native.git`, default branch `main`. Author Vadim Lopatin (GitHub `buggins`). License BSL-1.0.
-- **Status:** 0.1.0 prepared (P0–P5); roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold), P1 (connect, TLS, authentication, simple queries), P2 (extended-protocol results, binary types, getters), P3 (parameters, statement cache, prepared statements), P4 (transactions, cancel, timeouts, pipelines) and P5 (struct mapping, pool, connection strings, examples) done. Next: P6 types, P7 COPY/NOTIFY, P8 ddbc driver, P9 hibernated.
+- **Status:** 0.1.0 released 2026-11-06 (P0–P5), P6 (more types) in progress; roadmap issue #11 lists milestones P0–P9 (one issue each, #1–#10). P0 (scaffold), P1 (connect, TLS, authentication, simple queries), P2 (extended-protocol results, binary types, getters), P3 (parameters, statement cache, prepared statements), P4 (transactions, cancel, timeouts, pipelines) and P5 (struct mapping, pool, connection strings, examples) done. Next: P6 types, P7 COPY/NOTIFY, P8 ddbc driver, P9 hibernated.
 - **Builds on dbwire** (`../dbwire`, 0.6): `dbwire:types` (exceptions, `Decimal`), `:io` (transports, I/O backends, buffers), `:tls` (OpenSSL loaded at run time; ALPN for direct TLS), `:client` (DSN, failover, pool core), `:crypto` (PBKDF2 for SCRAM, secure random). Anything not protocol-specific is added to dbwire (issue + PR there), not here.
 - **Sibling projects:** `../oracle-native` and `../mssql-native` (the closest models: message layer over a byte stream, result streaming, parameters, pool, mapping, tests) and `../clickhoused`. Follow their structure, API style, tests and conventions (their `AGENTS.md`).
 - **`PLAN.md` (local and optional):** the design plan (protocol overview, types, API, milestones, decisions) is a local, untracked file (excluded through `.git/info/exclude`). If present, read it before design-level changes and keep it up to date; never `git add` it.
@@ -77,12 +77,15 @@ source/postgresql/
   params.d             Param, encodeParam (D value → binary or text for the server's parameter type), ? rewriting
   statement.d          StatementInfo, StatementCache (LRU by SQL text), PreparedStatement, argument encoders
   pipeline.d           Pipeline, PipelineMode, PipelineResult (run by Connection.runPipeline)
-  mapping.d            struct mapping: @column, @ignore, readValue, RowRange (query!T), multi-row insert SQL and encoder
+  attributes.d         @column, @ignore, mappedFields, columnNames, findName (used by mapping and Value.get!S)
+  mapping.d            struct mapping: readValue (= Value.get!T), RowRange (query!T), multi-row insert SQL and encoder
   pool.d               ConnectionPool, PooledConnection (session reset on release) over dbwire's PoolCore
   userfiles.d          the password file (.pgpass) and the default TLS files in ~/.postgresql
-  types/               oids.d (built-in OIDs, which are decoded from binary), numeric.d (binary numeric, exact
-                       text, Decimal), floats.d (shortest float text as the server prints it), temporal.d
-                       (date/time/timestamp(tz)/interval: calendar over the whole range, text output and parsing)
+  types/               oids.d (built-in OIDs, which are decoded from binary), pgtype.d (PgType: kind, element, fields,
+                       codec; the built-in registry), numeric.d (binary numeric, exact text, Decimal), floats.d
+                       (shortest float text as the server prints it), temporal.d (date/time/timestamp(tz)/interval),
+                       textformat.d (array/record/range/multirange/hstore text: parsing and quoting), network.d
+                       (Inet, MAC addresses), geometric.d, bitstring.d, ranges.d (Range!T)
   exception.d          ServerMessage (error/notice fields), ServerException + dbwire's exceptions
   protocol/            codes.d (message types, auth codes, request codes), messages.d (framing: Message,
                        MessageBody, MessageBuilder, MessageStream)
@@ -110,12 +113,15 @@ Checked on 13, 14, 16 and 18 (official Docker images).
 - **Text forms:** `bool::text` is `true`/`false`, but a bool column's text is `t`/`f`; `bytea` is hex (`\x00ff`); `"char"` with the high bit is `\ooo`, the zero byte empty. Interval (postgres style): `1 year 2 mons 3 days 04:05:06.789`, plural unless 1 (`-1 days`), a `+` before a positive part that follows a negative one. Dates `0044-03-15 BC`, years past 9999 unpadded; `timestamptz` offsets `+05:45`, `+00`, historical `+05:41:16`. Interval infinities from 17; numeric infinities from 14. PostgreSQL 13 and 14 refuse the largest interval literal (`2562047788:00:54.775807`).
 - **Session reset (pool):** `DISCARD ALL` can't run in a multi-statement simple query (implicit transaction block), the rest of its parts can: the pool sends `CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD SEQUENCES; DISCARD TEMP` (all but `DEALLOCATE ALL`, so the statement cache stays valid). `RESET ALL` goes back to the startup-packet values (`statement_timeout`, `TimeZone` given at startup stay). Cached plans are re-planned when `search_path` changes.
 - **target_session_attrs:** PostgreSQL 14+ report `in_hot_standby` and `default_transaction_read_only` (ParameterStatus); older servers are asked (`SHOW transaction_read_only`, `pg_is_in_recovery()`). `default_transaction_read_only=on` (e.g. `options=-c ...`) makes a primary count as read-only.
+- **Types of the database:** `Connection.resolveColumns` looks dynamic OIDs up in `pg_type` (statement `pgn_types`, prepared once per session; re-prepared after DISCARD/DEALLOCATE ALL) between the describe and the Bind, so the result format can be chosen per column; element, field, base and subtype OIDs are looked up in the same way until all are known. Arrays are told by `typelem <> 0 AND typlen = -1`; multiranges (`typtype 'm'`, `pg_range.rngmultitypid`) from 14 only, so the query differs by version. The anonymous `record` is read as text (field types unknown).
+- **RowDescription of a domain column** carries the base type's OID; inside arrays and records the domain's OID appears (`posint[]` is its own array type; record fields carry the declared type).
+- **Text forms:** array elements are quoted when empty, `NULL` (any case), or containing `{}",\`, the delimiter or space, with `\` escapes; `box[]` uses `;`. Record fields and range bounds are quoted when empty or containing parentheses (and brackets for ranges), `,`, `"`, `\` or space, with `"` and `\` doubled; a NULL field is empty. Multiranges `{[1,3),[5,7)}`. `hstore`: `"k"=>"v", "k2"=>NULL`. `inet::text` (`network_show`) always shows the prefix, unlike the column output: compare with the simple protocol's output. IPv6 output: longest run of ≥ 2 zero groups as `::`, dotted IPv4 tail only for `::a.b.c.d` (run of 6 from 0) and `::ffff:a.b.c.d`. PostGIS `geometry`/`geography`: binary is EWKB, text is its uppercase hex. Geometric types use float8 text (`NaN`, `Infinity`).
 - **Time zones:** `timestamptz` text uses the session's `TimeZone` (ParameterStatus) through dbwire's `resolveTimeZone` (Phobos `PosixTimeZone`), which differs from the server before a zone's first transition (local mean time, e.g. Asia/Kathmandu before 1920) and after the last transition in the tz file (DST rules after 2037); buggins/dbwire#33.
 
 ## Local environment
 
 - WSL2 Linux. **LDC 1.36.0** (`ldc2`); DMD is not installed. Test the minimum frontend with LDC 1.27.1 (download `https://github.com/ldc-developers/ldc/releases/download/v1.27.1/ldc2-1.27.1-linux-x86_64.tar.xz` into the scratchpad, run dub with `--compiler=<path>/bin/ldc2`).
-- PostgreSQL in Docker: containers `pgnative-18`, `pgnative-16`, `pgnative-14`, `pgnative-13` (`postgres:<version>`, ports **15418**, 15416, 15414, 15413), prepared with `setup-server.sh`; user `testuser` / `Test_password123`, database `testdb`. `psql` is inside the containers: `docker exec -it pgnative-18 psql -U testuser -d testdb`.
+- PostgreSQL in Docker: containers `pgnative-18`, `pgnative-16`, `pgnative-14`, `pgnative-13` (`postgres:<version>`, ports **15418**, 15416, 15414, 15413), prepared with `setup-server.sh`; user `testuser` / `Test_password123`, database `testdb`. `psql` is inside the containers: `docker exec -it pgnative-18 psql -U testuser -d testdb`. PostGIS: `pgnative-postgis` (`postgis/postgis:17-3.5`, port 15417, not prepared by the setup script; `testPostgis` runs where the extension is available).
 - The local `grep` is ugrep, which treats files with odd bytes as binary and prints nothing: use `grep -a` on wire dumps.
 
 ## Conventions

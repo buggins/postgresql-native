@@ -11,6 +11,7 @@ import std.stdio : stderr, writefln;
 import integrationtests.basic;
 import integrationtests.connect;
 import integrationtests.highlevel;
+import integrationtests.moretypes;
 import integrationtests.params;
 import integrationtests.probe;
 import integrationtests.server : serverConfigured;
@@ -65,6 +66,13 @@ immutable TestCase[] allTests = [
     TestCase("pool: reuse, session reset, limits", &testPool, true),
     TestCase("target_session_attrs, load_balance_hosts", &testTargetSessionAttrs, true),
     TestCase("PG* environment, password file, ~/.postgresql files", &testEnvironmentAndUserFiles, true),
+    TestCase("arrays", &testArrays, true),
+    TestCase("ranges and multiranges", &testRanges, true),
+    TestCase("composite types, enums, domains", &testCompositesEnumsDomains, true),
+    TestCase("inet, cidr, macaddr, bit strings, pg_lsn", &testNetworkAndBits, true),
+    TestCase("geometric types", &testGeometric, true),
+    TestCase("hstore, citext, types read as text", &testExtensionAndTextTypes, true),
+    TestCase("PostGIS geometry and geography (when installed)", &testPostgis, true),
 ];
 
 /// Runner identity, for reports.

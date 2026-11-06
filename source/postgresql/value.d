@@ -25,6 +25,12 @@ import postgresql.types.floats;
 import postgresql.types.numeric;
 import postgresql.types.oids;
 import postgresql.types.temporal;
+import postgresql.types.pgtype;
+import postgresql.types.textformat;
+import postgresql.types.network : Inet, macAddressText, parseMacAddress;
+import postgresql.types.geometric;
+import postgresql.types.bitstring : BitString;
+import postgresql.types.ranges : isRange, Range;
 
 /// One value of a row.
 struct Value
@@ -54,6 +60,26 @@ struct Value
         return null_;
     }
 
+    /// The value's data type; null if the client doesn't know it (see `ColumnInfo.type`).
+    @property const(PgType) type() const @safe nothrow
+    {
+        return column.type !is null ? column.type : builtinType(column.typeOid);
+    }
+
+    // The built-in type whose decoder reads the value (domains: their base type's; enums: text).
+    private @property uint codec() const @safe nothrow
+    {
+        const t = type;
+        return t is null ? column.typeOid : t.codec;
+    }
+
+    // The kind of the value's type, domains looked through (base for unknown types).
+    private @property TypeKind kind() const @safe nothrow
+    {
+        const t = type;
+        return t is null ? TypeKind.base : t.withoutDomain.kind;
+    }
+
     /// The bytes as the server sent them (binary or text format); null for NULL.
     @property immutable(ubyte)[] raw() const @safe pure nothrow
     {
@@ -81,10 +107,52 @@ struct Value
             return null;
         if (!binary)
             return cast(string) data;
-        switch (column.typeOid)
+        final switch (kind)
+        {
+        case TypeKind.array:
+            return arrayText();
+        case TypeKind.range:
+            return rangeText(getRange());
+        case TypeKind.multirange:
+            return multirangeText();
+        case TypeKind.composite:
+            return recordText();
+        case TypeKind.base, TypeKind.enum_, TypeKind.domain, TypeKind.pseudo:
+            break;
+        }
+        switch (codec)
         {
         case Oid.text, Oid.varchar, Oid.bpchar, Oid.name, Oid.json, Oid.unknown:
             return cast(string) data;
+        case Oid.inet, Oid.cidr:
+            return Inet.fromBinary(data).toString();
+        case Oid.macaddr, Oid.macaddr8:
+            return macAddressText(macBytes());
+        case Oid.bit, Oid.varbit:
+            return BitString.fromBinary(data).toString();
+        case Oid.point:
+            return geometricFromBinary!Point(data).toString();
+        case Oid.line:
+            return geometricFromBinary!Line(data).toString();
+        case Oid.lseg:
+            return geometricFromBinary!LineSegment(data).toString();
+        case Oid.box:
+            return geometricFromBinary!Box(data).toString();
+        case Oid.path:
+            return geometricFromBinary!Path(data).toString();
+        case Oid.polygon:
+            return geometricFromBinary!Polygon(data).toString();
+        case Oid.circle:
+            return geometricFromBinary!Circle(data).toString();
+        case Oid.pgLsn:
+            import std.format : format;
+
+            const lsn = cast(ulong) fixed!long();
+            return format("%X/%X", lsn >> 32, lsn & 0xFFFF_FFFF);
+        case hstoreCodec:
+            return hstoreText(getHstorePairs());
+        case postgisCodec:
+            return upperHex(data);
         case Oid.jsonb:
             return jsonbText();
         case Oid.bool_:
@@ -92,7 +160,7 @@ struct Value
         case Oid.int2, Oid.int4, Oid.int8, Oid.oid:
             import std.conv : to;
 
-            return column.typeOid == Oid.oid ? (cast(uint) integer()).to!string : integer().to!string;
+            return codec == Oid.oid ? (cast(uint) integer()).to!string : integer().to!string;
         case Oid.float4:
             return formatFloat4(float4());
         case Oid.float8:
@@ -133,7 +201,7 @@ struct Value
         notNull();
         if (binary)
         {
-            if (column.typeOid == Oid.bool_)
+            if (codec == Oid.bool_)
                 return fixed!ubyte() != 0;
             if (isIntegerType)
                 return integer() != 0;
@@ -166,9 +234,9 @@ struct Value
         {
             if (isIntegerType)
                 return integer();
-            if (column.typeOid == Oid.bool_)
+            if (codec == Oid.bool_)
                 return fixed!ubyte() != 0;
-            if (column.typeOid == Oid.numeric)
+            if (codec == Oid.numeric)
             {
                 const n = Numeric.decode(data);
                 if (n.isIntegral)
@@ -210,7 +278,7 @@ struct Value
         notNull();
         if (binary)
         {
-            switch (column.typeOid)
+            switch (codec)
             {
             case Oid.float4:
                 return float4();
@@ -241,7 +309,7 @@ struct Value
         notNull();
         if (binary)
         {
-            if (column.typeOid == Oid.numeric)
+            if (codec == Oid.numeric)
                 return Numeric.decode(data).toDecimal();
             if (isIntegerType)
                 return Decimal.fromLong(integer());
@@ -255,7 +323,8 @@ struct Value
 
     /++
     The value as bytes: the contents of a `bytea` (binary, or hex text),
-    the 16 bytes of a `uuid`, the UTF-8 bytes of a text value.
+    the 16 bytes of a `uuid`, the 6 or 8 of a `macaddr`/`macaddr8`, the EWKB
+    of a PostGIS `geometry`/`geography`, the UTF-8 bytes of a text value.
 
     Throws: `ClientException` for NULL or other types.
     +/
@@ -264,16 +333,24 @@ struct Value
         notNull();
         if (binary)
         {
-            switch (column.typeOid)
+            switch (codec)
             {
             case Oid.bytea, Oid.uuid, Oid.text, Oid.varchar, Oid.bpchar, Oid.name, Oid.json, Oid.char_:
+                return data;
+            case Oid.macaddr, Oid.macaddr8:
+                return macBytes();
+            case postgisCodec:
                 return data;
             default:
                 throw wrongType("bytes");
             }
         }
-        if (column.typeOid == Oid.bytea)
+        if (codec == Oid.bytea)
             return decodeHex(text);
+        if (codec == Oid.macaddr || codec == Oid.macaddr8)
+            return parseMacAddress(cast(string) data);
+        if (codec == postgisCodec)
+            return decodeHex(`\x` ~ text);
         return data;
     }
 
@@ -285,7 +362,7 @@ struct Value
     Date getDate() const @safe
     {
         notNull();
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.date:
             return dateFromPostgres(binary ? fixed!int() : parseDate(text));
@@ -307,7 +384,7 @@ struct Value
     DateTime getDateTime() const @safe
     {
         notNull();
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.timestamp, Oid.timestamptz:
             return dateTimeFromPostgres(timestampValue());
@@ -329,7 +406,7 @@ struct Value
         import std.datetime.timezone : UTC;
 
         notNull();
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.timestamp, Oid.timestamptz:
             return sysTimeFromPostgres(timestampValue());
@@ -349,7 +426,7 @@ struct Value
     int getMicrosecondsOfSecond() const @safe
     {
         notNull();
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.time:
             return microsecondsOfSecond(binary ? fixed!long() : parseTime(text));
@@ -371,7 +448,7 @@ struct Value
     TimeOfDay getTimeOfDay() const @safe
     {
         notNull();
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.time:
             return timeOfDayFromPostgres(binary ? fixed!long() : parseTime(text));
@@ -393,9 +470,9 @@ struct Value
         import core.time : days, usecs;
 
         notNull();
-        if (column.typeOid == Oid.time)
+        if (codec == Oid.time)
             return usecs(binary ? fixed!long() : parseTime(text));
-        if (column.typeOid == Oid.interval && binary)
+        if (codec == Oid.interval && binary)
         {
             const i = getInterval();
             if (i.months != 0)
@@ -413,7 +490,7 @@ struct Value
     Interval getInterval() const @safe
     {
         notNull();
-        if (column.typeOid != Oid.interval || !binary)
+        if (codec != Oid.interval || !binary)
             throw wrongType("Interval");
         if (data.length != 16)
             throw new ProtocolException("Malformed interval value");
@@ -430,7 +507,7 @@ struct Value
         notNull();
         if (binary)
         {
-            if (column.typeOid != Oid.uuid)
+            if (codec != Oid.uuid)
                 throw wrongType("UUID");
             if (data.length != 16)
                 throw new ProtocolException("Malformed uuid value");
@@ -449,20 +526,40 @@ struct Value
     a `string` for NaN, infinities or more than 76 digits), `string` (text
     types, JSON, and types without a decoder), `immutable(ubyte)[]`
     (`bytea`), `Date`, `TimeOfDay` (`time`), `DateTime` (`timestamp`),
-    `SysTime` (`timestamptz`), `Interval`, `UUID`; an empty `Variant` for
-    NULL. Infinite dates and timestamps, and times of 24:00:00, are strings.
+    `SysTime` (`timestamptz`), `Interval`, `UUID`, `Inet` (`inet`, `cidr`),
+    `BitString`, the geometric structs (`Point`, ...); an empty `Variant` for
+    NULL. Infinite dates and timestamps, times of 24:00:00, arrays, ranges,
+    composite values and the other types are strings (their text).
     +/
     Variant getVariant() const @trusted
     {
         // Variant's copy constructor isn't @safe; the values put in it are plain data
         if (null_)
             return Variant();
-        if (!binary)
+        if (!binary || kind != TypeKind.base)
             return Variant(getString());
         try
         {
-            switch (column.typeOid)
+            switch (codec)
             {
+            case Oid.inet, Oid.cidr:
+                return Variant(getInet());
+            case Oid.bit, Oid.varbit:
+                return Variant(getBitString());
+            case Oid.point:
+                return Variant(get!Point());
+            case Oid.line:
+                return Variant(get!Line());
+            case Oid.lseg:
+                return Variant(get!LineSegment());
+            case Oid.box:
+                return Variant(get!Box());
+            case Oid.path:
+                return Variant(get!Path());
+            case Oid.polygon:
+                return Variant(get!Polygon());
+            case Oid.circle:
+                return Variant(get!Circle());
             case Oid.bool_:
                 return Variant(getBool());
             case Oid.int2:
@@ -501,6 +598,604 @@ struct Value
             return Variant(getString()); // NaN, infinity, out of D's ranges
     }
 
+    /++
+    The value as an array: its dimensions and elements, which are `Value`s
+    of the element type. Binary and text values alike.
+
+    Throws: `ClientException` for NULL or values that aren't arrays.
+    +/
+    ArrayValue getArray() const @safe
+    {
+        notNull();
+        const t = type;
+        if (kind != TypeKind.array)
+            throw wrongType("array");
+        const element = t.withoutDomain.element;
+        ArrayValue a;
+        if (!binary)
+        {
+            auto parts = parseArrayText(cast(string) data, element is null ? ',' : element.delimiter);
+            a.lengths = parts.lengths;
+            a.lowerBounds = parts.lowerBounds;
+            const info = partInfo(element, ValueFormat.text, 0);
+            a.elements = new Value[parts.elements.length];
+            foreach (i, e; parts.elements)
+                a.elements[i] = Value(info, cast(immutable(ubyte)[]) e, e is null, timeZone);
+            return a;
+        }
+        auto r = Reader(data, "array");
+        const dims = r.int32();
+        r.int32(); // has NULLs
+        const elementOid = cast(uint) r.int32();
+        if (dims < 0 || dims > 6)
+            throw new ProtocolException("Malformed array value: " ~ "dimensions");
+        size_t total = dims > 0 ? 1 : 0;
+        a.lengths = new int[dims];
+        a.lowerBounds = new int[dims];
+        foreach (d; 0 .. dims)
+        {
+            a.lengths[d] = r.int32();
+            a.lowerBounds[d] = r.int32();
+            if (a.lengths[d] < 0 || total * a.lengths[d] > data.length)
+                throw new ProtocolException("Malformed array value: " ~ "lengths");
+            total *= a.lengths[d];
+        }
+        const info = partInfo(element !is null ? element : builtinType(elementOid), ValueFormat.binary, elementOid);
+        a.elements = new Value[total];
+        foreach (ref e; a.elements)
+        {
+            const p = r.part();
+            e = Value(info, p.bytes, p.isNull, timeZone);
+        }
+        r.end();
+        return a;
+    }
+
+    /++
+    The value as a range: emptiness, bounds (`Value`s of the subtype) and
+    their inclusivity. See `get!(Range!T)` for typed ranges.
+
+    Throws: `ClientException` for NULL or values that aren't ranges.
+    +/
+    RangeValue getRange() const @safe
+    {
+        notNull();
+        if (kind != TypeKind.range)
+            throw wrongType("range");
+        return rangeFrom(data, binary, type.withoutDomain.element);
+    }
+
+    /++
+    The value as a multirange: its ranges, in order.
+
+    Throws: `ClientException` for NULL or values that aren't multiranges.
+    +/
+    RangeValue[] getMultirange() const @safe
+    {
+        notNull();
+        if (kind != TypeKind.multirange)
+            throw wrongType("multirange");
+        const rangeType = type.withoutDomain.element;
+        const subtype = rangeType is null ? null : rangeType.element;
+        RangeValue[] ranges;
+        if (!binary)
+        {
+            foreach (text; parseMultirangeText(cast(string) data))
+                ranges ~= rangeFrom(cast(immutable(ubyte)[]) text, false, subtype);
+            return ranges;
+        }
+        auto r = Reader(data, "multirange");
+        const count = r.int32();
+        if (count < 0 || count > data.length)
+            throw new ProtocolException("Malformed multirange value");
+        foreach (i; 0 .. count)
+        {
+            const p = r.part();
+            if (p.isNull)
+                throw new ProtocolException("Malformed multirange value");
+            ranges ~= rangeFrom(p.bytes, true, subtype);
+        }
+        r.end();
+        return ranges;
+    }
+
+    /++
+    The value as a record: the fields of a composite value (`Value`s of their
+    types) and, for a composite type the connection knows, their names. See
+    `get!S` for structs.
+
+    Throws: `ClientException` for NULL or values that aren't composite.
+    +/
+    RecordValue getRecord() const @safe
+    {
+        notNull();
+        if (kind != TypeKind.composite)
+            throw wrongType("record");
+        const t = type.withoutDomain;
+        RecordValue record;
+        record.names = t.fieldNames;
+        if (!binary)
+        {
+            const fields = parseRecordText(cast(string) data);
+            record.fields = new Value[fields.length];
+            foreach (i, f; fields)
+            {
+                const fieldType = i < t.fieldTypes.length ? t.fieldTypes[i] : null;
+                record.fields[i] = Value(partInfo(fieldType, ValueFormat.text, 0, fieldName(t, i)),
+                        cast(immutable(ubyte)[]) f, f is null, timeZone);
+            }
+            if (record.names.length != fields.length)
+                record.names = null;
+            return record;
+        }
+        auto r = Reader(data, "record");
+        const count = r.int32();
+        if (count < 0 || count > data.length)
+            throw new ProtocolException("Malformed record value");
+        record.fields = new Value[count];
+        foreach (i, ref f; record.fields)
+        {
+            const oid = cast(uint) r.int32();
+            const p = r.part();
+            const known = i < t.fieldTypes.length && t.fieldTypes[i]!is null && t.fieldTypes[i].oid == oid
+                ? t.fieldTypes[i] : builtinType(oid);
+            f = Value(partInfo(known, ValueFormat.binary, oid, fieldName(t, i)), p.bytes, p.isNull, timeZone);
+        }
+        r.end();
+        if (record.names.length != count)
+            record.names = null;
+        return record;
+    }
+
+    /++
+    The value as an `Inet`: `inet`, `cidr`; their text.
+
+    Throws: `ClientException` for NULL or other types.
+    +/
+    Inet getInet() const @safe
+    {
+        notNull();
+        if (codec != Oid.inet && codec != Oid.cidr)
+            throw wrongType("Inet");
+        return binary ? Inet.fromBinary(data) : Inet.parse(cast(string) data, codec == Oid.cidr);
+    }
+
+    /++
+    The value as a `BitString`: `bit`, `varbit`; their text.
+
+    Throws: `ClientException` for NULL or other types.
+    +/
+    BitString getBitString() const @safe
+    {
+        notNull();
+        if (codec != Oid.bit && codec != Oid.varbit)
+            throw wrongType("BitString");
+        return binary ? BitString.fromBinary(data) : BitString.parse(cast(string) data);
+    }
+
+    /++
+    The value of an `hstore` (extension type): its keys and values (null
+    for NULL values), in the server's order.
+
+    Throws: `ClientException` for NULL or other types.
+    +/
+    HstorePair[] getHstore() const @safe
+    {
+        notNull();
+        if (codec != hstoreCodec)
+            throw wrongType("hstore");
+        return getHstorePairs();
+    }
+
+    /++
+    The value converted to `T`: any type with a getter (`bool`, integers,
+    floating point, strings, `ubyte[]`, `Decimal`, `Date`, `TimeOfDay`,
+    `DateTime`, `SysTime`, `Duration`, `Interval`, `UUID`, `Variant`,
+    `Inet`, `BitString`, `Point`, `Line`, `LineSegment`, `Box`, `Path`,
+    `Polygon`, `Circle`, `ArrayValue`, `RangeValue`, `RecordValue`), and:
+    $(UL
+    $(LI enums: from numbers, or from text (and PostgreSQL enums) by member name or value;)
+    $(LI `Nullable!T`: null for NULL;)
+    $(LI D arrays (`int[]`, `string[]`, `Nullable!int[]`, `int[][]` for two dimensions, ...) from arrays;)
+    $(LI `Range!T` from ranges, `Range!T[]` from multiranges;)
+    $(LI `string[string]` and `Nullable!string[string]` from `hstore`;)
+    $(LI other structs from composite values: fields by name (`@column`, `@ignore`) when the type's
+        field names are known, else in order.)
+    )
+    Integers are range-checked; `ulong` also reads `numeric` values above
+    `long.max`. NULL throws, except for types that hold it (`Nullable`,
+    `string`, `ubyte[]`, `Variant`, arrays: null).
+
+    Throws: `ClientException` if the value can't be converted.
+    +/
+    T get(T)() const
+    {
+        import std.conv : ConvException, to;
+        import std.traits : isDynamicArray, isFloatingPoint, isIntegral, isSomeString, OriginalType, Unqual;
+        import std.typecons : Nullable;
+
+        alias U = Unqual!T;
+        static if (is(U : Nullable!N, N))
+            return isNull ? T.init : T(get!N());
+        else static if (is(U == Variant))
+            return getVariant();
+        else static if (is(U == enum))
+        {
+            notNull();
+            if (codec == Oid.int2 || codec == Oid.int4 || codec == Oid.int8 || codec == Oid.oid
+                    || codec == Oid.numeric)
+            {
+                const n = getLong();
+                foreach (member; __traits(allMembers, U))
+                    if (__traits(getMember, U, member) == n)
+                        return __traits(getMember, U, member);
+                throw new ClientException(n.to!string ~ " is not a value of " ~ T.stringof);
+            }
+            // the member's name, or its value (as text)
+            const text = getString();
+            try
+                return text.to!U;
+            catch (ConvException)
+            {
+            }
+            foreach (member; __traits(allMembers, U))
+                if ((cast(OriginalType!U) __traits(getMember, U, member)).to!string == text)
+                    return __traits(getMember, U, member);
+            throw new ClientException("'" ~ text ~ "' is not a value of " ~ T.stringof);
+        }
+        else static if (is(U == bool))
+            return getBool();
+        else static if (isIntegral!U)
+        {
+            static if (is(U == ulong))
+            {
+                if (!isNull && (codec == Oid.numeric || codec == Oid.pgLsn))
+                {
+                    if (codec == Oid.pgLsn)
+                        return binary ? cast(ulong) fixed!long() : parseLsn(cast(string) data);
+                    try
+                        return getString().to!ulong;
+                    catch (ConvException)
+                        throw new ClientException("Value " ~ getString() ~ " does not fit in ulong");
+                }
+            }
+            const n = getLong();
+            if (n < U.min || (U.max <= long.max && n > cast(long) U.max))
+                throw new ClientException("Value " ~ n.to!string ~ " does not fit in " ~ U.stringof);
+            return cast(T) n;
+        }
+        else static if (isFloatingPoint!U)
+            return cast(T) getDouble();
+        else static if (isSomeString!U)
+            return getString().to!T;
+        else static if (is(U : const(ubyte)[]))
+        {
+            if (isNull)
+                return null;
+            static if (is(immutable(ubyte)[] : U))
+                return getBytes();
+            else
+                return getBytes().dup;
+        }
+        else static if (is(U == Decimal))
+            return getDecimal();
+        else static if (is(U == Date))
+            return getDate();
+        else static if (is(U == TimeOfDay))
+            return getTimeOfDay();
+        else static if (is(U == Duration))
+            return getDuration();
+        else static if (is(U == Interval))
+            return getInterval();
+        else static if (is(U == DateTime))
+            return getDateTime();
+        else static if (is(U == SysTime))
+            return getSysTime();
+        else static if (is(U == UUID))
+            return getUUID();
+        else static if (is(U == Inet))
+            return getInet();
+        else static if (is(U == BitString))
+            return getBitString();
+        else static if (isGeometric!U)
+        {
+            notNull();
+            const expected = geometricOid!U;
+            if (codec != expected)
+                throw wrongType(U.stringof);
+            return binary ? geometricFromBinary!U(data) : parseGeometric!U(cast(string) data);
+        }
+        else static if (is(U == ArrayValue))
+            return getArray();
+        else static if (is(U == RangeValue))
+            return getRange();
+        else static if (is(U == RecordValue))
+            return getRecord();
+        else static if (isRange!U)
+            return typedRange!U(getRange());
+        else static if (is(U : V[K], V, K))
+        {
+            static assert(is(K == string) && (is(V == string) || is(V == Nullable!string)),
+                    "Only string[string] and Nullable!string[string] (hstore) are read as associative arrays");
+            if (isNull)
+                return null;
+            U map;
+            foreach (pair; getHstore())
+            {
+                static if (is(V == string))
+                    map[pair.key] = pair.value;
+                else
+                    map[pair.key] = pair.value is null ? V.init : V(pair.value);
+            }
+            return map;
+        }
+        else static if (isDynamicArray!U)
+        {
+            alias E = Unqual!(typeof(U.init[0]));
+            if (isNull)
+                return null;
+            static if (isRange!E)
+            {
+                if (kind == TypeKind.multirange)
+                {
+                    E[] list;
+                    foreach (r; getMultirange())
+                        list ~= typedRange!E(r);
+                    return cast(T) list;
+                }
+            }
+            const a = getArray();
+            if (a.elements.length == 0)
+                return T.init;
+            enum depth = arrayDepth!U;
+            if (a.lengths.length != depth)
+                throw new ClientException("The array has " ~ a.lengths.length.to!string ~ " dimension(s), "
+                        ~ T.stringof ~ " has " ~ depth.to!string);
+            size_t at;
+            return cast(T) buildArray!U(a, 0, at);
+        }
+        else static if (is(U == struct))
+        {
+            import postgresql.attributes : columnNames, findName, mappedFields;
+
+            notNull();
+            const record = getRecord();
+            enum names = columnNames!U;
+            // by name if every field is found, else in order
+            size_t[names.length] positions;
+            bool byName = record.names.length > 0;
+            foreach (i, name; names)
+            {
+                const p = byName ? findName(record.names, name) : -1;
+                if (p < 0)
+                    byName = false;
+                else
+                    positions[i] = p;
+            }
+            if (!byName)
+            {
+                if (record.fields.length < names.length)
+                    throw new ClientException("The record has " ~ record.fields.length.to!string ~ " field(s), "
+                            ~ U.stringof ~ " needs " ~ names.length.to!string);
+                foreach (i, ref p; positions)
+                    p = i;
+            }
+            U value;
+            static foreach (i, name; mappedFields!U)
+            {
+                try
+                    __traits(getMember, value, name) = record.fields[positions[i]].get!(typeof(__traits(getMember,
+                            U, name)))();
+                catch (ClientException e)
+                    throw new ClientException(U.stringof ~ "." ~ name ~ ": " ~ e.msg);
+            }
+            return value;
+        }
+        else
+            static assert(0, "Values can't be read as " ~ T.stringof);
+    }
+
+    // The array (or nested arrays) of `A` from `a`, starting at dimension `level` and element `at`.
+    private static A buildArray(A)(const ArrayValue a, size_t level, ref size_t at)
+    {
+        import std.traits : Unqual;
+
+        alias E = Unqual!(typeof(A.init[0]));
+        auto list = new E[a.lengths[level]];
+        foreach (ref item; list)
+        {
+            static if (arrayDepth!E > 0)
+                item = buildArray!E(a, level + 1, at);
+            else
+                item = a.elements[at++].get!E();
+        }
+        return cast(A) list;
+    }
+
+    private static R typedRange(R)(const RangeValue r)
+    {
+        alias T = typeof(R.init.lower);
+        R result;
+        result.empty = r.empty;
+        result.lowerInclusive = r.lowerInclusive;
+        result.upperInclusive = r.upperInclusive;
+        result.lowerInfinite = r.lowerInfinite;
+        result.upperInfinite = r.upperInfinite;
+        if (!r.empty && !r.lowerInfinite)
+            result.lower = r.lower.get!T();
+        if (!r.empty && !r.upperInfinite)
+            result.upper = r.upper.get!T();
+        return result;
+    }
+
+    // A ColumnInfo for the parts (elements, fields, bounds) of this value.
+    private const(ColumnInfo)* partInfo(const(PgType) partType, ValueFormat format, uint oid,
+            string name = null) const @safe
+    {
+        auto info = new ColumnInfo;
+        info.name = name.length ? name : column.name;
+        info.typeOid = partType !is null ? partType.oid : oid;
+        info.typeModifier = -1;
+        info.format = format;
+        info.type = partType;
+        return info;
+    }
+
+    private static string fieldName(const PgType t, size_t i) @safe pure nothrow
+    {
+        return i < t.fieldNames.length ? t.fieldNames[i] : null;
+    }
+
+    private RangeValue rangeFrom(immutable(ubyte)[] bytes, bool isBinary, const(PgType) subtype) const @safe
+    {
+        RangeValue r;
+        if (!isBinary)
+        {
+            const parts = parseRangeText(cast(string) bytes);
+            r.empty = parts.empty;
+            if (r.empty)
+                return r;
+            r.lowerInclusive = parts.lowerInclusive;
+            r.upperInclusive = parts.upperInclusive;
+            r.lowerInfinite = parts.lower is null;
+            r.upperInfinite = parts.upper is null;
+            const info = partInfo(subtype, ValueFormat.text, 0);
+            if (!r.lowerInfinite)
+                r.lower = Value(info, cast(immutable(ubyte)[]) parts.lower, false, timeZone);
+            if (!r.upperInfinite)
+                r.upper = Value(info, cast(immutable(ubyte)[]) parts.upper, false, timeZone);
+            return r;
+        }
+        // flags: empty 0x01, [ 0x02, ] 0x04, no lower 0x08, no upper 0x10 (NULL bounds 0x20, 0x40)
+        auto reader = Reader(bytes, "range");
+        const flags = reader.byte_();
+        r.empty = (flags & 0x01) != 0;
+        r.lowerInclusive = (flags & 0x02) != 0;
+        r.upperInclusive = (flags & 0x04) != 0;
+        r.lowerInfinite = (flags & 0x28) != 0;
+        r.upperInfinite = (flags & 0x50) != 0;
+        const info = partInfo(subtype, ValueFormat.binary, 0);
+        if (!r.empty && !r.lowerInfinite)
+            r.lower = Value(info, reader.part().bytes, false, timeZone);
+        if (!r.empty && !r.upperInfinite)
+            r.upper = Value(info, reader.part().bytes, false, timeZone);
+        reader.end();
+        return r;
+    }
+
+    private string arrayText() const @safe
+    {
+        import std.conv : to;
+
+        const a = getArray();
+        if (a.elements.length == 0)
+            return "{}";
+        const element = type.withoutDomain.element;
+        const delimiter = element is null ? ',' : element.delimiter;
+        string text;
+        foreach (d; 0 .. a.lengths.length)
+            if (a.lowerBounds[d] != 1)
+            {
+                foreach (k; 0 .. a.lengths.length)
+                    text ~= "[" ~ a.lowerBounds[k].to!string ~ ":" ~ (a.lowerBounds[k] + a.lengths[k] - 1).to!string
+                        ~ "]";
+                text ~= "=";
+                break;
+            }
+        // row-major: before element i, as many braces close and open as dimensions start a sub-array at i
+        size_t starts(size_t i)
+        {
+            size_t count, stride = 1;
+            foreach_reverse (d; 0 .. a.lengths.length)
+            {
+                stride *= a.lengths[d];
+                if (i % stride != 0)
+                    break;
+                count++;
+            }
+            return count;
+        }
+
+        foreach (i, e; a.elements)
+        {
+            const n = starts(i);
+            if (i > 0)
+            {
+                foreach (k; 0 .. n)
+                    text ~= "}";
+                text ~= delimiter;
+            }
+            foreach (k; 0 .. n)
+                text ~= "{";
+            text ~= e.isNull ? "NULL" : quoteArrayElement(e.getString(), delimiter);
+        }
+        foreach (k; 0 .. a.lengths.length)
+            text ~= "}";
+        return text;
+    }
+
+    private static string rangeText(const RangeValue r) @safe
+    {
+        if (r.empty)
+            return "empty";
+        return (r.lowerInclusive ? "[" : "(") ~ (r.lowerInfinite ? "" : quoteRangeBound(r.lower.getString())) ~ ","
+            ~ (
+                    r.upperInfinite ? "" : quoteRangeBound(r.upper.getString())) ~ (r.upperInclusive ? "]" : ")");
+    }
+
+    private string multirangeText() const @safe
+    {
+        string text = "{";
+        foreach (i, r; getMultirange())
+            text ~= (i ? "," : "") ~ rangeText(r);
+        return text ~ "}";
+    }
+
+    private string recordText() const @safe
+    {
+        string text = "(";
+        foreach (i, f; getRecord().fields)
+            text ~= (i ? "," : "") ~ (f.isNull ? "" : quoteRecordField(f.getString()));
+        return text ~ ")";
+    }
+
+    private HstorePair[] getHstorePairs() const @safe
+    {
+        if (!binary)
+            return parseHstoreText(cast(string) data);
+        auto r = Reader(data, "hstore");
+        const count = r.int32();
+        if (count < 0 || count > data.length)
+            throw new ProtocolException("Malformed hstore value");
+        auto pairs = new HstorePair[count];
+        foreach (ref p; pairs)
+        {
+            const key = r.part();
+            if (key.isNull)
+                throw new ProtocolException("Malformed hstore value");
+            p.key = cast(string) key.bytes;
+            const value = r.part();
+            p.value = value.isNull ? null : value.bytes.length ? cast(string) value.bytes : "";
+        }
+        r.end();
+        return pairs;
+    }
+
+    private static string hstoreText(const HstorePair[] pairs) @safe
+    {
+        string text;
+        foreach (i, p; pairs)
+            text ~= (i ? ", " : "") ~ quoteHstore(p.key) ~ "=>" ~ (p.value is null ? "NULL" : quoteHstore(p.value));
+        return text;
+    }
+
+    private immutable(ubyte)[] macBytes() const @safe
+    {
+        if (data.length != (codec == Oid.macaddr ? 6 : 8))
+            throw new ProtocolException("Malformed " ~ typeName() ~ " value");
+        return data;
+    }
+
     // --- helpers ---
 
     private void notNull() const @safe
@@ -519,15 +1214,14 @@ struct Value
     {
         import std.conv : to;
 
-        foreach (member; __traits(allMembers, Oid))
-            if (__traits(getMember, Oid, member) == column.typeOid)
-                return member[$ - 1] == '_' ? member[0 .. $ - 1] : member;
+        if (const t = type)
+            return t.name;
         return "type OID " ~ column.typeOid.to!string;
     }
 
-    private @property bool isIntegerType() const @safe pure nothrow
+    private @property bool isIntegerType() const @safe nothrow
     {
-        const t = column.typeOid;
+        const t = codec;
         return t == Oid.int2 || t == Oid.int4 || t == Oid.int8 || t == Oid.oid;
     }
 
@@ -540,7 +1234,7 @@ struct Value
 
     private long integer() const @safe
     {
-        switch (column.typeOid)
+        switch (codec)
         {
         case Oid.int2:
             return fixed!short();
@@ -618,12 +1312,201 @@ struct Value
     }
 }
 
+/// An array value: its dimensions and elements (see `Value.getArray`).
+struct ArrayValue
+{
+    /// The length of each dimension; empty for an empty array.
+    int[] lengths;
+    /// The lower bound (first index) of each dimension: 1 unless the array was built otherwise.
+    int[] lowerBounds;
+    /// The elements in row-major order.
+    Value[] elements;
+
+    /// Number of elements (all dimensions).
+    @property size_t length() const @safe pure nothrow
+    {
+        return elements.length;
+    }
+
+    /// Element `i` in row-major order.
+    Value opIndex(size_t i) const @safe pure nothrow
+    {
+        return elements[i];
+    }
+}
+
+/// A range value (see `Value.getRange`).
+struct RangeValue
+{
+    /// Whether the range is empty.
+    bool empty;
+    /// Whether the bounds are included.
+    bool lowerInclusive, upperInclusive;
+    /// Whether a bound is missing (unbounded).
+    bool lowerInfinite, upperInfinite;
+    /// The bounds; unused when infinite or empty.
+    Value lower, upper;
+}
+
+/// A composite value (see `Value.getRecord`).
+struct RecordValue
+{
+    /// The field names, when the type is known (not for `record`); else empty.
+    const(string)[] names;
+    /// The fields.
+    Value[] fields;
+
+    /// Number of fields.
+    @property size_t length() const @safe pure nothrow
+    {
+        return fields.length;
+    }
+
+    /// Field `i`.
+    Value opIndex(size_t i) const @safe pure nothrow
+    {
+        return fields[i];
+    }
+
+    /++
+    The field named `name` (exact, else ignoring case).
+
+    Throws: `ClientException` if there is none.
+    +/
+    Value opIndex(string name) const @safe
+    {
+        import postgresql.attributes : findName;
+
+        const i = findName(names, name);
+        if (i < 0)
+            throw new ClientException("The record has no field '" ~ name ~ "'");
+        return fields[i];
+    }
+}
+
+// The number of array dimensions of D type `T` (strings and ubyte[] are values, not arrays).
+private template arrayDepth(T)
+{
+    import std.traits : isDynamicArray, isSomeString;
+    import postgresql.types.ranges : isRange;
+
+    static if (isDynamicArray!T && !isSomeString!T && !is(T : const(ubyte)[]))
+        enum arrayDepth = 1 + arrayDepth!(typeof(T.init[0]));
+    else
+        enum arrayDepth = 0;
+}
+
+// The OID of a geometric type.
+private template geometricOid(T)
+{
+    static if (is(T == Point))
+        enum geometricOid = Oid.point;
+    else static if (is(T == Line))
+        enum geometricOid = Oid.line;
+    else static if (is(T == LineSegment))
+        enum geometricOid = Oid.lseg;
+    else static if (is(T == Box))
+        enum geometricOid = Oid.box;
+    else static if (is(T == Path))
+        enum geometricOid = Oid.path;
+    else static if (is(T == Polygon))
+        enum geometricOid = Oid.polygon;
+    else
+        enum geometricOid = Oid.circle;
+}
+
+// Reads the parts of binary container values (arrays, ranges, records, hstore).
+private struct Reader
+{
+    immutable(ubyte)[] data;
+    string what;
+    size_t at;
+
+    this(immutable(ubyte)[] data, string what) @safe pure nothrow
+    {
+        this.data = data;
+        this.what = what;
+    }
+
+    int int32() @safe pure
+    {
+        if (at + 4 > data.length)
+            throw new ProtocolException("Malformed " ~ what ~ " value");
+        const v = bigEndian!int(data[at .. at + 4]);
+        at += 4;
+        return v;
+    }
+
+    ubyte byte_() @safe pure
+    {
+        if (at >= data.length)
+            throw new ProtocolException("Malformed " ~ what ~ " value");
+        return data[at++];
+    }
+
+    static struct Part
+    {
+        immutable(ubyte)[] bytes;
+        bool isNull;
+    }
+
+    // an int32 length (-1: NULL) and that many bytes
+    Part part() @safe pure
+    {
+        const length = int32();
+        if (length == -1)
+            return Part(null, true);
+        if (length < 0 || at + length > data.length)
+            throw new ProtocolException("Malformed " ~ what ~ " value");
+        auto bytes = data[at .. at + length];
+        at += length;
+        return Part(bytes, false);
+    }
+
+    void end() @safe pure
+    {
+        if (at != data.length)
+            throw new ProtocolException("Malformed " ~ what ~ " value");
+    }
+}
+
+// pg_lsn text: two hexadecimal halves, `16/B374D848`.
+private ulong parseLsn(string text) @safe pure
+{
+    import std.conv : ConvException, to;
+    import std.string : indexOf;
+
+    const slash = text.indexOf('/');
+    try
+    {
+        if (slash > 0)
+            return text[0 .. slash].to!ulong(16) << 32 | text[slash + 1 .. $].to!ulong(16);
+    }
+    catch (ConvException)
+    {
+    }
+    throw new ClientException("Invalid pg_lsn '" ~ text ~ "'");
+}
+
 private T bigEndian(T)(scope const(ubyte)[] bytes) @safe pure nothrow
 {
     ulong v;
     foreach (b; bytes[0 .. T.sizeof])
         v = (v << 8) | b;
     return cast(T) v;
+}
+
+// Uppercase hexadecimal digits (PostGIS's text of EWKB).
+private string upperHex(scope const(ubyte)[] data) @safe pure
+{
+    static immutable digits = "0123456789ABCDEF";
+    auto text = new char[data.length * 2];
+    foreach (i, b; data)
+    {
+        text[2 * i] = digits[b >> 4];
+        text[2 * i + 1] = digits[b & 15];
+    }
+    return (() @trusted => cast(string) text)(); // not referenced elsewhere
 }
 
 // Decodes bytea's hex text (\x0102...).

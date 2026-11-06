@@ -46,15 +46,19 @@ Features:
 - queries with parameters (`$1`, `$2`, … or `?`), binary formats, a statement
   cache, prepared statements, several result sets, transactions and
   savepoints, cancellation, `statement_timeout`, notices, pipelines;
-- the common types, read and sent exactly: integers, floating point, `numeric`
-  (as exact decimals), text, `bytea`, `bool`, `date`, `time`, `timetz`,
-  `timestamp` and `timestamptz` (with microseconds), `interval`, `uuid`,
-  `json`/`jsonb`; other types as text;
+- the types read and sent exactly, in binary format: integers, floating
+  point, `numeric` (as exact decimals), text, `bytea`, `bool`, `date`,
+  `time`, `timetz`, `timestamp` and `timestamptz` (with microseconds),
+  `interval`, `uuid`, `json`/`jsonb`, arrays (any dimensions), ranges and
+  multiranges, composite types, enums, domains, `inet`/`cidr`,
+  `macaddr`/`macaddr8`, `bit`/`varbit`, the geometric types, `pg_lsn`, and
+  the extension types `hstore`, `citext` and PostGIS `geometry`/`geography`;
+  the others (`money`, `xml`, `tsvector`, ...) as text;
 - struct mapping and a connection pool, in thread and fiber mode.
 
-Later: arrays, ranges, composite types, network and geometric types, `COPY`,
-`LISTEN`/`NOTIFY` helpers, a [ddbc](https://github.com/buggins/ddbc) driver
-and [hibernated](https://github.com/buggins/hibernated) support. SCRAM channel
+Later: `COPY`, `LISTEN`/`NOTIFY` helpers, a
+[ddbc](https://github.com/buggins/ddbc) driver and
+[hibernated](https://github.com/buggins/hibernated) support. SCRAM channel
 binding is implemented and switches on with the next dbwire release (it needs
 the server's certificate from the TLS layer). GSSAPI, SSPI and Unix-domain
 sockets are not supported.
@@ -186,7 +190,9 @@ auto total = conn.queryValue!long("SELECT count(*) FROM orders");
 ```
 
 Fields map to columns by name (exact, else ignoring case); extra result
-columns are ignored. `insert` writes up to 1000 rows per statement; outside a
+columns are ignored. Fields may be arrays (`int[]`, `string[][]`), ranges
+(`Range!DateTime`), structs (from composite types), `Inet`, `Point`, ... —
+anything `Value.get!T` reads. `insert` writes up to 1000 rows per statement; outside a
 transaction block, an insert of several statements runs in a transaction of
 its own. Column names that are plain identifiers are folded to lower case, as
 PostgreSQL folds unquoted names.
@@ -215,11 +221,15 @@ statements stay. Pool keywords: `pool_max`, `pool_wait_timeout`,
 `Row` getters convert a column to D types (`getLong`, `getInt`, `getBool`,
 `getDouble`, `getDecimal`, `getString`, `getBytes`, `getDate`,
 `getTimeOfDay`, `getDateTime`, `getSysTime`, `getMicrosecondsOfSecond`,
-`getDuration`, `getInterval`, `getUUID`, `getVariant`), by index or column
-name. NULL throws, except for `getString`, `getBytes` and `getVariant`
+`getDuration`, `getInterval`, `getUUID`, `getInet`, `getBitString`,
+`getArray`, `getRange`, `getMultirange`, `getRecord`, `getHstore`,
+`getVariant`), by index or column name, and `get!T` converts to any
+supported D type (`row.get!(int[])(0)`, `row.get!(Range!Date)("during")`,
+`row.get!Address("home")`, `row.get!(Nullable!long)(1)`). NULL throws,
+except for `getString`, `getBytes`, `getVariant` and types that hold it
 (`isNull` tells).
 
-| PostgreSQL type | Natural D type (`getVariant`) | Notes |
+| PostgreSQL type | D type | Notes |
 |---|---|---|
 | `int2`, `int4`, `int8`, `oid` | `short`, `int`, `long`, `uint` | |
 | `numeric` | `Decimal` (exact, 76 digits) | NaN, infinities and longer values: `getString` |
@@ -233,9 +243,33 @@ name. NULL throws, except for `getString`, `getBytes` and `getVariant`
 | `timestamptz` | `SysTime` | text in the session's `TimeZone` |
 | `interval` | `Interval` (months, days, microseconds) | `getDuration` when it has no months |
 | `uuid` | `UUID` | |
-| `json`, `jsonb`, other types | `string` | the server's text |
+| `json`, `jsonb` | `string` | the server's text |
+| arrays (`int4[]`, `text[][]`, ...) | `get!(T[])`, nested for more dimensions; `getArray` | NULL elements: `Nullable!T[]`; lower bounds kept |
+| ranges, multiranges (14+) | `get!(Range!T)`, `get!(Range!T[])`; `getRange` | `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`, `tstzrange`, user ranges |
+| composite types, `record` | `get!S` for a struct; `getRecord` | fields by name for named types, in order for `record` |
+| enums | `string`, or a D enum by member name | |
+| domains | as their base type | |
+| `inet`, `cidr` | `Inet` | |
+| `macaddr`, `macaddr8` | `ubyte[]` (`getBytes`) | |
+| `bit`, `varbit` | `BitString` | |
+| `point`, `line`, `lseg`, `box`, `path`, `polygon`, `circle` | `Point`, `Line`, `LineSegment`, `Box`, `Path`, `Polygon`, `Circle` | |
+| `pg_lsn` | `get!ulong` | |
+| `hstore` (extension) | `string[string]`, `Nullable!string[string]`; `getHstore` | |
+| `citext` (extension) | `string` | |
+| PostGIS `geometry`, `geography` | `ubyte[]` (EWKB, `getBytes`) | text: its hexadecimal digits |
+| `money`, `xml`, `tsvector`, `tsquery`, others | `string` | the server's text |
 
-`getString` gives exactly the text PostgreSQL prints for every type. Time
+`getString` gives exactly the text PostgreSQL prints for every type.
+`getVariant` holds the first D type listed for scalar types, and the text
+of arrays, ranges, composite values and the types read as text. The client looks up the types of the database (enums, composite types,
+domains, their arrays and ranges, extension types) in `pg_type` the first
+time a statement meets them, once per connection (`clearTypeCache` after
+`ALTER TYPE`); `querySimple` results use the types already known.
+
+The same D types work as parameters: D arrays (binary for arrays of built-in
+types), `Range!T`, structs (composite values), `string[string]` (`hstore`),
+`Inet`, `BitString`, the geometric structs; PostGIS values as text (WKT or
+hex EWKB) or through `ST_GeomFromWKB(?)` with `ubyte[]`. Time
 zones use the system's time zone database (Windows has none: `timestamptz`
 text then shows UTC).
 

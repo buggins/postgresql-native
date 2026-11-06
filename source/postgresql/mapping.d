@@ -6,13 +6,15 @@ one whose name differs only in case. `@column("name")` gives a field another
 column name and `@ignore` leaves it out. Result columns without a field are
 ignored.
 
-Field types: `bool`, integers, `float`/`double`, `string`, `ubyte[]`,
-`Decimal`, `Date`, `TimeOfDay`, `DateTime`, `SysTime`, `Duration`,
-`Interval`, `UUID`, `Variant`, enums (from numbers, or from text and
-PostgreSQL enum columns holding their member names), and `Nullable!T` of
+Field types: those `Value.get` reads: `bool`, integers, `float`/`double`,
+`string`, `ubyte[]`, `Decimal`, `Date`, `TimeOfDay`, `DateTime`, `SysTime`,
+`Duration`, `Interval`, `UUID`, `Variant`, enums (from numbers, or from text
+and PostgreSQL enum columns holding their member names), D arrays (from
+arrays), `Range!T`, `Inet`, `BitString`, the geometric types, structs (from
+composite values), `string[string]` (from `hstore`), and `Nullable!T` of
 these. A NULL read into a field that can't hold it (anything but `string`,
-`ubyte[]`, `Variant` and `Nullable!T`) throws `ClientException`, as the
-`Value` getters do.
+`ubyte[]`, arrays, `Variant` and `Nullable!T`) throws `ClientException`, as
+the `Value` getters do.
 
 Example:
 ---
@@ -56,69 +58,7 @@ import postgresql.types.oids : Oid;
 import postgresql.types.temporal : Interval;
 import postgresql.value : Value;
 
-/// The value of a `@column("name")` attribute.
-struct ColumnName
-{
-    /// The column name.
-    string name;
-}
-
-/// The type of the `@ignore` attribute.
-struct IgnoreField
-{
-}
-
-/// UDA: maps a field to the column `name` (instead of the field's name).
-ColumnName column(string name) @safe pure nothrow
-{
-    return ColumnName(name);
-}
-
-/// UDA: leaves a field out of the mapping.
-enum ignore = IgnoreField();
-
-/// The names of the mapped fields of `T` (not `@ignore`d), in field order.
-template mappedFields(T) if (is(T == struct))
-{
-    enum string[] mappedFields = () {
-        string[] names;
-        static foreach (name; FieldNameTuple!T)
-        {
-            static if (!hasUDA!(__traits(getMember, T, name), IgnoreField))
-                names ~= name;
-        }
-        return names;
-    }();
-}
-
-/// The column names of the mapped fields of `T`, in field order.
-template columnNames(T) if (is(T == struct))
-{
-    enum string[] columnNames = () {
-        string[] names;
-        static foreach (name; mappedFields!T)
-        {
-            static if (hasUDA!(__traits(getMember, T, name), ColumnName))
-                names ~= getUDAs!(__traits(getMember, T, name), ColumnName)[0].name;
-            else
-                names ~= name;
-        }
-        return names;
-    }();
-}
-
-///
-@safe unittest
-{
-    static struct S
-    {
-        int id;
-        @column("full_name") string name;
-        @ignore int cache;
-    }
-
-    static assert(columnNames!S == ["id", "full_name"]);
-}
+public import postgresql.attributes : column, ColumnName, columnNames, ignore, IgnoreField, mappedFields;
 
 /// Whether a mapped field of `T` is a `Variant`, whose copies are `@system`.
 template hasVariantField(T) if (is(T == struct))
@@ -135,104 +75,14 @@ template hasVariantField(T) if (is(T == struct))
 }
 
 /++
-`v` converted to the field type `T` (see the module documentation).
+`v` converted to the field type `T`: `v.get!T` (see `Value.get` and the module documentation).
 
 Throws: `ClientException` if the column's type can't be converted to `T`,
 the value doesn't fit, or it is NULL and `T` can't hold NULL.
 +/
 T readValue(T)(const Value v)
 {
-    import std.conv : ConvException, to;
-
-    alias U = Unqual!T;
-    static if (is(U : Nullable!N, N))
-        return v.isNull ? T.init : T(readValue!N(v));
-    else static if (is(U == Variant))
-        return v.getVariant();
-    else static if (is(U == enum))
-    {
-        if (v.isNull)
-            throw new ClientException("NULL can't be read as " ~ T.stringof);
-        if (isNumericColumn(v))
-        {
-            const n = v.getLong();
-            foreach (member; __traits(allMembers, U))
-                if (__traits(getMember, U, member) == n)
-                    return __traits(getMember, U, member);
-            throw new ClientException(n.to!string ~ " is not a value of " ~ T.stringof);
-        }
-        // the member's name, or its value (as text)
-        const text = v.getString();
-        try
-            return text.to!U;
-        catch (ConvException)
-        {
-        }
-        foreach (member; __traits(allMembers, U))
-            if ((cast(OriginalType!U) __traits(getMember, U, member)).to!string == text)
-                return __traits(getMember, U, member);
-        throw new ClientException("'" ~ text ~ "' is not a value of " ~ T.stringof);
-    }
-    else static if (is(U == bool))
-        return v.getBool();
-    else static if (isIntegral!U)
-    {
-        static if (is(U == ulong))
-        {
-            if (v.info.typeOid == Oid.numeric && !v.isNull)
-            {
-                // beyond long: through the decimal text
-                try
-                    return v.getString().to!ulong;
-                catch (ConvException)
-                    throw new ClientException("Value " ~ v.getString() ~ " does not fit in ulong");
-            }
-        }
-        const n = v.getLong();
-        if (n < U.min || (U.max <= long.max && n > cast(long) U.max))
-            throw new ClientException("Value " ~ n.to!string ~ " does not fit in " ~ U.stringof);
-        return cast(T) n;
-    }
-    else static if (isFloatingPoint!U)
-        return cast(T) v.getDouble();
-    else static if (isSomeString!U)
-        return v.getString().to!T;
-    else static if (is(U : const(ubyte)[]))
-    {
-        static if (is(immutable(ubyte)[] : U))
-            return v.getBytes();
-        else
-            return v.getBytes().dup;
-    }
-    else static if (is(U == Decimal))
-        return v.getDecimal();
-    else static if (is(U == Date))
-        return v.getDate();
-    else static if (is(U == TimeOfDay))
-        return v.getTimeOfDay();
-    else static if (is(U == Duration))
-        return v.getDuration();
-    else static if (is(U == Interval))
-        return v.getInterval();
-    else static if (is(U == DateTime))
-        return v.getDateTime();
-    else static if (is(U == SysTime))
-        return v.getSysTime();
-    else static if (is(U == UUID))
-        return v.getUUID();
-    else
-        static assert(0, "Fields of type " ~ T.stringof ~ " can't be read");
-}
-
-private bool isNumericColumn(const Value v) @safe pure nothrow
-{
-    switch (v.info.typeOid)
-    {
-    case Oid.int2, Oid.int4, Oid.int8, Oid.oid, Oid.numeric:
-        return true;
-    default:
-        return false;
-    }
+    return v.get!T();
 }
 
 /++

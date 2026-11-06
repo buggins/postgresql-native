@@ -201,8 +201,8 @@ void testTextFallbackAndVariants()
     auto conn = connectToServer();
     scope (exit)
         conn.close();
-    auto row = firstRow(conn, "SELECT '192.168.0.1/24'::inet, ARRAY[1, 2], '(1,2)'::point, 'abc'::xml");
-    enforce(row.columns[0].format == ValueFormat.text && row.getString(0) == "192.168.0.1/24", "inet as text");
+    auto row = firstRow(conn, "SELECT 'a fat cat'::tsvector, ARRAY[1, 2], '(1,2)'::point, 'abc'::xml");
+    enforce(row.columns[0].format == ValueFormat.text && row.getString(0) == "'a' 'cat' 'fat'", "tsvector as text");
     enforce(row.getString(1) == "{1,2}" && row.getString(2) == "(1,2)" && row.getString(3) == "abc", "text fallback");
 
     row = firstRow(conn, "SELECT 1::int2, 2::int4, 3::int8, 1.5::float4, 2.5::float8, 1.25::numeric, 'x'::text, "
