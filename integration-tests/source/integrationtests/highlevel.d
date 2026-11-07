@@ -363,6 +363,20 @@ void testEnvironmentAndUserFiles()
     write(buildPath(userDirectory(), "root.crt"), readText(tlsFile("other-ca.pem")));
     auto e = collectException!ConnectionException(new Connection(c));
     enforce(e !is null, "verified against root.crt");
+    // root.crl: revocation checks with the default files (a third home, for the context cache)
+    version (Windows)
+        environment["APPDATA"] = buildPath(dir, "third");
+    else
+        environment["HOME"] = buildPath(dir, "third");
+    mkdirRecurse(userDirectory());
+    write(buildPath(userDirectory(), "root.crt"), readText(tlsFile("ca.pem")));
+    write(buildPath(userDirectory(), "root.crl"), readText(tlsFile("crl-revoked.pem")));
+    auto s = serverOptions(SslMode.require);
+    auto revoked = collectException!ConnectionException(new Connection(s));
+    enforce(revoked !is null, "root.crl: a revoked certificate accepted");
+    write(buildPath(userDirectory(), "root.crl"), readText(tlsFile("crl-none.pem")));
+    s.tls.crlFile = tlsFile("crl-none.pem"); // the same content under another name: a new TLS context
+    new Connection(s).close();
 }
 
 private string escapePassField(string s)

@@ -65,6 +65,9 @@ jobs:
           POSTGRES_DB: testdb
         ports:
           - 5432:5432
+        # the server's Unix-domain socket, for the socket tests (POSTGRES_SOCKET_DIR)
+        volumes:
+          - /tmp/pgsocket:/var/run/postgresql
         options: >-
           --health-cmd "pg_isready -U testuser -d testdb"
           --health-interval 5s
@@ -76,6 +79,7 @@ jobs:
       POSTGRES_USER: testuser
       POSTGRES_PASSWORD: Test_password123
       POSTGRES_SETUP: "1"
+      POSTGRES_SOCKET_DIR: /tmp/pgsocket
     steps:
       - uses: actions/checkout@v7
       - uses: dlang-community/setup-dlang@v2.0.0

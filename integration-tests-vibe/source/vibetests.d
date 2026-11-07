@@ -8,7 +8,7 @@ import vibe.core.core : runTask, sleep;
 
 import postgresql;
 import integrationtests.harness : TestCase;
-import integrationtests.server : connectToServer, scalar, serverOptions;
+import integrationtests.server : connectToServer, scalar, serverOptions, socketDirectory, socketPort;
 
 /// Tests registered by the vibe.d runner.
 immutable TestCase[] vibeTests = [
@@ -48,10 +48,25 @@ void testConcurrentStatements()
     enforce(MonoTime.currTime - start < 1400.msecs, "the tasks ran concurrently");
 }
 
-/// Another task cancels a running statement; the connection stays usable.
+/++
+Another task cancels a running statement; the connection stays usable. Also
+over a Unix-domain socket (`POSTGRES_SOCKET_DIR`): the cancel request is a
+second socket connection while the first is open.
++/
 void testCancelFromTask()
 {
-    auto conn = connectToServer();
+    cancelFromTask(connectToServer());
+    if (socketDirectory().length)
+    {
+        auto o = serverOptions();
+        o.host = socketDirectory();
+        o.port = socketPort();
+        cancelFromTask(new Connection(o));
+    }
+}
+
+private void cancelFromTask(Connection conn)
+{
     scope (exit)
         conn.close();
     void cancelLater() nothrow

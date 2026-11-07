@@ -82,8 +82,11 @@ POSTGRES_HOST=localhost:15418 POSTGRES_PASSWORD=Test_password123 \
 ```
 
 `sh integration-tests/setup-server.sh pgnative-18` adds TLS and a user per
-authentication method; then set `POSTGRES_SETUP=1` to run those tests too
-(see [CONTRIBUTING.md](CONTRIBUTING.md)).
+authentication method; then set `POSTGRES_SETUP=1` to run those tests too.
+The socket tests need the container's `/var/run/postgresql` mounted on the
+host (`-v /tmp/pgsocket:/var/run/postgresql`, a short path: socket paths are
+limited to about 100 bytes) and `POSTGRES_SOCKET_DIR=/tmp/pgsocket`.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Connecting
 
@@ -94,16 +97,18 @@ auto conn2 = new Connection("host=db1 dbname=sales user=app application_name=rep
 auto conn3 = new Connection(fromEnvironment());   // PGHOST, PGUSER, PGDATABASE, PGSSLMODE, ...
 ```
 
-Keywords are libpq's: `host`, `hostaddr` (numeric addresses to connect to,
+Keywords are libpq's: `host` (a name, an address, or the directory of the
+server's Unix-domain socket, e.g. `/var/run/postgresql`; `@name` for a Linux
+abstract socket), `hostaddr` (numeric addresses to connect to,
 keeping `host` for TLS name checks and the password file), `port` (several,
 comma-separated, for failover), `service` and `servicefile` (connection services,
 `pg_service.conf`), `dbname`, `user`, `password`, `passfile`, `options`,
 `application_name`, `connect_timeout`, `sslmode` (`disable`, `allow`,
 `prefer` (the default), `require`, `verify-ca`, `verify-full`),
 `sslnegotiation`, `sslrootcert` (`system` for the system's store), `sslcert`,
-`sslkey`, `sslpassword`, `ssl_min_protocol_version`,
+`sslkey`, `sslpassword`, `sslcrl`, `sslcrldir`, `ssl_min_protocol_version`,
 `ssl_max_protocol_version`, `channel_binding`, `require_auth`,
-`max_protocol_version`, `target_session_attrs` (`any`, `read-write`,
+`max_protocol_version`, `requirepeer`, `target_session_attrs` (`any`, `read-write`,
 `read-only`, `primary`, `standby`, `prefer-standby`), `load_balance_hosts`
 (`disable`, `random`); and this library's `statement_cache_size`,
 `rewrite_placeholders`, `io_mode`. `ConnectionOptions` has them all as fields,
@@ -119,9 +124,10 @@ else `~/.pg_service.conf`) and then the system's (`pg_service.conf` in
 `/etc`). Without a password, one from the password
 file is used when the server asks (`passfile`, `PGPASSFILE`, else
 `~/.pgpass`; `%APPDATA%\postgresql\pgpass.conf` on Windows). The TLS files
-default to `root.crt`, `postgresql.crt` and `postgresql.key` in
+default to `root.crt`, `root.crl`, `postgresql.crt` and `postgresql.key` in
 `~/.postgresql` when they exist; with `root.crt`, `sslmode=require` verifies
-the certificate. When no CA is given, `verify-ca` and `verify-full` use the
+the certificate. TLS is never used over Unix-domain sockets, and the default
+host is `localhost` over TCP (libpq's default is the socket directory). When no CA is given, `verify-ca` and `verify-full` use the
 system's trusted certificates.
 
 Without TLS (`sslmode=disable`, or `prefer` with a server without TLS), the
