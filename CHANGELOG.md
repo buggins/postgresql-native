@@ -6,6 +6,8 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.5.0 (2026-11-07)
+
 ### Added
 
 - `hostaddr` (and `PGHOSTADDR`, `ConnectionOptions.hostAddress`, #19):
@@ -36,7 +38,7 @@ project uses [semantic versioning](https://semver.org/).
 
 ### Changed
 
-- Requires dbwire 0.8 (CRLs, Unix-domain sockets).
+- dbwire 0.8 (`~>0.8.0`: CRLs, Unix-domain sockets).
 
 ## 0.4.0 (2026-11-06)
 
