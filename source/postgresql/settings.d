@@ -103,7 +103,13 @@ Everything needed to connect.
 +/
 struct ConnectionOptions
 {
-    /// Host name or IP address, if `hosts` is empty.
+    /++
+    Host name or IP address, if `hosts` is empty. A name that starts with `/`
+    is the directory of the server's Unix-domain socket
+    (`/var/run/postgresql` connects to `/var/run/postgresql/.s.PGSQL.5432`);
+    one that starts with `@` names a Linux abstract socket (thread mode only).
+    Unlike libpq, the default is `localhost` over TCP, not a socket directory.
+    +/
     string host = "localhost";
     /// Port, if `hosts` is empty; 0 means 5432.
     ushort port;
@@ -123,6 +129,11 @@ struct ConnectionOptions
     (the next host is tried).
     +/
     TargetSessionAttrs targetSessionAttrs = TargetSessionAttrs.any;
+    /++
+    The operating-system user the server must run as, checked on Unix-domain
+    sockets (libpq's `requirepeer`); empty: not checked. Ignored over TCP.
+    +/
+    string requirePeer;
     /// User name.
     string user;
     /++
@@ -155,13 +166,18 @@ struct ConnectionOptions
     TLS details: `caFile` (libpq's `sslrootcert`), `certFile`/`keyFile`
     (`sslcert`/`sslkey`, client certificate), `keyPassword` (`sslpassword`),
     `serverName`, `minVersion`/`maxVersion` (`ssl_min_protocol_version`,
-    `ssl_max_protocol_version`). Verification follows `sslMode`;
+    `ssl_max_protocol_version`), `crlFile`/`crlDir` (`sslcrl`/`sslcrldir`,
+    certificate revocation lists). Verification follows `sslMode`;
     `skipVerify` and `skipNameCheck` are set from it.
 
     As libpq, the files default to those in `~/.postgresql`
     (`%APPDATA%\postgresql` on Windows) when they exist: `root.crt` (then
     `sslmode=require` verifies the certificate, as `verifyCa`),
+    `root.crl` (when neither `crlFile` nor `crlDir` is set),
     `postgresql.crt` and `postgresql.key`.
+
+    TLS is never used over Unix-domain sockets, whatever `sslMode` says
+    (as libpq).
     +/
     TlsOptions tls;
     /// Whether to use SCRAM channel binding.
@@ -277,6 +293,15 @@ struct ConnectionOptions
                 break;
             case "passfile":
                 o.passFile = value;
+                break;
+            case "requirepeer":
+                o.requirePeer = value;
+                break;
+            case "sslcrl":
+                o.tls.crlFile = value;
+                break;
+            case "sslcrldir":
+                o.tls.crlDir = value;
                 break;
             case "ssl_min_protocol_version":
                 o.tls.minVersion = parseTlsVersion(key, value);
@@ -432,6 +457,14 @@ unittest
     assert(o.targetSessionAttrs == TargetSessionAttrs.readWrite && o.tls.minVersion == TlsVersion.tls13);
     assert(o.passFile == "/p");
     assertThrown!ClientException(ConnectionOptions.parse("host=h ssl_min_protocol_version=TLSv1.1"));
+    // revocation lists, Unix-domain sockets
+    o = ConnectionOptions.parse("host=/var/run/postgresql requirepeer=postgres sslcrl=/c.pem sslcrldir=/crls");
+    assert(o.host == "/var/run/postgresql" && o.requirePeer == "postgres");
+    assert(o.tls.crlFile == "/c.pem" && o.tls.crlDir == "/crls");
+    o = ConnectionOptions.parse("postgresql://%2Fvar%2Frun%2Fpostgresql:5433/db");
+    assert(o.host == "/var/run/postgresql" && o.port == 5433 && o.database == "db");
+    o = ConnectionOptions.parse("postgresql:///db?host=/tmp");
+    assert(o.host == "/tmp" && o.database == "db");
     assertThrown!ClientException(ConnectionOptions.parse("host=h target_session_attrs=master"));
 }
 
@@ -494,6 +527,41 @@ private void applyService(ref string[string] params)
     foreach (key, value; serviceParams(name, file))
         if (key !in params)
             params[key] = value;
+}
+
+/++
+Whether `host` names the directory of a Unix-domain socket (it starts with
+`/`) or a Linux abstract socket (it starts with `@`), not a host name.
++/
+bool isSocketDirectory(string host) pure nothrow
+{
+    return host.length && (host[0] == '/' || host[0] == '@');
+}
+
+/++
+The path of the server's socket in the socket directory `host` for `port`:
+`<host>/.s.PGSQL.<port>`, with a zero byte for the `@` of an abstract
+socket.
++/
+string socketPath(string host, ushort port) pure
+{
+    import std.conv : to;
+
+    auto dir = host;
+    while (dir.length > 1 && dir[$ - 1] == '/')
+        dir = dir[0 .. $ - 1];
+    if (dir.length && dir[0] == '@')
+        dir = "\0" ~ dir[1 .. $];
+    return (dir == "/" ? "" : dir) ~ "/.s.PGSQL." ~ ConnectionOptions.effectivePort(port).to!string;
+}
+
+///
+unittest
+{
+    assert(isSocketDirectory("/var/run/postgresql") && isSocketDirectory("@pg") && !isSocketDirectory("db"));
+    assert(socketPath("/var/run/postgresql", 0) == "/var/run/postgresql/.s.PGSQL.5432");
+    assert(socketPath("/tmp/", 5433) == "/tmp/.s.PGSQL.5433");
+    assert(socketPath("@pg", 5432) == "\0pg/.s.PGSQL.5432");
 }
 
 /// Whether `text` is a numeric IPv4 or IPv6 address (not a name).
@@ -603,6 +671,9 @@ shared static this()
         "PGSSLCERT": "sslcert",
         "PGSSLKEY": "sslkey",
         "PGSSLROOTCERT": "sslrootcert",
+        "PGSSLCRL": "sslcrl",
+        "PGSSLCRLDIR": "sslcrldir",
+        "PGREQUIREPEER": "requirepeer",
         "PGSSLSNI": "sslsni",
         "PGSSLMINPROTOCOLVERSION": "ssl_min_protocol_version",
         "PGSSLMAXPROTOCOLVERSION": "ssl_max_protocol_version",
@@ -767,7 +838,7 @@ string[string] parseUri(string uri)
         bool anyPort;
         foreach (h; dsn.hosts)
         {
-            hosts ~= h.host;
+            hosts ~= decodeHost(h.host);
             ports ~= h.port ? h.port.to!string : "";
             anyPort = anyPort || h.port != 0;
         }
@@ -783,6 +854,20 @@ string[string] parseUri(string uri)
     foreach (key, value; dsn.params)
         result[key] = value;
     return result;
+}
+
+// A URI host, percent-decoded: a socket directory is written `%2Fvar%2Frun%2Fpostgresql`.
+private string decodeHost(string host)
+{
+    import std.algorithm.searching : canFind;
+    import std.uri : decodeComponent, URIException;
+
+    if (!host.canFind('%'))
+        return host;
+    try
+        return decodeComponent(host);
+    catch (URIException)
+        throw new ClientException("Invalid percent-encoding in the host '" ~ host ~ "'");
 }
 
 /// Whether and which authentication methods are allowed (`ConnectionOptions.requireAuth`).

@@ -18,6 +18,25 @@ bool serverConfigured()
     return environment.get("POSTGRES_HOST", "").length > 0;
 }
 
+/++
+The directory where the test server's Unix-domain socket is visible
+(`POSTGRES_SOCKET_DIR`, e.g. the container's `/var/run/postgresql` mounted
+on the host), or null. The socket's port is the server's own,
+`POSTGRES_SOCKET_PORT` (default 5432), not the mapped TCP port.
++/
+string socketDirectory()
+{
+    return environment.get("POSTGRES_SOCKET_DIR", null);
+}
+
+/// The server's own port, which names its socket (see `socketDirectory`).
+ushort socketPort()
+{
+    import std.conv : to;
+
+    return environment.get("POSTGRES_SOCKET_PORT", "5432").to!ushort;
+}
+
 /// Host name of the test server.
 string serverHost()
 {

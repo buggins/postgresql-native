@@ -20,11 +20,11 @@
         "./examples/vibe"
     ],
     "dependencies": {
-        "dbwire:types": "~>0.7.0",
-        "dbwire:io": "~>0.7.0",
-        "dbwire:tls": "~>0.7.0",
-        "dbwire:client": "~>0.7.0",
-        "dbwire:crypto": "~>0.7.0",
+        "dbwire:types": "~>0.8.0",
+        "dbwire:io": "~>0.8.0",
+        "dbwire:tls": "~>0.8.0",
+        "dbwire:client": "~>0.8.0",
+        "dbwire:crypto": "~>0.8.0",
         "vibe-core": {
             "version": ">=1.22.0 <3.0.0",
             "optional": true

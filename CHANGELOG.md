@@ -17,6 +17,26 @@ project uses [semantic versioning](https://semver.org/).
   user's file, then the system's (`PGSYSCONFDIR`). The service's keywords
   come after the connection string's and before the environment's, as in
   libpq.
+- Unix-domain sockets (#19): a host that starts with `/` is the server's
+  socket directory (`host=/var/run/postgresql` connects to
+  `/var/run/postgresql/.s.PGSQL.5432`; in URIs percent-encoded,
+  `postgresql://%2Fvar%2Frun%2Fpostgresql/db`), one that starts with `@` a
+  Linux abstract socket (thread mode only). In thread and fiber mode, with
+  failover between sockets and TCP hosts; cancel requests use the socket
+  too. As in libpq, TLS is never used over a socket, whatever `sslmode`
+  says. The default host stays `localhost` over TCP. A socket directory also
+  matches `localhost` lines of the password file.
+- `requirepeer` (and `PGREQUIREPEER`, `ConnectionOptions.requirePeer`, #19):
+  the operating-system user the server must run as, checked on Unix-domain
+  sockets.
+- Certificate revocation lists (#19): `sslcrl` and `sslcrldir` (and
+  `PGSSLCRL`, `PGSSLCRLDIR`, `ConnectionOptions.tls.crlFile`/`crlDir`);
+  `~/.postgresql/root.crl` by default when it exists. The server's whole
+  certificate chain is checked, as in libpq.
+
+### Changed
+
+- Requires dbwire 0.8 (CRLs, Unix-domain sockets).
 
 ## 0.4.0 (2026-11-06)
 

@@ -7,7 +7,7 @@ import std.exception : collectException, enforce;
 
 import postgresql;
 import integrationtests.harness : TestCase;
-import integrationtests.server : connectToServer, scalar, serverOptions, serverSetUp;
+import integrationtests.server : connectToServer, scalar, serverOptions, serverSetUp, socketDirectory, socketPort;
 
 /// Tests registered by the thread runner.
 immutable TestCase[] threadTests = [
@@ -50,14 +50,20 @@ void testThreads()
 
 /++
 `Connection.cancel` from another thread stops a running statement (SQLSTATE
-57014), over plain and TLS connections; the connection stays usable; cancels
+57014), over plain, TLS and Unix-domain socket connections; the connection stays usable; cancels
 racing with short statements leave it in step.
 +/
 void testCancelFromThread()
 {
-    void check(SslMode mode)
+    void check(SslMode mode, bool unixSocket = false)
     {
-        auto conn = connectToServer(mode);
+        auto o = serverOptions(mode);
+        if (unixSocket)
+        {
+            o.host = socketDirectory();
+            o.port = socketPort();
+        }
+        auto conn = new Connection(o);
         scope (exit)
             conn.close();
         auto canceller = new Thread({ Thread.sleep(300.msecs); conn.cancel(); });
@@ -91,6 +97,9 @@ void testCancelFromThread()
     check(SslMode.disable);
     if (serverSetUp())
         check(SslMode.require);
+    version (Posix)
+        if (socketDirectory().length)
+            check(SslMode.disable, true); // the cancel request goes over the socket too
 }
 
 /// Eight threads share a pool of three connections; each statement waits for a free one.

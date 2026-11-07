@@ -149,7 +149,10 @@ final class Connection : Poolable
         return state == State.busy;
     }
 
-    /// The host connected to (its name; see `address` for `hostaddr`).
+    /++
+    The host connected to: its name (see `address` for `hostaddr`), or the
+    socket directory of a Unix-domain socket.
+    +/
     @property HostPort host() const pure nothrow
     {
         return connectedHost;
@@ -1453,10 +1456,7 @@ final class Connection : Poolable
         if (state != State.busy || cancelKey.length == 0)
             return;
         auto io = backendFor(IoMode.auto_); // the caller's context: another thread or task
-        auto endpoint = connectedAddress;
-        auto raw = options.transportFactory !is null
-            ? options.transportFactory(endpoint.host, endpoint.port, options.connectTimeout) : io.connect(
-                    endpoint.host, endpoint.port, options.connectTimeout);
+        auto raw = openTransport(io, connectedAddress);
         Transport t = raw;
         scope (exit)
             t.close();
@@ -2201,6 +2201,12 @@ final class Connection : Poolable
 
     private void connectTo(HostPort endpoint)
     {
+        // as libpq: never TLS over Unix-domain sockets, whatever sslmode says
+        if (isSocketDirectory(endpoint.host))
+        {
+            attempt(endpoint, Encryption.none);
+            return;
+        }
         const mode = options.sslMode;
         if (options.sslNegotiation == SslNegotiation.direct)
         {
@@ -2262,6 +2268,8 @@ final class Connection : Poolable
         // libpq's defaults: the files in ~/.postgresql, when they exist
         if (t.caFile.length == 0)
             t.caFile = userFile("root.crt");
+        if (t.crlFile.length == 0 && t.crlDir.length == 0)
+            t.crlFile = userFile("root.crl");
         if (t.certFile.length == 0)
         {
             import std.path : buildPath;
@@ -2297,11 +2305,45 @@ final class Connection : Poolable
         return t;
     }
 
+    // A new raw transport to `endpoint`: the transport factory's, else a Unix-domain
+    // socket for a socket directory, else TCP.
+    private Transport openTransport(IoBackend io, HostPort endpoint)
+    {
+        import dbwire.io.unixsocket : connectUnixSocket;
+
+        if (options.transportFactory !is null)
+            return options.transportFactory(endpoint.host, endpoint.port, options.connectTimeout);
+        if (isSocketDirectory(endpoint.host))
+            return connectUnixSocket(io, socketPath(endpoint.host, endpoint.port), options.connectTimeout);
+        return io.connect(endpoint.host, endpoint.port, options.connectTimeout);
+    }
+
+    // requirepeer: the user running the server at the other end of a Unix-domain socket.
+    private void checkPeer(Transport raw, HostPort endpoint)
+    {
+        import dbwire.io.unixsocket : peerUserId, userName;
+
+        if (options.requirePeer.length == 0 || !isSocketDirectory(endpoint.host)
+                || options.transportFactory !is null)
+            return;
+        const uid = peerUserId(raw);
+        string name;
+        try
+            name = userName(uid);
+        catch (ClientException)
+        {
+            import std.conv : to;
+
+            name = "uid " ~ uid.to!string;
+        }
+        if (name != options.requirePeer)
+            throw new ClientException("requirepeer specifies \"" ~ options.requirePeer
+                    ~ "\", but the server at " ~ endpoint.host ~ " runs as \"" ~ name ~ "\"");
+    }
+
     private void attempt(HostPort endpoint, Encryption encryption)
     {
-        auto raw = options.transportFactory !is null
-            ? options.transportFactory(endpoint.host, endpoint.port, options.connectTimeout) : backend.connect(
-                    endpoint.host, endpoint.port, options.connectTimeout);
+        auto raw = openTransport(backend, endpoint);
         transport = raw;
         tls = null;
         attemptHost = nameOf(endpoint);
@@ -2309,6 +2351,7 @@ final class Connection : Poolable
         scope (failure)
             close();
         raw.setTimeouts(options.connectTimeout, options.connectTimeout);
+        checkPeer(raw, endpoint);
 
         if (encryption == Encryption.sslRequest)
         {
@@ -2478,9 +2521,12 @@ final class Connection : Poolable
         {
             import postgresql.userfiles : passwordFromFile;
 
+            const database = options.database.length ? options.database : user;
             if (password.length == 0)
-                password = passwordFromFile(options.passFile, attemptHost.host, attemptHost.port,
-                        options.database.length ? options.database : user, user);
+                password = passwordFromFile(options.passFile, attemptHost.host, attemptHost.port, database, user);
+            // a socket directory also matches "localhost" lines (libpq: only its default directory)
+            if (password.length == 0 && isSocketDirectory(attemptHost.host))
+                password = passwordFromFile(options.passFile, "localhost", attemptHost.port, database, user);
             if (password.length == 0)
                 throw new ClientException("The server asks for a password, but none was given");
         }

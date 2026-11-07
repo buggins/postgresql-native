@@ -1,6 +1,7 @@
 /++
 Connecting: startup, session information, authentication methods, TLS
-modes, client certificates, protocol versions, failover.
+modes, client certificates, revocation lists, protocol versions, failover,
+Unix-domain sockets.
 
 The tests of authentication methods and TLS need the server prepared by
 `integration-tests/setup-server.sh` (`POSTGRES_SETUP=1`); they pass without
@@ -198,6 +199,50 @@ void testTls()
     o.tls.caFile = null;
     open(o).close(); // require without a CA file: not verified
 
+    // certificate revocation lists: sslcrl (a file) and sslcrldir (hashed names)
+    {
+        import std.algorithm.searching : canFind;
+
+        auto r = serverOptions(SslMode.verifyFull);
+        r.host = "localhost";
+        r.tls.caFile = tlsFile("ca.pem");
+        r.tls.crlFile = tlsFile("crl-none.pem");
+        open(r).close();
+        r.tls.crlFile = tlsFile("crl-revoked.pem");
+        auto revoked = collectException!ConnectionException(open(r));
+        enforce(revoked !is null && revoked.msg.canFind("revoked"),
+                revoked is null ? "a revoked certificate accepted" : revoked.msg);
+        r.tls.crlFile = null;
+        r.tls.crlDir = tlsFile("crls");
+        open(r).close();
+        // the keywords of a connection string
+        string keywords(string crlKeyword, string file)
+        {
+            import std.array : replace;
+            import std.conv : to;
+
+            string q(string v)
+            {
+                return "'" ~ v.replace(`\`, `\\`).replace("'", `\'`) ~ "'";
+            }
+
+            return "host=localhost port=" ~ serverPort()
+                .to!string ~ " dbname=" ~ q(databaseName()) ~ " user="
+                ~ q(userName()) ~ " password=" ~ q(
+                        password()) ~ " sslmode=verify-full sslrootcert="
+                ~ q(
+                        tlsFile("ca.pem")) ~ " " ~ crlKeyword ~ "=" ~ q(file);
+        }
+
+        open(ConnectionOptions.parse(keywords("sslcrldir", tlsFile("crls")))).close();
+        assertThrown!ConnectionException(open(ConnectionOptions.parse(keywords("sslcrl",
+                tlsFile("crl-revoked.pem")))));
+        // sslmode=require without a CA file verifies nothing: the CRL doesn't matter
+        auto q = serverOptions(SslMode.require);
+        q.tls.crlFile = tlsFile("crl-revoked.pem");
+        open(q).close();
+    }
+
     // a TLS-only user (hostssl): refused without TLS, allow retries with TLS
     auto e = collectException!ServerException(open(userOptions("tlsuser", SslMode.disable)));
     enforce(e !is null && e.sqlState == "28000", e is null ? "tlsuser without TLS accepted" : e.msg);
@@ -235,6 +280,73 @@ void testTls()
         assertThrown!ConnectionException(open(d));
     d.sslMode = SslMode.prefer;
     assertThrown!ClientException(open(d)); // direct needs require or stricter
+}
+
+/++
+Unix-domain sockets (`host=<socket directory>`, needs `POSTGRES_SOCKET_DIR`):
+no TLS whatever sslmode says, requirepeer, failover from a missing
+directory to TCP. Thread mode and fiber mode (vibe-core).
++/
+void testUnixSockets()
+{
+    import std.algorithm.searching : canFind;
+    import std.conv : to;
+
+    const dir = socketDirectory();
+    if (dir.length == 0)
+        return;
+    version (Posix)
+    {
+        auto o = serverOptions(SslMode.require); // ignored on Unix-domain sockets, as libpq
+        o.host = dir;
+        o.port = socketPort();
+        auto conn = new Connection(o);
+        enforce(!conn.isEncrypted, "no TLS over a Unix-domain socket");
+        enforce(scalar(conn, "SELECT inet_server_addr() IS NULL") == "t", "connected over a Unix-domain socket");
+        enforce(conn.host.host == dir, "Connection.host is the socket directory");
+        conn.close();
+
+        // the same from connection strings: key=value and a URI with the directory percent-encoded
+        import std.uri : encodeComponent;
+
+        auto viaUri = ConnectionOptions.parse("postgresql://" ~ encodeComponent(
+                userName()) ~ ":"
+                ~ encodeComponent(password()) ~ "@" ~ encodeComponent(dir) ~ ":" ~ socketPort()
+                    .to!string
+                    ~ "/" ~ databaseName());
+        conn = new Connection(viaUri);
+        enforce(scalar(conn, "SELECT inet_server_addr() IS NULL") == "t", "URI with a socket directory");
+        conn.close();
+
+        // requirepeer: the user that owns the socket runs the server
+        import core.sys.posix.sys.stat : stat_t, stat;
+        import std.string : toStringz;
+        import dbwire.io.unixsocket : dbwireUserName = userName;
+
+        stat_t st;
+        const socket = socketPath(dir, socketPort());
+        enforce((() @trusted => stat(socket.toStringz, &st))() == 0, "stat " ~ socket);
+        string owner;
+        try
+            owner = dbwireUserName(st.st_uid);
+        catch (ClientException)
+            owner = "uid " ~ st.st_uid.to!string; // a container user unknown on the host
+        o.requirePeer = owner;
+        new Connection(o).close();
+        o.requirePeer = "no-such-user-pgnative";
+        auto e = collectException!ClientException(new Connection(o));
+        enforce(e !is null && e.msg.canFind("requirepeer"), e is null ? "requirepeer not checked" : e.msg);
+        o.requirePeer = null;
+
+        // failover: a directory without a server, then TCP
+        auto f = serverOptions(SslMode.disable);
+        f.hosts = [
+            HostPort("/nonexistent-pgnative", socketPort()), HostPort(serverHost(), serverPort())
+        ];
+        conn = new Connection(f);
+        enforce(conn.host.host == serverHost(), "failover from the socket to TCP");
+        conn.close();
+    }
 }
 
 /// max_protocol_version=3.2: used by PostgreSQL 18, negotiated down to 3.0 by older servers.
