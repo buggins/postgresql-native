@@ -4,6 +4,8 @@ Connection options and connection strings.
 Connection strings use libpq's syntax and keywords: URIs
 (`postgresql://user:password@host:port/dbname?sslmode=require`, also
 `postgres://`) and `key=value` strings (`host=db1 dbname=app sslmode=require`).
+`service=name` takes keywords from a connection service file
+(`pg_service.conf`, see `postgresql.userfiles.serviceParams`).
 
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
@@ -107,6 +109,13 @@ struct ConnectionOptions
     ushort port;
     /// Hosts to try in turn (failover); a port of 0 means 5432.
     HostPort[] hosts;
+    /++
+    Numeric IP addresses to connect to instead of looking the host names up
+    (libpq's `hostaddr`): one, or a comma-separated list with one address per
+    host (`hosts`). The names still serve TLS name checks, the password file
+    and messages; without names, the addresses are used for those.
+    +/
+    string hostAddress;
     /// The order in which `hosts` are tried (libpq's `load_balance_hosts`: `disable` or `random`).
     HostSelection hostSelection = HostSelection.inOrder;
     /++
@@ -228,19 +237,33 @@ struct ConnectionOptions
 
     Throws: `ClientException` for an unknown keyword or an invalid value.
     +/
-    static ConnectionOptions fromParams(const string[string] params)
+    static ConnectionOptions fromParams(const string[string] given)
     {
         import dbwire.client.dsn : parseFlag, parseSeconds;
         import std.array : split;
         import std.conv : ConvException, to;
         import std.string : strip, toLower;
 
+        string[string] params;
+        foreach (key, value; given)
+            params[key] = value;
+        applyService(params);
         ConnectionOptions o;
-        string[] hostList, portList;
+        string[] hostList, portList, addressList;
         foreach (key, value; params)
         {
             switch (key)
             {
+            case "hostaddr":
+                addressList = value.split(",");
+                foreach (ref a; addressList)
+                {
+                    a = a.strip;
+                    if (!isNumericAddress(a))
+                        throw new ClientException("hostaddr '" ~ a ~ "' is not a numeric IP address");
+                }
+                o.hostAddress = value;
+                break;
             case "host":
                 hostList = value.split(",");
                 break;
@@ -341,6 +364,14 @@ struct ConnectionOptions
                 throw new ClientException("Unknown connection keyword '" ~ key ~ "'");
             }
         }
+        if (addressList.length)
+        {
+            // hostaddr alone: the addresses are the names too
+            if (hostList.length == 0)
+                hostList = addressList;
+            else if (hostList.length != addressList.length)
+                throw new ClientException("'hostaddr' must list one address per host");
+        }
         if (hostList.length > 1 || portList.length > 1)
         {
             if (portList.length > 1 && portList.length != hostList.length)
@@ -421,26 +452,135 @@ ConnectionOptions fromEnvironment(string connectionString = null)
     import std.process : environment;
     import std.string : strip;
 
+    // as libpq: the string's keywords, then a service's (PGSERVICE), then the environment's
     string[string] params;
+    const s = connectionString.strip;
+    if (s.length)
+        params = s.startsWith("postgresql://") || s.startsWith("postgres://") ? parseUri(s) : parseKeywordValue(s);
+    if ("service" !in params)
+        if (const service = environment.get("PGSERVICE"))
+            params["service"] = service;
+    applyService(params);
     foreach (variable, keyword; environmentKeywords)
     {
         const value = environment.get(variable);
-        if (value !is null)
+        if (value !is null && keyword !in params)
             params[keyword] = value;
-    }
-    const s = connectionString.strip;
-    if (s.length)
-    {
-        const given = s.startsWith("postgresql://") || s.startsWith("postgres://")
-            ? parseUri(s) : parseKeywordValue(s);
-        foreach (key, value; given)
-            params[key] = value;
     }
     auto o = ConnectionOptions.fromParams(params);
     const tz = environment.get("PGTZ");
     if (tz.length)
         o.runtimeParameters["TimeZone"] = tz;
     return o;
+}
+
+/++
+Replaces the `service` keyword (and `servicefile`) by the keywords of that
+connection service, for those `params` doesn't have (see
+`postgresql.userfiles.serviceParams`).
+
+Throws: `ClientException` if the service is not defined.
++/
+private void applyService(ref string[string] params)
+{
+    import postgresql.userfiles : serviceParams;
+
+    const name = params.get("service", null);
+    const file = params.get("servicefile", null);
+    params.remove("service");
+    params.remove("servicefile");
+    if (name.length == 0)
+        return;
+    foreach (key, value; serviceParams(name, file))
+        if (key !in params)
+            params[key] = value;
+}
+
+/// Whether `text` is a numeric IPv4 or IPv6 address (not a name).
+private bool isNumericAddress(string text) pure nothrow
+{
+    import std.ascii : isDigit, isHexDigit;
+
+    if (text.length == 0)
+        return false;
+    bool colon, dot;
+    foreach (c; text)
+    {
+        if (c == ':')
+            colon = true;
+        else if (c == '.')
+            dot = true;
+        else if (!(colon ? isHexDigit(c) : isDigit(c) || isHexDigit(c)))
+            return false;
+    }
+    if (colon)
+        return true; // IPv6, possibly with a dotted tail
+    if (!dot)
+        return false;
+    foreach (c; text)
+        if (c != '.' && !isDigit(c))
+            return false;
+    return true;
+}
+
+unittest
+{
+    assert(isNumericAddress("127.0.0.1") && isNumericAddress("::1") && isNumericAddress("2001:db8::ffff:1.2.3.4"));
+    assert(!isNumericAddress("localhost") && !isNumericAddress("db1.example") && !isNumericAddress(""));
+}
+
+// hostaddr: one address per host; alone, the addresses are the names
+unittest
+{
+    import std.exception : assertThrown;
+
+    auto o = ConnectionOptions.parse("host=db.example hostaddr=10.0.0.5");
+    assert(o.host == "db.example" && o.hostAddress == "10.0.0.5");
+    o = ConnectionOptions.parse("hostaddr=127.0.0.1");
+    assert(o.host == "127.0.0.1" && o.hostAddress == "127.0.0.1");
+    o = ConnectionOptions.parse("host=a,b hostaddr=10.0.0.1,::1 port=5432,5433");
+    assert(o.hosts == [HostPort("a", 5432), HostPort("b", 5433)] && o.hostAddress == "10.0.0.1,::1");
+    assertThrown!ClientException(ConnectionOptions.parse("host=a,b hostaddr=10.0.0.1"));
+    assertThrown!ClientException(ConnectionOptions.parse("hostaddr=db.example"));
+}
+
+// Services: the string's keywords win over the service's, which win over the environment's
+@system unittest
+{
+    import std.conv : to;
+    import std.exception : assertThrown;
+    import std.file : remove, tempDir, write;
+    import std.path : buildPath;
+    import std.process : environment, thisProcessID;
+
+    const file = buildPath(tempDir, "pgn-settings-service-" ~ thisProcessID.to!string);
+    write(file, "[sales]\nhost=svc.example\ndbname=sales\napplication_name=from-service\nsslmode=require\n");
+    scope (exit)
+        remove(file);
+    import std.array : replace;
+
+    const quoted = file.replace(`\`, `\\`); // a backslash escapes in key=value strings (Windows paths)
+    auto o = ConnectionOptions.parse("service=sales servicefile=" ~ quoted ~ " application_name=from-string");
+    assert(o.host == "svc.example" && o.database == "sales" && o.applicationName == "from-string");
+    assert(o.sslMode == SslMode.require);
+    assertThrown!ClientException(ConnectionOptions.parse("service=nope servicefile=" ~ quoted));
+
+    const saved = environment.toAA();
+    scope (exit)
+        foreach (v; ["PGSERVICE", "PGSERVICEFILE", "PGAPPNAME", "PGDATABASE", "PGHOST"])
+        {
+            if (auto value = v in saved)
+                environment[v] = *value;
+            else
+                environment.remove(v);
+        }
+    environment["PGSERVICE"] = "sales";
+    environment["PGSERVICEFILE"] = file;
+    environment["PGAPPNAME"] = "from-env";
+    environment["PGDATABASE"] = "envdb";
+    environment.remove("PGHOST");
+    o = fromEnvironment("dbname=stringdb");
+    assert(o.database == "stringdb" && o.applicationName == "from-service" && o.host == "svc.example");
 }
 
 /// The `PG*` environment variables `fromEnvironment` reads, and their keywords.
@@ -450,6 +590,7 @@ shared static this()
 {
     environmentKeywords = [
         "PGHOST": "host",
+        "PGHOSTADDR": "hostaddr",
         "PGPORT": "port",
         "PGDATABASE": "dbname",
         "PGUSER": "user",

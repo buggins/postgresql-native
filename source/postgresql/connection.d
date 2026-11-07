@@ -79,7 +79,9 @@ final class Connection : Poolable
     private Transport transport;
     private TlsTransport tls;
     package MessageStream stream;
-    private HostPort connectedHost;
+    private HostPort connectedHost; // the host name (and port) connected to
+    private HostPort connectedAddress; // the address connected to: hostaddr's, else the name
+    private string[HostPort] hostNames; // hostaddr endpoint -> host name
     private HostPort attemptHost; // the host being connected to
     private string[string] parameters;
     private int backendPid;
@@ -147,10 +149,16 @@ final class Connection : Poolable
         return state == State.busy;
     }
 
-    /// The host connected to.
+    /// The host connected to (its name; see `address` for `hostaddr`).
     @property HostPort host() const pure nothrow
     {
         return connectedHost;
+    }
+
+    /// The address connected to: the `hostaddr` address, or the same as `host` without one.
+    @property HostPort address() const pure nothrow
+    {
+        return connectedAddress;
     }
 
     /// Whether the connection is encrypted with TLS.
@@ -1445,7 +1453,7 @@ final class Connection : Poolable
         if (state != State.busy || cancelKey.length == 0)
             return;
         auto io = backendFor(IoMode.auto_); // the caller's context: another thread or task
-        auto endpoint = connectedHost;
+        auto endpoint = connectedAddress;
         auto raw = options.transportFactory !is null
             ? options.transportFactory(endpoint.host, endpoint.port, options.connectTimeout) : io.connect(
                     endpoint.host, endpoint.port, options.connectTimeout);
@@ -1465,7 +1473,7 @@ final class Connection : Poolable
                     throw new ConnectionException("The server refused TLS for the cancel request");
             }
             auto opts = tlsOptions(direct);
-            t = new TlsTransport(raw, io, TlsContext.client(opts), endpoint.host, opts, options.connectTimeout);
+            t = new TlsTransport(raw, io, TlsContext.client(opts), connectedHost.host, opts, options.connectTimeout);
         }
         MessageBuilder b;
         b.begin(0);
@@ -2075,6 +2083,22 @@ final class Connection : Poolable
         ];
         foreach (ref h; hosts)
             h.port = ConnectionOptions.effectivePort(h.port);
+        // hostaddr: connect to the addresses, keep the names (TLS, password file, messages)
+        if (options.hostAddress.length)
+        {
+            import std.array : split;
+            import std.string : strip;
+
+            auto addresses = options.hostAddress.split(",");
+            if (addresses.length != hosts.length)
+                throw new ClientException("'hostaddr' must list one address per host");
+            foreach (i, ref h; hosts)
+            {
+                const address = HostPort(addresses[i].strip, h.port);
+                hostNames[address] = h.host;
+                h = address;
+            }
+        }
         auto ordered = orderHosts(hosts, options.hostSelection);
         auto target = options.targetSessionAttrs;
         void tryHost(HostPort endpoint) @safe
@@ -2089,13 +2113,23 @@ final class Connection : Poolable
             target = TargetSessionAttrs.standby;
             try
             {
-                connectedHost = connectFirst(ordered, &tryHost, "PostgreSQL");
+                connectedAddress = connectFirst(ordered, &tryHost, "PostgreSQL");
+                connectedHost = nameOf(connectedAddress);
                 return;
             }
             catch (ConnectionException)
                 target = TargetSessionAttrs.any;
         }
-        connectedHost = connectFirst(ordered, &tryHost, "PostgreSQL");
+        connectedAddress = connectFirst(ordered, &tryHost, "PostgreSQL");
+        connectedHost = nameOf(connectedAddress);
+    }
+
+    // The host name of an endpoint: its name when `hostaddr` gave its address, else itself.
+    private HostPort nameOf(HostPort endpoint) const pure nothrow
+    {
+        if (auto name = endpoint in hostNames)
+            return HostPort(*name, endpoint.port);
+        return endpoint;
     }
 
     // Closes the connection with a ConnectionException (so the next host is tried) if
@@ -2270,7 +2304,7 @@ final class Connection : Poolable
                     endpoint.host, endpoint.port, options.connectTimeout);
         transport = raw;
         tls = null;
-        attemptHost = endpoint;
+        attemptHost = nameOf(endpoint);
         state = State.busy;
         scope (failure)
             close();
@@ -2313,9 +2347,9 @@ final class Connection : Poolable
         auto t = tlsOptions(direct);
         auto context = TlsContext.client(t);
         try
-            tls = new TlsTransport(raw, backend, context, endpoint.host, t, options.connectTimeout);
+            tls = new TlsTransport(raw, backend, context, nameOf(endpoint).host, t, options.connectTimeout);
         catch (ConnectionException e)
-            throw new TlsHandshakeFailed("TLS handshake with " ~ endpoint.toString() ~ " failed: " ~ e.msg);
+            throw new TlsHandshakeFailed("TLS handshake with " ~ nameOf(endpoint).toString() ~ " failed: " ~ e.msg);
         transport = tls;
         if (direct && tls.alpnProtocol != "postgresql")
             throw new ConnectionException("The server did not select the ALPN protocol 'postgresql' for direct TLS");
