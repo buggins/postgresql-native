@@ -39,7 +39,7 @@ public import dbwire.types.decimal : Decimal;
 /// Library version.
 enum uint postgresqlVersionMajor = 0;
 /// ditto
-enum uint postgresqlVersionMinor = 4;
+enum uint postgresqlVersionMinor = 5;
 /// ditto
 enum uint postgresqlVersionPatch = 0;
 
