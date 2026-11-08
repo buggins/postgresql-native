@@ -6,6 +6,16 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Changed
+
+- dbwire 0.9 (`~>0.9.0`): from its code review, robustness fixes (huge TZif
+  counts, a socket that can't be created moves on to the next address),
+  faster charset conversions, fewer allocations, and dip1000 builds.
+- `connect_timeout=0` waits without a time limit, as in libpq. It used to
+  mean the default of 15 seconds, because dbwire 0.8 failed at once on a
+  zero timeout. `ConnectionOptions.connectTimeout = Duration.zero` means the
+  same.
+
 ## 0.5.0 (2026-11-07)
 
 ### Added

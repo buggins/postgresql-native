@@ -15,15 +15,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, dc: dmd-latest }
-          - { os: ubuntu-latest, dc: ldc-latest }
+          - { os: ubuntu-22.04, dc: dmd-latest }
+          - { os: ubuntu-22.04, dc: ldc-latest }
           # Minimum supported D frontend: 2.097 (the same as ddbc)
-          - { os: ubuntu-latest, dc: dmd-2.097.2 }
-          - { os: ubuntu-latest, dc: ldc-1.27.1 }
+          - { os: ubuntu-22.04, dc: dmd-2.097.2 }
+          - { os: ubuntu-22.04, dc: ldc-1.27.1 }
+          # Releases in between (LDC 1.30, 1.35 and 1.40 have frontends 2.100, 2.105 and 2.110)
+          - { os: ubuntu-22.04, dc: dmd-2.100.2 }
+          - { os: ubuntu-22.04, dc: dmd-2.105.3 }
+          - { os: ubuntu-22.04, dc: dmd-2.109.1 }
+          - { os: ubuntu-22.04, dc: ldc-1.30.0 }
+          - { os: ubuntu-22.04, dc: ldc-1.35.0 }
+          - { os: ubuntu-22.04, dc: ldc-1.40.1 }
           - { os: windows-latest, dc: dmd-latest }
           - { os: windows-latest, dc: ldc-latest }
-          # DMD does not target arm64 macOS runners
+          # DMD does not target arm64 macOS runners. LDC before 1.41 builds programs that
+          # crash on current macOS (even hello world), so 1.41.0 is the oldest LDC tested there.
           - { os: macos-latest, dc: ldc-latest }
+          - { os: macos-latest, dc: ldc-1.41.0 }
     defaults:
       run:
         shell: bash
@@ -49,7 +58,7 @@ jobs:
 
   integration:
     name: server (PostgreSQL ${{ matrix.version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -105,7 +114,7 @@ jobs:
         run: dub run :example-basic && dub run :example-vibe
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
       - uses: dlang-community/setup-dlang@v2.0.0

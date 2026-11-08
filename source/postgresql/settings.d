@@ -206,7 +206,7 @@ struct ConnectionOptions
     +/
     bool rewritePlaceholders = true;
 
-    /// Time allowed to connect, start TLS and log in.
+    /// Time allowed to connect, start TLS and log in; zero waits forever (`connect_timeout=0`, as in libpq).
     Duration connectTimeout = 15.seconds;
     /// Time allowed for each write.
     Duration sendTimeout = 300.seconds;
@@ -365,9 +365,7 @@ struct ConnectionOptions
                 ]);
                 break;
             case "connect_timeout":
-                o.connectTimeout = parseSeconds(key, value);
-                if (o.connectTimeout == Duration.zero)
-                    o.connectTimeout = 15.seconds;
+                o.connectTimeout = parseSeconds(key, value); // 0: no limit
                 break;
             case "client_encoding":
                 if (value.toLower != "utf8" && value.toLower != "utf-8")
@@ -445,6 +443,7 @@ unittest
             && o.channelBinding == ChannelBinding.require);
     o = ConnectionOptions.parse("postgresql://[::1]:5432/x?max_protocol_version=latest&connect_timeout=3");
     assert(o.host == "::1" && o.maxProtocolVersion == ProtocolVersion.v32 && o.connectTimeout == 3.seconds);
+    assert(ConnectionOptions.parse("postgresql://h?connect_timeout=0").connectTimeout == Duration.zero);
     o = ConnectionOptions.parse("postgresql://h?sslnegotiation=direct&sslmode=require&require_auth=!password,!md5");
     assert(o.sslNegotiation == SslNegotiation.direct && o.requireAuth == "!password,!md5");
     assertThrown!ClientException(ConnectionOptions.parse("postgresql://h?sslmode=sometimes"));
