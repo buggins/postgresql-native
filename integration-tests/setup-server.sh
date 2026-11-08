@@ -31,6 +31,16 @@ ALTER SYSTEM SET ssl_cert_file = '/etc/pgtls/server.crt';
 ALTER SYSTEM SET ssl_key_file = '/etc/pgtls/server.key';
 ALTER SYSTEM SET ssl_ca_file = '/etc/pgtls/ca.pem';
 SET password_encryption = 'scram-sha-256';
+-- On a rerun the roles still hold their privileges on testdb, which DROP ROLE refuses.
+DO $$
+DECLARE r text;
+BEGIN
+    FOREACH r IN ARRAY ARRAY['scramuser', 'md5user', 'clearuser', 'trustuser', 'tlsuser', 'certuser', 'saslpuser'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('DROP OWNED BY %I', r);
+        END IF;
+    END LOOP;
+END $$;
 DROP ROLE IF EXISTS scramuser, md5user, clearuser, trustuser, tlsuser, certuser, saslpuser;
 CREATE ROLE scramuser LOGIN PASSWORD 'scramuser_pw';
 CREATE ROLE clearuser LOGIN PASSWORD 'clearuser_pw';
