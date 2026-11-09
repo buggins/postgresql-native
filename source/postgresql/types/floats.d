@@ -51,7 +51,7 @@ unittest
 }
 
 // Whether the decimal `text` ([-]d.ddde±X) is exactly halfway between `value` and a neighbour.
-private bool isTie(T)(string text, T value) @trusted
+private bool isTie(T)(string text, T value)
 {
     import std.conv : to;
     import std.math : abs, nextDown, nextUp;
@@ -92,7 +92,7 @@ private bool isTie(T)(string text, T value) @trusted
 }
 
 // Compares decimal × 10^exponent10 with binary × 2^exponent2 exactly: -1, 0 or 1.
-private int compareExact(const BigInt decimal, long exponent10, const BigInt binary, long exponent2) @trusted
+private int compareExact(const BigInt decimal, long exponent10, const BigInt binary, long exponent2)
 {
     BigInt left = decimal, right = binary;
     if (exponent10 >= 0)
@@ -113,7 +113,7 @@ private struct Exact
 }
 
 // A finite non-negative value as mantissa × 2^exponent (mantissa an integer below 2^mant_dig).
-private Exact exact(T)(T value) @trusted
+private Exact exact(T)(T value)
 {
     import std.math : ilogb, ldexp;
 
@@ -128,43 +128,104 @@ correctly rounded.
 
 Throws: `ClientException` if `text` is not a number.
 +/
-package double parseFloat8(string text) @trusted
+package(postgresql) double parseFloat8(string text)
 {
-    import core.stdc.stdlib : strtod;
     import postgresql.exception : ClientException;
 
-    // strtod reads the NUL-terminated copy and keeps no pointer to it
-    const z = cText(text);
-    immutable(char)* end;
-    const value = strtod(z.ptr, &end);
-    if (text.length == 0 || end != z.ptr + z.length) // also when there is a NUL in the text
-        throw new ClientException("Invalid number '" ~ text ~ "'");
-    return value;
+    if (isFloatText(text))
+    {
+        const r = parseC!double(text);
+        if (r.complete)
+            return r.value;
+    }
+    throw new ClientException("Invalid number '" ~ text ~ "'");
 }
 
-// `text` for strtod, which reads the decimal point of the C library's locale (LC_NUMERIC: "." unless the
-// application called setlocale, as GUI toolkits do); a NUL follows the returned slice.
-private string cText(string text) @trusted
+// Whether `text` looks like float text as the server reads it: digits with a sign, point and exponent, or NaN,
+// Infinity or inf in any case. strtod also takes leading spaces, hexadecimal numbers and `nan(...)`.
+private bool isFloatText(scope const(char)[] text) pure nothrow @nogc
+{
+    import std.ascii : isDigit;
+    import postgresql.types.textformat : equalsIgnoringCase;
+
+    const s = text.length && (text[0] == '-' || text[0] == '+') ? text[1 .. $] : text;
+    if (equalsIgnoringCase(s, "infinity") || equalsIgnoringCase(s, "inf") || equalsIgnoringCase(text, "nan"))
+        return true;
+    bool digits;
+    foreach (c; s)
+    {
+        if (isDigit(c))
+            digits = true;
+        else if (c != '.' && c != 'e' && c != 'E' && c != '-' && c != '+')
+            return false;
+    }
+    return digits;
+}
+
+// What parseC read: the value, and whether it read the whole text.
+private struct Parsed(T)
+{
+    T value;
+    bool complete;
+}
+
+// Reads a number as C's strtod/strtof do: correctly rounded, subnormals included, out of range = infinity.
+// strtod reads the decimal point of the C library's locale (LC_NUMERIC: "." unless the application called
+// setlocale, as GUI toolkits do).
+private Parsed!T parseC(T)(string text) if (is(T == float) || is(T == double))
+{
+    import std.array : replace;
+
+    const point = decimalPoint();
+    return strtodCopy!T(point == "." ? text : text.replace(".", point));
+}
+
+// strtod (strtof for float) on a NUL-terminated copy of `text`, on the stack when it is short.
+private Parsed!T strtodCopy(T)(scope const(char)[] text) @trusted if (is(T == float) || is(T == double))
+{
+    import core.stdc.stdlib : strtod, strtof;
+
+    char[64] stack = void;
+    char[] z = text.length < stack.length ? stack[0 .. text.length + 1] : new char[text.length + 1];
+    z[0 .. $ - 1] = text[];
+    z[$ - 1] = 0;
+    char* end; // strtod keeps no pointer to z
+    static if (is(T == float))
+        const value = strtof(z.ptr, &end);
+    else
+        const value = strtod(z.ptr, &end);
+    return Parsed!T(value, end == z.ptr + text.length); // also false when there is a NUL in the text
+}
+
+// The decimal point of the C library's locale.
+private string decimalPoint() @trusted
 {
     import core.stdc.locale : localeconv;
-    import std.array : replace;
     import std.string : fromStringz;
 
-    const lc = localeconv(); // its strings stay valid until the next setlocale; used only here
-    const point = lc is null || lc.decimal_point is null ? "." : fromStringz(lc.decimal_point);
-    const converted = point == "." ? text : text.replace(".", point);
-    return (converted ~ '\0')[0 .. $ - 1];
+    // localeconv's strings stay valid until the next setlocale: copied
+    const lc = localeconv();
+    if (lc is null || lc.decimal_point is null)
+        return ".";
+    const point = fromStringz(lc.decimal_point);
+    return point == "." ? "." : point.idup;
 }
 
 @safe unittest
 {
     import postgresql.exception : ClientException;
+    import std.array : replicate;
     import std.exception : assertThrown;
 
     assert(parseFloat8("1.5") == 1.5 && parseFloat8("-Infinity") == -double.infinity);
     assertThrown!ClientException(parseFloat8(""));
     assertThrown!ClientException(parseFloat8("1.5x"));
     assertThrown!ClientException(parseFloat8("1.5\0x"));
+    assert(parseFloat8("NaN") != parseFloat8("NaN") && parseFloat8("-inf") == -double.infinity);
+    assert(parseFloat8("1e+20") == 1e20 && parseFloat8(".5") == 0.5);
+    foreach (bad; [" 12", "0x1A", "nan(5)", "1e", "-", "1-2", "e5"])
+        assertThrown!ClientException(parseFloat8(bad));
+    assert(parseFloat8("0." ~ "0000000000".replicate(10) ~ "1") == 1e-101); // longer than the stack buffer
 }
 
 @system unittest
@@ -183,18 +244,6 @@ private string cText(string text) @trusted
             assert(formatFloat8(0.1) == "0.1");
             break;
         }
-}
-
-// Reads a number as C's strtod/strtof do: correctly rounded, subnormals included, out of range = infinity.
-private T parseC(T)(string text) @trusted
-{
-    import core.stdc.stdlib : strtod, strtof;
-
-    // strtod reads the NUL-terminated copy and keeps no pointer to it
-    static if (is(T == float))
-        return strtof(cText(text).ptr, null);
-    else
-        return strtod(cText(text).ptr, null);
 }
 
 private string formatShortest(T)(T value, int plainLimit)
@@ -216,7 +265,7 @@ private string formatShortest(T)(T value, int plainLimit)
     foreach (precision; 1 .. maxDigits + 1)
     {
         scientific = format("%.*e", precision - 1, value);
-        if (parseC!T(scientific) == value && !isTie(scientific, value))
+        if (parseC!T(scientific).value == value && !isTie(scientific, value))
             break;
     }
     // scientific: [-]d[.ddd]e(+|-)XX

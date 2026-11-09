@@ -91,14 +91,16 @@ struct ServerMessage
     +/
     static ServerMessage parse(MessageBody body) @safe
     {
-        import std.conv : to;
-
-        static int number(string s) @safe pure
+        static int number(string s) @safe pure nothrow @nogc
         {
-            try
-                return s.to!int;
-            catch (Exception)
-                return 0;
+            int n;
+            foreach (c; s)
+            {
+                if (c < '0' || c > '9' || n > (int.max - (c - '0')) / 10)
+                    return 0;
+                n = n * 10 + (c - '0');
+            }
+            return n;
         }
 
         ServerMessage m;

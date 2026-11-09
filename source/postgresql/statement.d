@@ -15,10 +15,11 @@ module postgresql.statement;
 
 import postgresql.connection : Connection;
 import postgresql.exception : ClientException;
-import postgresql.params : hasVariant, nullValue, putParam;
+import postgresql.params : checkVariantParam, hasVariant, nullValue, putParam;
 import postgresql.protocol.messages : MessageBuilder;
 import postgresql.result : ColumnInfo, QueryResult;
 
+import std.meta : staticMap;
 import std.variant : Variant;
 
 @safe:
@@ -51,22 +52,13 @@ package void putArgs(Args...)(ref MessageBuilder b, const(uint)[] types, ref Arg
     checkParameterCount(types.length, Args.length);
     const formats = beginParameters(b, Args.length);
     static foreach (i; 0 .. Args.length)
-        setFormat(b, formats, i, putArg(b, args[i], types[i]));
+        setFormat(b, formats, i, putParam(b, args[i], types[i]));
 }
 
 /// Fills in the format code of parameter `i` (see `beginParameters`) from what `putParam` returned.
 package void setFormat(ref MessageBuilder b, size_t formats, size_t i, short written) @safe pure nothrow
 {
     b.patchInt16(formats + 2 * i, written == nullValue ? 0 : written);
-}
-
-// One argument of putArgs.
-private short putArg(T)(ref MessageBuilder b, ref T arg, uint type)
-{
-    static if (hasVariant!T)
-        return (() @trusted => putParam(b, arg, type))(); // a Variant copy: it holds a plain value
-    else
-        return putParam(b, arg, type);
 }
 
 /++
@@ -95,13 +87,10 @@ package void checkParameterCount(size_t parameters, size_t values) @safe pure
 /++
 Makes an encoder that keeps a copy of `args`, for use after the call (pipelines).
 +/
-package ParamEncoder makeEncoder(Args...)(Args args)
+package ParamEncoder makeEncoder(Args...)(auto ref Args args)
 {
     // the values are copied into an object: a closure can't hold values with destructors (Variant)
-    static if (hasVariant!Args)
-        auto holder = (() @trusted => new ArgsHolder!Args(args))(); // Variant copies: they hold plain values
-    else
-        auto holder = new ArgsHolder!Args(args);
+    auto holder = new ArgsHolder!Args(args);
     return &holder.encode;
 }
 
@@ -110,36 +99,66 @@ Writes the parameter part of a Bind message for values known only at run
 time: each `Variant` holds a parameter type of `encodeParam` (an empty
 `Variant` or `null`: NULL).
 +/
-package void putVariants(ref MessageBuilder b, const(uint)[] types, const Variant[] values) @trusted
+package void putVariants(ref MessageBuilder b, const(uint)[] types, const Variant[] values)
 {
-    // Variant accessors; plain values
     import postgresql.params : putVariant;
 
     checkParameterCount(types.length, values.length);
     const formats = beginParameters(b, values.length);
-    foreach (i, v; values)
-        setFormat(b, formats, i, putVariant(b, cast() v, types[i]));
+    foreach (i, ref v; values)
+        setFormat(b, formats, i, putVariant(b, v, types[i]));
 }
 
 private final class ArgsHolder(Args...)
 {
-    Args args;
+    staticMap!(Stored, Args) args;
 
-    this(Args args)
+    this(ref Args args)
     {
-        this.args = args; // initialized here: `Args` may be const
+        static foreach (i; 0 .. Args.length)
+        {
+            static if (hasVariant!(Args[i]))
+            {
+                checkVariantParam(args[i]);
+                (() @trusted { this.args[i] = cast() args[i]; })(); // a Variant copy: it holds a plain value
+            }
+            else
+                this.args[i] = args[i]; // initialized here: `Args` may be const
+        }
     }
 
-    static if (hasVariant!Args)
-        enum attributes = "@trusted"; // copies of Variant values, which hold plain values
-    else
-        enum attributes = "@safe";
-
-    mixin("void encode(const(uint)[] types, ref MessageBuilder b) " ~ attributes ~ q{
+    void encode(const(uint)[] types, ref MessageBuilder b)
     {
         putArgs(b, types, args);
     }
-    });
+}
+
+// How ArgsHolder keeps an argument of type T: a Variant as a mutable copy, which the constructor assigns.
+private template Stored(T)
+{
+    static if (hasVariant!T)
+        alias Stored = Variant;
+    else
+        alias Stored = T;
+}
+
+// A Variant is copied for a pipeline only when it holds a type putVariant encodes
+@system unittest
+{
+    import std.exception : assertThrown;
+
+    static struct Evil
+    {
+        int x;
+        this(this)
+        {
+        }
+    }
+
+    auto plain = Variant(5);
+    assert(makeEncoder(plain) !is null && makeEncoder(Variant()) !is null);
+    auto evil = Variant(Evil(1));
+    assertThrown!ClientException(makeEncoder(evil));
 }
 
 /++
@@ -277,15 +296,12 @@ final class PreparedStatement
     Throws: `ClientException` for a wrong number of values, values that don't
     fit the parameter types, or a closed statement; `ServerException`.
     +/
-    QueryResult query(Args...)(Args args)
+    QueryResult query(Args...)(auto ref Args args)
     {
         checkOpen();
         void encode(const(uint)[] types, ref MessageBuilder b)
         {
-            static if (hasVariant!Args)
-                (() @trusted => putArgs(b, types, args))(); // Variant copies: they hold plain values
-            else
-                putArgs(b, types, args);
+            putArgs(b, types, args);
         }
 
         return conn.runStatement(info, &encode);
@@ -315,12 +331,9 @@ final class PreparedStatement
     }
 
     /// Runs the statement with `args` and returns the number of rows it affected (see `Connection.exec`).
-    ulong exec(Args...)(Args args)
+    ulong exec(Args...)(auto ref Args args)
     {
-        static if (hasVariant!Args)
-            return (() @trusted => Connection.drainCount(query(args)))(); // Variant copies
-        else
-            return Connection.drainCount(query(args));
+        return Connection.drainCount(query(args));
     }
 
     /// Frees the statement on the server. Calling it again does nothing.

@@ -8,6 +8,8 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.types.geometric;
 
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
+
 import postgresql.exception : ClientException, ProtocolException;
 import postgresql.types.floats : formatFloat8;
 
@@ -116,24 +118,43 @@ private string pointList(const Point[] points)
 enum bool isGeometric(T) = is(T == Point) || is(T == Line) || is(T == LineSegment) || is(T == Box)
     || is(T == Path) || is(T == Polygon) || is(T == Circle);
 
+/// The type OID of the geometric type `T`.
+package(postgresql) template geometricOid(T) if (isGeometric!T)
+{
+    import postgresql.types.oids : Oid;
+
+    static if (is(T == Point))
+        enum uint geometricOid = Oid.point;
+    else static if (is(T == Line))
+        enum uint geometricOid = Oid.line;
+    else static if (is(T == LineSegment))
+        enum uint geometricOid = Oid.lseg;
+    else static if (is(T == Box))
+        enum uint geometricOid = Oid.box;
+    else static if (is(T == Path))
+        enum uint geometricOid = Oid.path;
+    else static if (is(T == Polygon))
+        enum uint geometricOid = Oid.polygon;
+    else
+        enum uint geometricOid = Oid.circle;
+}
+
 /++
 Reads `T` from its binary format (big-endian float8s; paths with a closed
 flag and a count, polygons with a count).
 
 Throws: `ProtocolException` for malformed data.
 +/
-T geometricFromBinary(T)(scope const(ubyte)[] data) pure if (isGeometric!T)
+T geometricFromBinary(T)(scope const(ubyte)[] data) if (isGeometric!T)
 {
     size_t at;
     double number()
     {
         if (at + 8 > data.length)
             throw new ProtocolException("Malformed " ~ T.stringof ~ " value");
-        ulong bits;
-        foreach (b; data[at .. at + 8])
-            bits = bits << 8 | b;
+        const v = fromBigEndian!double(data[at .. $][0 .. 8]);
         at += 8;
-        return (() @trusted => *cast(double*)&bits)(); // reinterprets the 8 bytes
+        return v;
     }
 
     Point point()
@@ -146,7 +167,7 @@ T geometricFromBinary(T)(scope const(ubyte)[] data) pure if (isGeometric!T)
     {
         if (at + 4 > data.length)
             throw new ProtocolException("Malformed " ~ T.stringof ~ " value");
-        const n = cast(uint)(data[at] << 24 | data[at + 1] << 16 | data[at + 2] << 8 | data[at + 3]);
+        const n = fromBigEndian!uint(data[at .. $][0 .. 4]);
         at += 4;
         if (n > (data.length - at) / 16)
             throw new ProtocolException("Malformed " ~ T.stringof ~ " value");
@@ -196,14 +217,12 @@ T geometricFromBinary(T)(scope const(ubyte)[] data) pure if (isGeometric!T)
 }
 
 /// The binary format of `value`.
-immutable(ubyte)[] geometricToBinary(T)(const T value) pure if (isGeometric!T)
+immutable(ubyte)[] geometricToBinary(T)(const T value) if (isGeometric!T)
 {
     ubyte[] data;
     void number(double d)
     {
-        const bits = (() @trusted => *cast(const(ulong)*)&d)(); // reinterprets the 8 bytes
-        foreach_reverse (i; 0 .. 8)
-            data ~= cast(ubyte)(bits >> (8 * i));
+        data ~= toBigEndian(d)[];
     }
 
     void point(const Point p)
@@ -215,7 +234,7 @@ immutable(ubyte)[] geometricToBinary(T)(const T value) pure if (isGeometric!T)
     void points(const Point[] list)
     {
         const n = cast(uint) list.length;
-        data ~= [cast(ubyte)(n >> 24), cast(ubyte)(n >> 16), cast(ubyte)(n >> 8), cast(ubyte) n];
+        data ~= toBigEndian(n)[];
         foreach (p; list)
             point(p);
     }
@@ -250,7 +269,7 @@ immutable(ubyte)[] geometricToBinary(T)(const T value) pure if (isGeometric!T)
         point(value.center);
         number(value.radius);
     }
-    return (() @trusted => cast(immutable) data)(); // not referenced elsewhere
+    return data;
 }
 
 /++
@@ -345,4 +364,13 @@ unittest
     assert(geometricFromBinary!Polygon(geometricToBinary(p)) == p);
     const path = Path([Point(1, 2)], true);
     assert(geometricFromBinary!Path(geometricToBinary(path)) == path);
+}
+
+@safe pure unittest
+{
+    const c = Circle(Point(1, 2), 0.5);
+    assert(geometricFromBinary!Circle(geometricToBinary(c)) == c);
+    assert(geometricToBinary(Point(1.5, 0)) == [
+        0x3F, 0xF8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    ]);
 }

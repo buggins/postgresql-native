@@ -29,6 +29,19 @@ project uses [semantic versioning](https://semver.org/).
   are parsed only when `onNotice` is set.
 - `parseTextLine` and `parseCsvLine` return slices of the line for fields
   without escapes or doubled quotes.
+- `@safe` code can pass a `Variant` variable to `query`, `exec`,
+  `queryRow`, `queryValue`, `PreparedStatement.query`/`exec`,
+  `Pipeline.add`, `CopyIn.writeRow` and `encodeParam`: arguments are taken by
+  `auto ref`, so the `Variant` isn't copied (#37). `Pipeline.add` refuses a
+  `Variant` holding a type it can't send before copying it.
+- **Breaking:** `queryRow!S` and `insert` with structs that have a `Variant`
+  field are `@system` (#37): copying and assigning a `Variant` is, and they
+  no longer trust those copies, which also hid the `@system` copies of other
+  field types. Call them from `@system` or `@trusted` code. `query!S`
+  (`RowRange`) was already `@system` for such structs.
+  `postgresql.mapping.hasVariantField` was removed.
+- Connection keyword values (`sslmode`, `target_session_attrs`, ...) map to
+  their enum members by name, no longer by position (#37).
 
 - dbwire 0.9 (`~>0.9.0`): from its code review, robustness fixes (huge TZif
   counts, a socket that can't be created moves on to the next address),
@@ -108,6 +121,13 @@ From the performance work (#35):
   `5.00` from a `numeric(10,2)` column, threw "out of long's range".
 - `getDouble` of a numeric is correctly rounded (it went through Phobos'
   `to!double`, which can be one unit in the last place off).
+
+From the attribute and idiom review (#37):
+
+- `getDouble` of a value in text format (e.g. from `querySimple`) is
+  correctly rounded, as `float8` values in binary format already were.
+- `get!ulong` of a numeric in binary format is computed from its digits;
+  a fractional value throws "is not an integer" as `getLong` does.
 
 ## 0.5.0 (2026-11-07)
 

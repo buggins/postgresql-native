@@ -298,7 +298,8 @@ struct ConnectionOptions
         import dbwire.client.dsn : parseFlag, parseSeconds;
         import std.array : split;
         import std.conv : ConvException, to;
-        import std.string : strip, toLower;
+        import std.string : strip;
+        import postgresql.types.textformat : equalsIgnoringCase;
 
         string[string] params;
         foreach (key, value; given)
@@ -324,11 +325,19 @@ struct ConnectionOptions
                 hostList = value.split(",");
                 break;
             case "load_balance_hosts":
-                o.hostSelection = parseKeyword!HostSelection(key, value, ["disable", "random"]);
+                o.hostSelection = parseKeyword(key, value, [
+                    "disable": HostSelection.inOrder,
+                    "random": HostSelection.random
+                ]);
                 break;
             case "target_session_attrs":
-                o.targetSessionAttrs = parseKeyword!TargetSessionAttrs(key, value, [
-                    "any", "read-write", "read-only", "primary", "standby", "prefer-standby"
+                o.targetSessionAttrs = parseKeyword(key, value, [
+                    "any": TargetSessionAttrs.any,
+                    "read-write": TargetSessionAttrs.readWrite,
+                    "read-only": TargetSessionAttrs.readOnly,
+                    "primary": TargetSessionAttrs.primary,
+                    "standby": TargetSessionAttrs.standby,
+                    "prefer-standby": TargetSessionAttrs.preferStandby
                 ]);
                 break;
             case "passfile":
@@ -369,12 +378,20 @@ struct ConnectionOptions
                 o.serverOptions = value;
                 break;
             case "sslmode":
-                o.sslMode = parseKeyword!SslMode(key, value, [
-                    "disable", "allow", "prefer", "require", "verify-ca", "verify-full"
+                o.sslMode = parseKeyword(key, value, [
+                    "disable": SslMode.disable,
+                    "allow": SslMode.allow,
+                    "prefer": SslMode.prefer,
+                    "require": SslMode.require,
+                    "verify-ca": SslMode.verifyCa,
+                    "verify-full": SslMode.verifyFull
                 ]);
                 break;
             case "sslnegotiation":
-                o.sslNegotiation = parseKeyword!SslNegotiation(key, value, ["postgres", "direct"]);
+                o.sslNegotiation = parseKeyword(key, value, [
+                    "postgres": SslNegotiation.postgres,
+                    "direct": SslNegotiation.direct
+                ]);
                 break;
             case "sslrootcert":
                 o.tls.caFile = value;
@@ -391,8 +408,10 @@ struct ConnectionOptions
             case "sslsni":
                 break; // SNI is always sent for host names
             case "channel_binding":
-                o.channelBinding = parseKeyword!ChannelBinding(key, value, [
-                    "disable", "prefer", "require"
+                o.channelBinding = parseKeyword(key, value, [
+                    "disable": ChannelBinding.disable,
+                    "prefer": ChannelBinding.prefer,
+                    "require": ChannelBinding.require
                 ]);
                 break;
             case "require_auth":
@@ -400,15 +419,17 @@ struct ConnectionOptions
                 o.requireAuth = value;
                 break;
             case "max_protocol_version":
-                o.maxProtocolVersion = parseKeyword!ProtocolVersion(key, value == "latest" ? "3.2" : value, [
-                    "3.0", "3.2"
+                o.maxProtocolVersion = parseKeyword(key, value, [
+                    "3.0": ProtocolVersion.v30,
+                    "3.2": ProtocolVersion.v32,
+                    "latest": ProtocolVersion.v32
                 ]);
                 break;
             case "connect_timeout":
                 o.connectTimeout = parseSeconds(key, value); // 0: no limit
                 break;
             case "client_encoding":
-                if (value.toLower != "utf8" && value.toLower != "utf-8")
+                if (!equalsIgnoringCase(value, "utf8") && !equalsIgnoringCase(value, "utf-8"))
                     throw new ClientException("Only client_encoding=UTF8 is supported");
                 break;
             case "statement_cache_size":
@@ -421,7 +442,11 @@ struct ConnectionOptions
                 o.rewritePlaceholders = parseFlag(key, value);
                 break;
             case "io_mode":
-                o.ioMode = parseKeyword!IoMode(key, value, ["auto", "phobos", "vibe"]);
+                o.ioMode = parseKeyword(key, value, [
+                    "auto": IoMode.auto_,
+                    "phobos": IoMode.phobos,
+                    "vibe": IoMode.vibe
+                ]);
                 break;
             default:
                 throw new ClientException("Unknown connection keyword '" ~ key ~ "'");
@@ -584,7 +609,7 @@ private void applyService(ref string[string] params)
 Whether `host` names the directory of a Unix-domain socket (it starts with
 `/`) or a Linux abstract socket (it starts with `@`), not a host name.
 +/
-bool isSocketDirectory(string host) pure nothrow
+bool isSocketDirectory(string host) pure nothrow @nogc
 {
     return host.length && (host[0] == '/' || host[0] == '@');
 }
@@ -594,7 +619,7 @@ The path of the server's socket in the socket directory `host` for `port`:
 `<host>/.s.PGSQL.<port>`, with a zero byte for the `@` of an abstract
 socket.
 +/
-string socketPath(string host, ushort port) pure
+string socketPath(string host, ushort port) pure nothrow
 {
     import std.conv : to;
 
@@ -664,7 +689,7 @@ unittest
 }
 
 // Services: the string's keywords win over the service's, which win over the environment's
-@system unittest
+unittest
 {
     import std.conv : to;
     import std.exception : assertThrown;
@@ -739,7 +764,7 @@ shared static this()
 }
 
 ///
-@system unittest
+unittest
 {
     import std.process : environment;
 
@@ -1021,11 +1046,11 @@ unittest
 
 private:
 
-E parseKeyword(E)(string key, string value, const string[] names)
+// The member of `E` that `value` names in `choices`.
+E parseKeyword(E)(string key, string value, const E[string] choices)
 {
-    foreach (i, n; names)
-        if (n == value)
-            return cast(E) i;
+    if (auto e = value in choices)
+        return *e;
     throw new ClientException("Invalid " ~ key ~ " '" ~ value ~ "'");
 }
 

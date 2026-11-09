@@ -18,7 +18,8 @@ module postgresql.params;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
-import std.traits : isDynamicArray, isFloatingPoint, isIntegral, isSomeChar, isSomeString, OriginalType, Unqual;
+import std.traits : hasElaborateCopyConstructor, hasElaborateDestructor, isDynamicArray, isFloatingPoint, isIntegral,
+    isSomeChar, isSomeString, OriginalType, Unqual;
 import std.typecons : Nullable;
 import std.uuid : UUID;
 import std.variant : Variant;
@@ -34,9 +35,12 @@ import postgresql.types.bitstring : BitString;
 import postgresql.types.geometric;
 import postgresql.types.network : Inet;
 import postgresql.types.ranges : isRange;
-import postgresql.types.textformat : quoteHstore;
+import postgresql.types.textformat : hexText, quoteHstore;
 
-/// Whether `Args` contain a `Variant`, whose copies are `@system`: calls copying them need `@trusted`.
+/++
+Whether `Args` contain a `Variant` (as such, not inside an array, a
+`Nullable` or a struct). A `Variant` copy is `@system`.
++/
 enum bool hasVariant(Args...) = anySatisfyVariant!Args;
 
 private template anySatisfyVariant(Args...)
@@ -78,13 +82,13 @@ binary, else as text, as ranges, `hstore` values and composite values do.
 Throws: `ClientException` for an integer out of the target type's range or
 an unsupported D type.
 +/
-Param encodeParam(T)(T value, uint oid)
+Param encodeParam(T)(auto ref T value, uint oid)
 {
     MessageBuilder b;
     const format = putParam(b, value, oid);
     if (format == nullValue)
         return Param(true);
-    return Param(false, format, (() @trusted => cast(immutable) b.data[4 .. $])()); // b's memory isn't used again
+    return Param(false, format, b.data[4 .. $].idup);
 }
 
 /// What `putParam` returns for NULL (else the format).
@@ -96,7 +100,7 @@ its length (-1 for NULL) and bytes.
 
 Returns: the format, text (0) or binary (1); `nullValue` (-1) for NULL.
 +/
-package short putParam(T)(ref MessageBuilder b, T value, uint oid)
+package short putParam(T)(ref MessageBuilder b, auto ref T value, uint oid)
 {
     alias U = Unqual!T;
     static if (is(U == typeof(null)))
@@ -136,9 +140,9 @@ package short putParam(T)(ref MessageBuilder b, T value, uint oid)
     else static if (isFloatingPoint!U)
     {
         if (oid == Oid.float8)
-            return b.putBinary(doubleBits(cast(double) value));
+            return b.putBinary(cast(double) value);
         if (oid == Oid.float4)
-            return b.putBinary(floatBits(cast(float) value));
+            return b.putBinary(cast(float) value);
         return b.putText(is(U == float) ? formatFloat4(value) : formatFloat8(cast(double) value));
     }
     else static if (is(U == Decimal))
@@ -158,7 +162,7 @@ package short putParam(T)(ref MessageBuilder b, T value, uint oid)
     {
         if (oid == Oid.bytea || oid == 0)
             return b.putBinaryBytes(value);
-        return b.putText(hexBytea(value));
+        return b.putText(hexText(value, `\x`));
     }
     else static if (is(U == Date))
     {
@@ -223,7 +227,7 @@ package short putParam(T)(ref MessageBuilder b, T value, uint oid)
     }
     else static if (isGeometric!U)
     {
-        if (oid == geometricOidOf!U)
+        if (oid == geometricOid!U)
             return b.putBinaryBytes(geometricToBinary(value));
         return b.putText(value.toString());
     }
@@ -244,9 +248,9 @@ package short putParam(T)(ref MessageBuilder b, T value, uint oid)
         {
             literal ~= (literal.length ? ", " : "") ~ quoteHstore(k) ~ "=>";
             static if (is(V : Nullable!X, X))
-                literal ~= v.isNull ? "NULL" : quoteHstore(textOf(v.get));
+                literal ~= v.isNull ? "NULL" : quotedItem(v.get, `""`);
             else
-                literal ~= quoteHstore(textOf(v));
+                literal ~= quotedItem(v, `""`);
         }
         return b.putText(literal);
     }
@@ -318,7 +322,7 @@ a literal `?` (e.g. the jsonb `?` operator).
 
 Returns: the rewritten SQL; `count` is set to the number of placeholders.
 +/
-string rewritePlaceholders(string sql, out size_t count) @safe pure
+string rewritePlaceholders(string sql, out size_t count) @safe pure nothrow
 {
     import std.array : appender;
     import std.string : indexOf;
@@ -423,19 +427,20 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
 
 private:
 
-// The text of a value, as the server parses it.
-string textOf(T)(T value)
+// A part of an array, range, record or hstore literal: the value's text (as the server parses it) quoted, `"`
+// and `\` escaped; `ifNull` for NULL.
+string quotedItem(T)(auto ref T value, string ifNull)
 {
-    const p = encodeParam(value, Oid.text);
-    return p.isNull ? null : cast(string) p.data;
+    MessageBuilder b;
+    if (putParam(b, value, Oid.text) == nullValue)
+        return ifNull;
+    return quoteHstore(cast(const(char)[]) b.data[4 .. $]); // after the length
 }
 
-// A part of an array, range or record literal: quoted, `"` and `\` escaped; empty for NULL in records and
-// ranges (arrays use NULL).
-string literalItem(T)(T value)
+// A part of a range or record literal: empty for NULL.
+string literalItem(T)(auto ref T value)
 {
-    const p = encodeParam(value, Oid.text);
-    return p.isNull ? "" : quoteHstore(cast(string) p.data);
+    return quotedItem(value, "");
 }
 
 // An array parameter: binary when the parameter is an array of a built-in type and every element is sent in
@@ -519,10 +524,7 @@ short putArray(A)(ref MessageBuilder b, A value, uint oid)
             if (i)
                 literal ~= delimiter;
             static if (isValue!(typeof(X.init[0])))
-            {
-                const p = encodeParam(item, Oid.text);
-                literal ~= p.isNull ? "NULL" : quoteHstore(cast(string) p.data);
-            }
+                literal ~= quotedItem(item, "NULL");
             else
                 write(item);
         }
@@ -531,24 +533,6 @@ short putArray(A)(ref MessageBuilder b, A value, uint oid)
 
     write(value);
     return b.putText(literal);
-}
-
-template geometricOidOf(T)
-{
-    static if (is(T == Point))
-        enum geometricOidOf = Oid.point;
-    else static if (is(T == Line))
-        enum geometricOidOf = Oid.line;
-    else static if (is(T == LineSegment))
-        enum geometricOidOf = Oid.lseg;
-    else static if (is(T == Box))
-        enum geometricOidOf = Oid.box;
-    else static if (is(T == Path))
-        enum geometricOidOf = Oid.path;
-    else static if (is(T == Polygon))
-        enum geometricOidOf = Oid.polygon;
-    else
-        enum geometricOidOf = Oid.circle;
 }
 
 // The value parts of a Bind message: the length (-1 for NULL), then the bytes; each returns the format, or
@@ -573,7 +557,7 @@ short putBinaryBytes(ref MessageBuilder b, scope const(ubyte)[] bytes) @safe pur
     return 1;
 }
 
-short putBinary(T)(ref MessageBuilder b, T value) if (isIntegral!T)
+short putBinary(T)(ref MessageBuilder b, T value) if (isIntegral!T || isFloatingPoint!T)
 {
     b.putInt32(T.sizeof);
     b.putBigEndian(value);
@@ -615,7 +599,7 @@ bool isNumericOid(uint oid) @safe pure nothrow
     }
 }
 
-short putInteger(T)(ref MessageBuilder b, T value, uint oid) @safe
+short putInteger(T)(ref MessageBuilder b, T value, uint oid)
 {
     import std.conv : to;
 
@@ -646,9 +630,9 @@ short putInteger(T)(ref MessageBuilder b, T value, uint oid) @safe
             throw outOfRange(value.to!string, "oid");
         return b.putBinary(cast(uint) value);
     case Oid.float8:
-        return b.putBinary(doubleBits(cast(double) value));
+        return b.putBinary(cast(double) value);
     case Oid.float4:
-        return b.putBinary(floatBits(cast(float) value));
+        return b.putBinary(cast(float) value);
     default:
         char[20] digits;
         return b.putText(digits[integerText(value, digits) .. $]);
@@ -694,6 +678,16 @@ package size_t integerText(T)(T value, ref char[20] buffer)
     b.putBinary(short(-2));
     b.putBinary(ulong(1));
     assert(b.data == [0, 0, 0, 2, 0xFF, 0xFE, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 1]);
+    b.clear();
+    b.putBinary(1.5f);
+    assert(b.data == [0, 0, 0, 4, 0x3F, 0xC0, 0, 0]);
+}
+
+@safe pure unittest
+{
+    MessageBuilder b;
+    assert(putInteger(b, 7, Oid.int2) == 1 && putInteger(b, ulong.max, Oid.numeric) == 0);
+    assert(b.data[0 .. 6] == [0, 0, 0, 2, 0, 7]);
 }
 
 ClientException outOfRange(string value, string type) @safe pure
@@ -701,56 +695,67 @@ ClientException outOfRange(string value, string type) @safe pure
     return new ClientException("The value " ~ value ~ " is out of the range of the parameter's type " ~ type);
 }
 
-/// Encodes a `Variant` holding a type `encodeParam` takes (empty or `null`: NULL) into a Bind message.
-package short putVariant(ref MessageBuilder b, Variant value, uint oid) @trusted
+// The types putVariant encodes (besides byte[] and null): none has a copy constructor or destructor.
+alias VariantTypes = AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real, Decimal,
+        string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime, SysTime, TimeOfDay,
+        Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line, LineSegment, Box, Path, Polygon,
+        Circle);
+
+static foreach (T; VariantTypes)
+    static assert(!hasElaborateCopyConstructor!T && !hasElaborateDestructor!T);
+
+/++
+Throws `ClientException` unless `value` is empty or holds a type that
+`putVariant` encodes (whose copies are then `@safe`).
++/
+package void checkVariantParam(ref const Variant value) @safe
 {
-    // Variant's accessors aren't @safe; each branch copies a plain value out of it
-    const type = value.type;
-    if (!value.hasValue || type is typeid(typeof(null)))
-        return b.putNull();
-    if (type is typeid(byte[]))
-        return putParam(b, cast(const(ubyte)[]) value.get!(byte[]), oid);
-    alias Types = AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real, Decimal,
-            string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime, SysTime,
-            TimeOfDay, Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line, LineSegment, Box,
-            Path, Polygon, Circle);
-    static foreach (T; Types)
-        if (type is typeid(T)) // the usual case: one TypeInfo object per type
-            return putParam(b, value.get!T, oid);
-    if (type == typeid(typeof(null)))
-        return b.putNull();
-    if (type == typeid(byte[]))
-        return putParam(b, cast(const(ubyte)[]) value.get!(byte[]), oid);
-    static foreach (T; Types)
-        if (type == typeid(T)) // e.g. a TypeInfo of another shared library
-            return putParam(b, value.get!T, oid);
+    TypeInfo type = value.type;
+    if (!value.hasValue || sameType(type, typeid(typeof(null))) || sameType(type, typeid(byte[])))
+        return;
+    static foreach (T; VariantTypes)
+        if (sameType(type, typeid(T)))
+            return;
     throw new ClientException("Unsupported parameter type in a Variant: " ~ type.toString());
 }
 
+/// Encodes a `Variant` holding a type `encodeParam` takes (empty or `null`: NULL) into a Bind message.
+package short putVariant(ref MessageBuilder b, ref const Variant value, uint oid) @safe
+{
+    TypeInfo type = value.type;
+    if (!value.hasValue || type is typeid(typeof(null)))
+        return b.putNull();
+    if (type is typeid(byte[]))
+        return putParam(b, cast(const(ubyte)[]) held!(byte[])(value), oid);
+    static foreach (T; VariantTypes)
+        if (type is typeid(T)) // the usual case: one TypeInfo object per type
+            return putParam(b, held!T(value), oid);
+    if (sameType(type, typeid(typeof(null))))
+        return b.putNull();
+    if (sameType(type, typeid(byte[])))
+        return putParam(b, cast(const(ubyte)[]) held!(byte[])(value), oid);
+    static foreach (T; VariantTypes)
+        if (sameType(type, typeid(T))) // e.g. a TypeInfo of another shared library
+            return putParam(b, held!T(value), oid);
+    throw new ClientException("Unsupported parameter type in a Variant: " ~ type.toString());
+}
+
+// Whether two TypeInfo objects describe the same type: TypeInfo.opEquals compares names, but Object's
+// opEquals isn't @safe.
+bool sameType(TypeInfo a, TypeInfo b) @trusted
+{
+    return a == b;
+}
+
+// The `T` that `value` holds (its type checked by the caller). `Variant.get` isn't @safe; copies of the
+// types it is used for are.
+const(T) held(T)(ref const Variant value) @trusted
+        if (!hasElaborateCopyConstructor!T && !hasElaborateDestructor!T)
+{
+    return value.get!T;
+}
+
 import std.meta : AliasSeq;
-
-uint floatBits(float f) @trusted pure nothrow
-{
-    return *cast(uint*)&f; // reinterprets the 4 bytes
-}
-
-ulong doubleBits(double d) @trusted pure nothrow
-{
-    return *cast(ulong*)&d; // reinterprets the 8 bytes
-}
-
-string hexBytea(const(ubyte)[] bytes) @safe pure
-{
-    static immutable digits = "0123456789abcdef";
-    auto text = new char[2 + bytes.length * 2];
-    text[0 .. 2] = `\x`;
-    foreach (i, b; bytes)
-    {
-        text[2 + 2 * i] = digits[b >> 4];
-        text[3 + 2 * i] = digits[b & 15];
-    }
-    return text;
-}
 
 string dateText(Date d) @safe pure
 {
