@@ -277,11 +277,29 @@ final class MessageStream
         if (length < 4 || length - 4 > maxMessageLength)
             throw new ProtocolException("Invalid length of a '" ~ cast(char) header[0] ~ "' message");
         const size = length - 4;
-        if (buffer.length < size)
-            buffer = new ubyte[size];
-        reader.readExact(buffer[0 .. size]);
+        // a buffer grown for a large message isn't kept for the small ones after it
+        if (buffer.length > keptBufferSize && size <= keptBufferSize)
+            buffer = null;
+        if (buffer.length >= size)
+            reader.readExact(buffer[0 .. size]);
+        else
+        {
+            // grown as the bytes arrive, so that a length alone never allocates much
+            size_t done;
+            while (done < size)
+            {
+                const next = size - done > done + growStep ? done + done + growStep : size;
+                if (buffer.length < next)
+                    buffer.length = next;
+                reader.readExact(buffer[done .. next]);
+                done = next;
+            }
+        }
         return Message(cast(char) header[0], buffer[0 .. size]);
     }
+
+    private enum size_t keptBufferSize = 1 << 20;
+    private enum size_t growStep = 1 << 16;
 
     /// Queues the composed bytes; `flush` sends them.
     void write(scope const(ubyte)[] bytes)
@@ -305,6 +323,7 @@ final class MessageStream
 
 unittest
 {
+    import dbwire.exception : ConnectionException;
     import dbwire.io.mock : MockTransport;
     import std.exception : assertThrown;
 
@@ -325,4 +344,21 @@ unittest
     assertThrown!ProtocolException(s.read());
     s = new MessageStream(mock("D\x7F\x00\x00\x00"));
     assertThrown!ProtocolException(s.read()); // longer than the limit: nothing allocated
+
+    // a length alone allocates at most one growth step; a large buffer isn't kept
+    s = new MessageStream(mock("D\x10\x00\x00\x00abc"));
+    assertThrown!ConnectionException(s.read()); // the data ends early
+    assert(s.buffer.length == 1 << 16);
+    auto big = new ubyte[5 + (3 << 20)];
+    big[0] = 'D';
+    big[1 .. 5] = [0, 0x30, 0, 4];
+    big[$ - 1] = 7;
+    auto t = new MockTransport;
+    t.feed(big);
+    t.feed(cast(const(ubyte)[]) "Z\x00\x00\x00\x05I");
+    s = new MessageStream(t);
+    m = s.read();
+    assert(m.type == 'D' && m.data.length == 3 << 20 && m.data[$ - 1] == 7);
+    m = s.read();
+    assert(m.type == 'Z' && m.data == cast(const(ubyte)[]) "I" && s.buffer.length == 1);
 }

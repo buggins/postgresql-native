@@ -165,6 +165,26 @@ void testPipelines()
     assertThrown!ClientException(p.run());
     enforce(firstRow(conn, "SELECT 'usable'").getString(0) == "usable", "usable after failed pipelines");
 
+    // more new statements than the statement cache holds: those it evicts are closed after the pipeline
+    {
+        auto small = serverOptions();
+        small.statementCacheSize = 2;
+        auto cached = new Connection(small);
+        scope (exit)
+            cached.close();
+        foreach (round; 0 .. 2)
+        {
+            p = cached.pipeline();
+            foreach (i; 0 .. 3)
+                p.add("SELECT ?::int + " ~ (round * 3 + i).to!string, 1);
+            results = p.run();
+            foreach (i, r; results)
+                enforce(r.rows[0].getInt(0) == 1 + round * 3 + i, "cache eviction in a pipeline");
+        }
+        const kept = firstRow(cached, "SELECT count(*) FROM pg_prepared_statements").getLong(0);
+        enforce(kept <= 3 && !cached.isBusy, "evicted statements closed: " ~ kept.to!string);
+    }
+
     // many statements, the same SQL repeated, without a statement cache
     auto o = serverOptions();
     o.statementCacheSize = 0;

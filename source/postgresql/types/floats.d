@@ -131,29 +131,70 @@ Throws: `ClientException` if `text` is not a number.
 package double parseFloat8(string text) @trusted
 {
     import core.stdc.stdlib : strtod;
-    import std.string : toStringz;
     import postgresql.exception : ClientException;
 
     // strtod reads the NUL-terminated copy and keeps no pointer to it
-    const z = text.toStringz;
+    const z = cText(text);
     immutable(char)* end;
-    const value = strtod(z, &end);
-    if (text.length == 0 || end != z + text.length)
+    const value = strtod(z.ptr, &end);
+    if (text.length == 0 || end != z.ptr + z.length) // also when there is a NUL in the text
         throw new ClientException("Invalid number '" ~ text ~ "'");
     return value;
+}
+
+// `text` for strtod, which reads the decimal point of the C library's locale (LC_NUMERIC: "." unless the
+// application called setlocale, as GUI toolkits do); a NUL follows the returned slice.
+private string cText(string text) @trusted
+{
+    import core.stdc.locale : localeconv;
+    import std.array : replace;
+    import std.string : fromStringz;
+
+    const lc = localeconv(); // its strings stay valid until the next setlocale; used only here
+    const point = lc is null || lc.decimal_point is null ? "." : fromStringz(lc.decimal_point);
+    const converted = point == "." ? text : text.replace(".", point);
+    return (converted ~ '\0')[0 .. $ - 1];
+}
+
+@safe unittest
+{
+    import postgresql.exception : ClientException;
+    import std.exception : assertThrown;
+
+    assert(parseFloat8("1.5") == 1.5 && parseFloat8("-Infinity") == -double.infinity);
+    assertThrown!ClientException(parseFloat8(""));
+    assertThrown!ClientException(parseFloat8("1.5x"));
+    assertThrown!ClientException(parseFloat8("1.5\0x"));
+}
+
+@system unittest
+{
+    import core.stdc.locale : LC_NUMERIC, setlocale;
+    import std.string : fromStringz, toStringz;
+
+    // with a locale whose decimal point is a comma, where the system has one
+    const saved = fromStringz(setlocale(LC_NUMERIC, null)).idup;
+    scope (exit)
+        setlocale(LC_NUMERIC, saved.toStringz);
+    foreach (name; ["de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "German_Germany.1252"])
+        if (setlocale(LC_NUMERIC, name.ptr) !is null)
+        {
+            assert(parseFloat8("1.5") == 1.5 && parseFloat8("-2.5e-3") == -2.5e-3);
+            assert(formatFloat8(0.1) == "0.1");
+            break;
+        }
 }
 
 // Reads a number as C's strtod/strtof do: correctly rounded, subnormals included, out of range = infinity.
 private T parseC(T)(string text) @trusted
 {
     import core.stdc.stdlib : strtod, strtof;
-    import std.string : toStringz;
 
     // strtod reads the NUL-terminated copy and keeps no pointer to it
     static if (is(T == float))
-        return strtof(text.toStringz, null);
+        return strtof(cText(text).ptr, null);
     else
-        return strtod(text.toStringz, null);
+        return strtod(cText(text).ptr, null);
 }
 
 private string formatShortest(T)(T value, int plainLimit)

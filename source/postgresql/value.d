@@ -32,6 +32,10 @@ import postgresql.types.geometric;
 import postgresql.types.bitstring : BitString;
 import postgresql.types.ranges : isRange, Range;
 
+// Arrays and records being converted to text by this thread, one inside the other (see Value.getString).
+private uint textNesting;
+private enum maxTextNesting = 100;
+
 /// One value of a row.
 struct Value
 {
@@ -119,14 +123,19 @@ struct Value
             return cast(string) data;
         final switch (kind)
         {
-        case TypeKind.array:
-            return arrayText();
+        case TypeKind.array, TypeKind.composite:
+            // the element and field types of binary values come from the data (anonymous records, arrays)
+            if (textNesting >= maxTextNesting)
+                throw new ProtocolException(
+                        "Malformed value: arrays and records nested too deeply");
+            textNesting++;
+            scope (exit)
+                textNesting--;
+            return kind == TypeKind.array ? arrayText() : recordText();
         case TypeKind.range:
             return rangeText(getRange());
         case TypeKind.multirange:
             return multirangeText();
-        case TypeKind.composite:
-            return recordText();
         case TypeKind.base, TypeKind.enum_, TypeKind.domain, TypeKind.pseudo:
             break;
         }
@@ -881,7 +890,19 @@ struct Value
         else static if (isFloatingPoint!U)
             return cast(T) getDouble();
         else static if (isSomeString!U)
-            return getString().to!T;
+        {
+            static if (is(string : T)) // string, const(char)[]
+                return getString();
+            else
+            {
+                import std.utf : UTFException;
+
+                try
+                    return getString().to!T;
+                catch (UTFException e) // SQL_ASCII databases pass any bytes through
+                    throw new ClientException("The value is not valid UTF-8: " ~ e.msg);
+            }
+        }
         else static if (is(U : const(ubyte)[]))
         {
             if (isNull)
@@ -1566,6 +1587,25 @@ private immutable(ubyte)[] decodeHex(const(char)[] text) @safe pure
     }
 
     assert(v(Oid.int4, [0xFF, 0xFF, 0xFF, 0xFE]).getLong() == -2);
+
+    // anonymous records in records: the field types come from the data, so the nesting is limited
+    immutable(ubyte)[] nested(size_t depth)
+    {
+        immutable(ubyte)[] record = [0, 0, 0, 0]; // no fields
+        foreach (i; 0 .. depth)
+        {
+            const n = record.length;
+            immutable(ubyte)[] field = [0, 0, 0, 1, 0, 0, 0x08, 0xC9]; // one field of type record (2249)
+            immutable(ubyte)[] length = [
+                cast(ubyte)(n >> 24), cast(ubyte)(n >> 16), cast(ubyte)(n >> 8), cast(ubyte) n
+            ];
+            record = field ~ length ~ record;
+        }
+        return record;
+    }
+
+    assert(v(2249, nested(2)).getString() == `("(""()"")")`);
+    assertThrown!ProtocolException(v(2249, nested(200)).getString());
     assert(v(Oid.int2, [0x80, 0]).getString() == "-32768");
     assert(v(Oid.oid, [0xFF, 0xFF, 0xFF, 0xFF]).getString() == "4294967295");
     assert(v(Oid.bool_, [1]).getBool() && v(Oid.bool_, [0]).getString() == "f");

@@ -60,6 +60,9 @@ final class ConnectionPool
     +/
     this(ConnectionOptions connectionOptions, PoolOptions poolOptions = PoolOptions.init) @safe
     {
+        // the caller's arrays may change later
+        connectionOptions.hosts = connectionOptions.hosts.dup;
+        connectionOptions.runtimeParameters = connectionOptions.runtimeParameters.dup;
         Poolable open() @safe
         {
             return new Connection(connectionOptions);
@@ -155,11 +158,17 @@ struct PooledConnection
 
     /++
     Returns the connection to the pool now, after resetting its session
-    (`Connection.resetSession`; a connection whose reset fails is closed).
+    (`Connection.resetSession`; a connection whose reset fails is closed) and
+    clearing `onNotice` and `onNotification`, which belong to this user.
     Calling it again does nothing.
     +/
     void release() @safe
     {
+        if (conn !is null)
+        {
+            conn.onNotice = null;
+            conn.onNotification = null;
+        }
         if (conn !is null && conn.isOpen && !conn.isBusy)
         {
             try

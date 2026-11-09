@@ -156,10 +156,10 @@ struct Numeric
             throw new ClientException("The numeric value has too many digits for a Decimal (76 at most)");
     }
 
-    /// The value as a `double` (NaN and infinities included), rounded to the nearest.
+    /// The value as a `double` (NaN and infinities included), rounded to the nearest; beyond `double.max`, an infinity.
     double toDouble() const
     {
-        import std.conv : to;
+        import std.conv : ConvException, to;
 
         final switch (kind)
         {
@@ -170,7 +170,11 @@ struct Numeric
         case Kind.negativeInfinity:
             return -double.infinity;
         case Kind.finite:
-            return toString().to!double;
+            const text = toString();
+            try
+                return text.to!double;
+            catch (ConvException) // out of range: numeric goes up to 10^131072
+                return text[0] == '-' ? -double.infinity : double.infinity;
         }
     }
 
@@ -202,6 +206,9 @@ unittest
     assert(Numeric.decode([0, 0, 0, 0, 0, 0, 0, 2]).toString() == "0.00");
     // 1e30: digit 100 at weight 7
     assert(Numeric.decode([0, 1, 0, 7, 0, 0, 0, 0, 0, 100]).toString() == "1000000000000000000000000000000");
+    // 1e400 and -1e400 (digit 1 at weight 100): beyond double
+    assert(Numeric.decode([0, 1, 0, 100, 0, 0, 0, 0, 0, 1]).toDouble() == double.infinity);
+    assert(Numeric.decode([0, 1, 0, 100, 0x40, 0, 0, 0, 0, 1]).toDouble() == -double.infinity);
     assert(Numeric.decode([0, 0, 0, 0, 0xC0, 0, 0, 0]).toString() == "NaN");
     assert(Numeric.decode([0, 0, 0, 0, 0xF0, 0, 0, 0]).toString() == "-Infinity");
     assertThrown!ClientException(Numeric.decode([0, 0, 0, 0, 0xD0, 0, 0, 0]).toDecimal());

@@ -198,6 +198,15 @@ void testTls()
     assertThrown!ConnectionException(open(o));
     o.tls.caFile = null;
     open(o).close(); // require without a CA file: not verified
+    o.sslMode = SslMode.verifyCa;
+    {
+        import std.file : exists;
+        import std.path : buildPath;
+        import postgresql.userfiles : userDirectory;
+
+        if (!exists(buildPath(userDirectory(), "root.crt"))) // verify-ca needs a CA file (libpq)
+            assertThrown!ClientException(open(o));
+    }
 
     // certificate revocation lists: sslcrl (a file) and sslcrldir (hashed names)
     {

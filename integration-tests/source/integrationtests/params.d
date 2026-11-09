@@ -316,4 +316,16 @@ void testVariantParameters()
     const text = firstRow(conn, "SELECT '17'::text, 't'::varchar, '2026-11-06'::text, '1.5'::name");
     enforce(text.getLong(0) == 17 && text.getBool(1) && text.getDate(2) == Date(2026, 11, 6)
             && text.getDouble(3) == 1.5, "getters on text values");
+
+    // more than 32767 parameters (the protocol allows 65535)
+    auto many = new Variant[40_000];
+    string sql = "SELECT array_length(ARRAY[";
+    foreach (i, ref v; many)
+    {
+        v = Variant(cast(int) i);
+        sql ~= (i ? ",?" : "?");
+    }
+    auto counted = conn.query(sql ~ "]::int[], 1)", many);
+    enforce(counted.front.getLong(0) == 40_000, "40000 parameters");
+    counted.close();
 }
