@@ -18,6 +18,17 @@ bool isSpace(char c) pure nothrow @nogc
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
 
+// Whether `s` is `lower` in any case, ASCII only (as the server's pg_strcasecmp compares).
+private bool equalsIgnoringCase(scope const(char)[] s, string lower) pure nothrow @nogc
+{
+    if (s.length != lower.length)
+        return false;
+    foreach (i, c; s)
+        if ((c >= 'A' && c <= 'Z' ? c | 0x20 : c) != lower[i])
+            return false;
+    return true;
+}
+
 /++
 An array element as the server writes it in array text: in double quotes
 (with `"` and `\` escaped by `\`) when it is empty, `NULL` in any case, or
@@ -25,9 +36,7 @@ contains `{`, `}`, `"`, `\`, the delimiter or a space.
 +/
 string quoteArrayElement(string s, char delimiter) pure
 {
-    import std.uni : sicmp;
-
-    bool quote = s.length == 0 || sicmp(s, "NULL") == 0;
+    bool quote = s.length == 0 || equalsIgnoringCase(s, "null");
     foreach (c; s)
         quote = quote || c == '{' || c == '}' || c == '"' || c == '\\' || c == delimiter || isSpace(c);
     return quote ? quoted(s, '\\') : s;
@@ -91,6 +100,20 @@ unittest
     assert(quoteRecordField(`q"x`) == `"q""x"` && quoteRecordField("") == `""` && quoteRecordField("ab") == "ab");
     assert(quoteRangeBound("2020-01-01 00:00:00") == `"2020-01-01 00:00:00"` && quoteRangeBound("5") == "5");
     assert(quoteHstore(`a"b`) == `"a\"b"`);
+}
+
+// `s` with each backslash removed and the character after it kept (a backslash at the end stays).
+private string removeBackslashes(string s) pure
+{
+    auto r = new char[s.length];
+    size_t n;
+    for (size_t k = 0; k < s.length; k++)
+    {
+        if (s[k] == '\\' && k + 1 < s.length)
+            k++;
+        r[n++] = s[k];
+    }
+    return (() @trusted => cast(string) r[0 .. n])(); // not referenced elsewhere
 }
 
 /// The parts of an array's text.
@@ -176,48 +199,47 @@ ArrayText parseArrayText(string text, char delimiter = ',') pure
             leafLevel = level;
         else if (leafLevel != level)
             fail();
+        // a slice of the text unless there are backslash escapes
         string value;
+        bool escaped;
         if (text[i] == '"')
         {
-            i++;
-            auto buf = new char[](0);
-            bool closed;
-            while (i < text.length)
+            const start = ++i;
+            while (i < text.length && text[i] != '"')
             {
                 if (text[i] == '\\' && i + 1 < text.length)
                 {
-                    buf ~= text[i + 1];
-                    i += 2;
-                }
-                else if (text[i] == '"')
-                {
+                    escaped = true;
                     i++;
-                    closed = true;
-                    break;
                 }
-                else
-                    buf ~= text[i++];
+                i++;
             }
-            if (!closed)
-                fail();
-            value = buf.length ? (() @trusted => cast(string) buf)() : ""; // not referenced elsewhere
+            if (i >= text.length)
+                fail(); // not closed
+            value = escaped ? removeBackslashes(text[start .. i]) : text[start .. i];
+            if (value.length == 0)
+                value = ""; // not NULL
+            i++;
         }
         else
         {
-            import std.uni : sicmp;
-
-            auto buf = new char[](0);
+            const start = i;
             while (i < text.length && text[i] != delimiter && text[i] != '}' && text[i] != '{' && text[i] != '"')
             {
                 if (text[i] == '\\' && i + 1 < text.length)
+                {
+                    escaped = true;
                     i++;
-                buf ~= text[i++];
+                }
+                i++;
             }
-            while (buf.length && isSpace(buf[$ - 1]))
-                buf = buf[0 .. $ - 1];
-            if (buf.length == 0)
+            value = escaped ? removeBackslashes(text[start .. i]) : text[start .. i];
+            while (value.length && isSpace(value[$ - 1]))
+                value = value[0 .. $ - 1];
+            if (value.length == 0)
                 fail();
-            value = sicmp(buf, "NULL") == 0 ? null : (() @trusted => cast(string) buf)();
+            if (equalsIgnoringCase(value, "null"))
+                value = null;
         }
         result.elements ~= value;
     }
@@ -331,6 +353,13 @@ unittest
     assertThrown!ClientException(parseArrayText(`{1,{2}}`));
     assertThrown!ClientException(parseArrayText(`{"a}`));
     assertThrown!ClientException(parseArrayText(`[1:3]={1,2}`));
+    assertThrown!ClientException(parseArrayText(`{"a\"}`));
+    assertThrown!ClientException(parseArrayText(`{,1}`));
+    a = parseArrayText(`{a\,b, c ,"d\\e",x\ }`);
+    assert(a.elements == ["a,b", "c", `d\e`, "x"], a.elements[3]);
+    const text = `{plain,"quoted"}`;
+    a = parseArrayText(text);
+    assert(&a.elements[0][0] is &text[1] && &a.elements[1][0] is &text[8]); // slices, not copies
 }
 
 /++
@@ -361,6 +390,19 @@ string[] parseRecordText(string text) pure
             fields ~= null; // NULL
         else
         {
+            // most fields: a slice of the text
+            size_t end = i;
+            while (end < text.length && text[end] != ',' && text[end] != ')' && text[end] != '"'
+                    && text[end] != '\\')
+                end++;
+            if (end < text.length && (text[end] == ',' || text[end] == ')'))
+            {
+                fields ~= text[i .. end];
+                i = end;
+                if (text[i++] == ')')
+                    break;
+                continue;
+            }
             auto buf = new char[](0);
             bool inQuotes;
             while (i < text.length && (inQuotes || (text[i] != ',' && text[i] != ')')))
@@ -411,6 +453,9 @@ unittest
     assert(f[0] is null && f[1]!is null && f[1].length == 0);
     assert(parseRecordText(`("{""a b""}","q""x")`) == [`{"a b"}`, `q"x`]);
     assert(parseRecordText(`()`) == [null]);
+    assert(parseRecordText(`(a,b"c"d,e\,f)`) == ["a", "bcd", "e,f"]);
+    const text = "(plain,2)";
+    assert(&parseRecordText(text)[0][0] is &text[1]); // a slice, not a copy
     assertThrown!ClientException(parseRecordText(`(1,2`));
 }
 
@@ -435,7 +480,6 @@ Throws: `ClientException` for malformed text.
 RangeText parseRangeText(string text) pure
 {
     import std.string : strip;
-    import std.uni : sicmp;
 
     RangeText r;
     void fail()
@@ -444,7 +488,7 @@ RangeText parseRangeText(string text) pure
     }
 
     const s = text.strip;
-    if (sicmp(s, "empty") == 0)
+    if (equalsIgnoringCase(s, "empty"))
     {
         r.empty = true;
         return r;
@@ -587,7 +631,6 @@ Throws: `ClientException` for malformed text.
 +/
 HstorePair[] parseHstoreText(string text) pure
 {
-    import std.uni : sicmp;
 
     HstorePair[] pairs;
     size_t i;
@@ -649,7 +692,7 @@ HstorePair[] parseHstoreText(string text) pure
             fail();
         i += 2;
         const value = item();
-        pairs ~= HstorePair(key, !value.quoted && sicmp(value.text, "NULL") == 0 ? null : value.text);
+        pairs ~= HstorePair(key, !value.quoted && equalsIgnoringCase(value.text, "null") ? null : value.text);
         skipSpaces();
         if (i < text.length)
         {

@@ -103,8 +103,6 @@ struct Numeric
     /// The value as PostgreSQL prints it: exact, with `displayScale` digits after the point; `NaN`, `Infinity`.
     string toString() const pure
     {
-        import std.format : format;
-
         final switch (kind)
         {
         case Kind.nan:
@@ -114,31 +112,98 @@ struct Numeric
         case Kind.negativeInfinity:
             return "-Infinity";
         case Kind.finite:
-            break;
+            auto text = new char[textLength];
+            writeText(text);
+            return (() @trusted => cast(string) text)(); // unique: allocated here
         }
-        ushort digitAt(long i) // base-10000 digit with weight `i`
-        {
-            const index = weight - i;
-            return index >= 0 && index < digits.length ? digits[cast(size_t) index] : 0;
-        }
+    }
 
-        string text = negative ? "-" : "";
+    /++
+    The value as a `long`, when it is integral (`isIntegral`).
+
+    Throws: `ClientException` if it is out of `long`'s range.
+    +/
+    package(postgresql) long toLong() const pure
+    {
+        assert(isIntegral);
+        ulong magnitude;
+        bool fits = true;
+        for (long w = weight; w >= 0 && fits; w--)
+        {
+            const d = digitAt(w);
+            fits = magnitude <= (ulong.max - d) / 10_000;
+            magnitude = magnitude * 10_000 + d;
+        }
+        if (fits && negative && magnitude <= cast(ulong) long.max + 1)
+            return cast(long)(0 - magnitude); // two's complement: also right for long.min
+        if (fits && !negative && magnitude <= long.max)
+            return cast(long) magnitude;
+        throw new ClientException("The numeric value " ~ toString() ~ " is out of long's range");
+    }
+
+    // The base-10000 digit with weight `i` (0 beyond the stored digits).
+    private ushort digitAt(long i) const pure nothrow @nogc
+    {
+        const index = weight - i;
+        return index >= 0 && index < digits.length ? digits[cast(size_t) index] : 0;
+    }
+
+    // The length of the text of a finite value.
+    private size_t textLength() const pure nothrow @nogc
+    {
+        size_t length = negative ? 1 : 0;
         if (weight < 0)
-            text ~= "0";
+            length += 1;
         else
         {
-            text ~= format("%d", digitAt(weight));
+            const first = digitAt(weight);
+            length += (first >= 1000 ? 4 : first >= 100 ? 3 : first >= 10 ? 2 : 1) + 4 * cast(size_t) weight;
+        }
+        return displayScale > 0 ? length + 1 + displayScale : length;
+    }
+
+    // Writes the text of a finite value into `text` (`textLength` characters).
+    private void writeText(scope char[] text) const pure nothrow @nogc
+    {
+        size_t at;
+        void group(ushort d, size_t width) // the last `width` of its 4 digits
+        {
+            foreach_reverse (k; 0 .. width)
+            {
+                text[at + k] = cast(char)('0' + d % 10);
+                d /= 10;
+            }
+            at += width;
+        }
+
+        if (negative)
+            text[at++] = '-';
+        if (weight < 0)
+            text[at++] = '0';
+        else
+        {
+            const first = digitAt(weight);
+            group(first, first >= 1000 ? 4 : first >= 100 ? 3 : first >= 10 ? 2 : 1);
             foreach_reverse (i; 0 .. weight)
-                text ~= format("%04d", digitAt(i));
+                group(digitAt(i), 4);
         }
         if (displayScale > 0)
         {
-            string fraction;
-            for (long i = -1; fraction.length < displayScale; i--)
-                fraction ~= format("%04d", digitAt(i));
-            text ~= "." ~ fraction[0 .. displayScale];
+            text[at++] = '.';
+            for (long i = -1; at < text.length; i--)
+            {
+                const left = text.length - at;
+                if (left >= 4)
+                    group(digitAt(i), 4);
+                else
+                {
+                    ushort d = digitAt(i);
+                    foreach (k; left .. 4)
+                        d /= 10; // the first `left` digits
+                    group(d, left);
+                }
+            }
         }
-        return text;
     }
 
     /++
@@ -150,17 +215,19 @@ struct Numeric
     {
         if (kind != Kind.finite)
             throw new ClientException("A numeric " ~ toString() ~ " can't be a Decimal");
+        char[128] buffer;
+        const length = textLength;
+        auto text = length <= buffer.length ? buffer[0 .. length] : new char[length];
+        writeText(text);
         try
-            return Decimal.fromString(toString());
+            return Decimal.fromString(text);
         catch (Exception e)
             throw new ClientException("The numeric value has too many digits for a Decimal (76 at most)");
     }
 
-    /// The value as a `double` (NaN and infinities included), rounded to the nearest; beyond `double.max`, an infinity.
+    /// The value as a `double` (NaN and infinities included), correctly rounded; beyond `double.max`, an infinity.
     double toDouble() const
     {
-        import std.conv : ConvException, to;
-
         final switch (kind)
         {
         case Kind.nan:
@@ -170,16 +237,53 @@ struct Numeric
         case Kind.negativeInfinity:
             return -double.infinity;
         case Kind.finite:
-            const text = toString();
-            try
-                return text.to!double;
-            catch (ConvException) // out of range: numeric goes up to 10^131072
-                return text[0] == '-' ? -double.infinity : double.infinity;
+            break;
         }
+        if (digits.length == 0)
+            return 0;
+        // all the digits and an exponent, `[-]dddd...e-n`: no decimal point, which would depend on the locale
+        char[256] stack;
+        const length = 4 * digits.length + 16; // sign, digits, "e-", up to 6 exponent digits, NUL
+        auto text = length <= stack.length ? stack[] : new char[length];
+        size_t at;
+        if (negative)
+            text[at++] = '-';
+        foreach (digit; digits)
+        {
+            ushort d = digit;
+            foreach_reverse (k; 0 .. 4)
+            {
+                text[at + k] = cast(char)('0' + d % 10);
+                d /= 10;
+            }
+            at += 4;
+        }
+        long exponent = 4 * (weight - cast(long) digits.length + 1);
+        text[at++] = 'e';
+        if (exponent < 0)
+        {
+            text[at++] = '-';
+            exponent = -exponent;
+        }
+        char[20] digitsOfExponent;
+        size_t e = digitsOfExponent.length;
+        do
+        {
+            digitsOfExponent[--e] = cast(char)('0' + exponent % 10);
+            exponent /= 10;
+        }
+        while (exponent);
+        text[at .. at + digitsOfExponent.length - e] = digitsOfExponent[e .. $];
+        at += digitsOfExponent.length - e;
+        text[at] = 0;
+        // strtod rounds correctly and gives an infinity beyond double.max; it keeps no pointer to the text
+        return (() @trusted { import core.stdc.stdlib : strtod;
+
+        return strtod(&text[0], null); })();
     }
 
     /// Whether the value is finite and has no fractional part (whatever its display scale).
-    @property bool isIntegral() const pure nothrow
+    @property bool isIntegral() const pure nothrow @nogc
     {
         if (kind != Kind.finite)
             return false;
@@ -210,6 +314,28 @@ unittest
     assert(Numeric.decode([0, 1, 0, 100, 0, 0, 0, 0, 0, 1]).toDouble() == double.infinity);
     assert(Numeric.decode([0, 1, 0, 100, 0x40, 0, 0, 0, 0, 1]).toDouble() == -double.infinity);
     assert(Numeric.decode([0, 0, 0, 0, 0xC0, 0, 0, 0]).toString() == "NaN");
+    // 0.1 (dscale 1), 12.5 (digits 12, 5000, dscale 3), -1000.00001 (dscale 5)
+    assert(Numeric.decode([0, 1, 0xFF, 0xFF, 0, 0, 0, 1, 0x03, 0xE8]).toDouble() == 0.1);
+    const n2 = Numeric.decode([0, 2, 0, 0, 0, 0, 0, 3, 0, 12, 0x13, 0x88]);
+    assert(n2.toString() == "12.500" && n2.toDouble() == 12.5 && n2.toDecimal().toFixedString() == "12.500");
+    const n3 = Numeric.decode([0, 3, 0, 0, 0x40, 0, 0, 5, 0x03, 0xE8, 0, 0, 0x03, 0xE8]);
+    assert(n3.toString() == "-1000.00001" && n3.toDouble() == -1000.00001);
+    assert(Numeric.decode([0, 1, 0, 0, 0, 0, 0, 2, 0, 5]).toLong() == 5); // 5.00
+    // long.min = -9223372036854775808: digits 922, 3372, 0368, 5477, 5808 at weights 4 .. 0
+    assert(Numeric.decode([
+        0, 5, 0, 4, 0x40, 0, 0, 0, 0x03, 0x9A, 0x0D, 0x2C, 0x01, 0x70, 0x15, 0x65, 0x16, 0xB0
+    ])
+        .toLong() == long.min);
+    assertThrown!ClientException(Numeric.decode([
+        0, 5, 0, 4, 0, 0, 0, 0, 0x03, 0x9A, 0x0D, 0x2C, 0x01, 0x70, 0x15,
+        0x65, 0x16, 0xB0
+    ]).toLong()); // 9223372036854775808
+    assertThrown!ClientException(Numeric.decode([0, 1, 0, 100, 0, 0, 0, 0, 0, 1]).toLong()); // 10^400
+    // the longest exponent: many digits at the lowest weight (only a malformed value has them)
+    ubyte[] bytes = [0, 62, 0x80, 0, 0x40, 0, 0, 0];
+    foreach (i; 0 .. 62)
+        bytes ~= [ubyte(0), 1];
+    assert(Numeric.decode(bytes).toDouble() == -0.0);
     assert(Numeric.decode([0, 0, 0, 0, 0xF0, 0, 0, 0]).toString() == "-Infinity");
     assertThrown!ClientException(Numeric.decode([0, 0, 0, 0, 0xD0, 0, 0, 0]).toDecimal());
     assertThrown!ProtocolException(Numeric.decode([0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10])); // digit 10000

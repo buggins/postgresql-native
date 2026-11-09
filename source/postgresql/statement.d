@@ -15,7 +15,8 @@ module postgresql.statement;
 
 import postgresql.connection : Connection;
 import postgresql.exception : ClientException;
-import postgresql.params : encodeParam, hasVariant, Param;
+import postgresql.params : hasVariant, nullValue, putParam;
+import postgresql.protocol.messages : MessageBuilder;
 import postgresql.result : ColumnInfo, QueryResult;
 
 import std.variant : Variant;
@@ -35,79 +36,108 @@ package struct StatementInfo
     ColumnInfo[] columns;
 }
 
-/// Encodes the arguments for the parameter types of a statement.
-package alias ParamEncoder = Param[]delegate(const(uint)[] types) @safe;
+/++
+Writes the parameter part of a Bind message (the format codes, then the
+values) for the parameter types of a statement.
++/
+package alias ParamEncoder = void delegate(const(uint)[] types, ref MessageBuilder b) @safe;
 
 /++
-Makes the encoder for `args`: checks their number against the statement's
-parameters and encodes each for its type.
+Writes the parameter part of a Bind message for `args`, encoded for
+`types`; checks their number first.
++/
+package void putArgs(Args...)(ref MessageBuilder b, const(uint)[] types, ref Args args)
+{
+    checkParameterCount(types.length, Args.length);
+    const formats = beginParameters(b, Args.length);
+    static foreach (i; 0 .. Args.length)
+        setFormat(b, formats, i, putArg(b, args[i], types[i]));
+}
+
+/// Fills in the format code of parameter `i` (see `beginParameters`) from what `putParam` returned.
+package void setFormat(ref MessageBuilder b, size_t formats, size_t i, short written) @safe pure nothrow
+{
+    b.patchInt16(formats + 2 * i, written == nullValue ? 0 : written);
+}
+
+// One argument of putArgs.
+private short putArg(T)(ref MessageBuilder b, ref T arg, uint type)
+{
+    static if (hasVariant!T)
+        return (() @trusted => putParam(b, arg, type))(); // a Variant copy: it holds a plain value
+    else
+        return putParam(b, arg, type);
+}
+
+/++
+Starts the parameter part of a Bind message for `count` values: returns
+the position of the format codes, which `patchInt16` fills in as the
+values are written.
++/
+package size_t beginParameters(ref MessageBuilder b, size_t count) @safe pure nothrow
+{
+    b.putInt16(cast(short) count); // a uint16 on the server
+    const formats = b.skip(2 * count);
+    b.putInt16(cast(short) count);
+    return formats;
+}
+
+/// Throws `ClientException` unless as many values as parameters were given.
+package void checkParameterCount(size_t parameters, size_t values) @safe pure
+{
+    import std.conv : to;
+
+    if (parameters != values)
+        throw new ClientException("The statement has " ~ parameters.to!string ~ " parameter(s), but "
+                ~ values.to!string ~ " value(s) were given");
+}
+
+/++
+Makes an encoder that keeps a copy of `args`, for use after the call (pipelines).
 +/
 package ParamEncoder makeEncoder(Args...)(Args args)
 {
     // the values are copied into an object: a closure can't hold values with destructors (Variant)
-    auto holder = new ArgsHolder!Args;
-    static foreach (i; 0 .. Args.length)
-    {
-        static if (hasVariant!(Args[i]))
-            (() @trusted { holder.args[i] = args[i]; })(); // a Variant copy: it holds a plain value
-        else
-            holder.args[i] = args[i];
-    }
+    static if (hasVariant!Args)
+        auto holder = (() @trusted => new ArgsHolder!Args(args))(); // Variant copies: they hold plain values
+    else
+        auto holder = new ArgsHolder!Args(args);
     return &holder.encode;
 }
 
 /++
-Makes the encoder for values known only at run time: each `Variant` holds
-a parameter type of `encodeParam` (an empty `Variant` or `null`: NULL).
+Writes the parameter part of a Bind message for values known only at run
+time: each `Variant` holds a parameter type of `encodeParam` (an empty
+`Variant` or `null`: NULL).
 +/
-package ParamEncoder makeVariantEncoder(const Variant[] values) @trusted
+package void putVariants(ref MessageBuilder b, const(uint)[] types, const Variant[] values) @trusted
 {
-    // copies of Variants holding plain values
-    auto holder = new VariantHolder;
-    holder.values = (cast(Variant[]) values).dup;
-    return &holder.encode;
-}
+    // Variant accessors; plain values
+    import postgresql.params : putVariant;
 
-private final class VariantHolder
-{
-    Variant[] values;
-
-    Param[] encode(const(uint)[] types) @trusted // Variant accessors; plain values
-    {
-        import std.conv : to;
-        import postgresql.params : encodeVariant;
-
-        if (types.length != values.length)
-            throw new ClientException("The statement has " ~ types.length.to!string ~ " parameter(s), but "
-                    ~ values.length.to!string ~ " value(s) were given");
-        auto params = new Param[values.length];
-        foreach (i, v; values)
-            params[i] = encodeVariant(v, types[i]);
-        return params;
-    }
+    checkParameterCount(types.length, values.length);
+    const formats = beginParameters(b, values.length);
+    foreach (i, v; values)
+        setFormat(b, formats, i, putVariant(b, cast() v, types[i]));
 }
 
 private final class ArgsHolder(Args...)
 {
     Args args;
 
+    this(Args args)
+    {
+        this.args = args; // initialized here: `Args` may be const
+    }
+
     static if (hasVariant!Args)
         enum attributes = "@trusted"; // copies of Variant values, which hold plain values
     else
         enum attributes = "@safe";
 
-    mixin("Param[] encode(const(uint)[] types) " ~ attributes ~ q{
+    mixin("void encode(const(uint)[] types, ref MessageBuilder b) " ~ attributes ~ q{
     {
-        import std.conv : to;
-
-        if (types.length != Args.length)
-            throw new ClientException("The statement has " ~ types.length.to!string ~ " parameter(s), but "
-                    ~ Args.length.to!string ~ " value(s) were given");
-        Param[] params;
-        params.reserve(Args.length);
-        static foreach (i; 0 .. Args.length)
-            params ~= encodeParam(args[i], types[i]);
-        return params;
+        putArgs(b, types, args);
     }
     });
 }
@@ -250,10 +280,15 @@ final class PreparedStatement
     QueryResult query(Args...)(Args args)
     {
         checkOpen();
-        static if (hasVariant!Args)
-            return (() @trusted => conn.runStatement(info, makeEncoder(args)))(); // Variant copies
-        else
-            return conn.runStatement(info, makeEncoder(args));
+        void encode(const(uint)[] types, ref MessageBuilder b)
+        {
+            static if (hasVariant!Args)
+                (() @trusted => putArgs(b, types, args))(); // Variant copies: they hold plain values
+            else
+                putArgs(b, types, args);
+        }
+
+        return conn.runStatement(info, &encode);
     }
 
     /++
@@ -265,7 +300,12 @@ final class PreparedStatement
     QueryResult query(const Variant[] args)
     {
         checkOpen();
-        return conn.runStatement(info, makeVariantEncoder(args));
+        void encode(const(uint)[] types, ref MessageBuilder b)
+        {
+            putVariants(b, types, args);
+        }
+
+        return conn.runStatement(info, &encode);
     }
 
     /// ditto, returning the number of rows affected (see `Connection.exec`).

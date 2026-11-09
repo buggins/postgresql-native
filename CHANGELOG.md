@@ -6,7 +6,29 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- Benchmarks (`dub run :bench -b release`, #35): queries, parameters,
+  inserts, value conversions and COPY against an in-memory fake server;
+  results in `doc/benchmarks.md`.
+
 ### Changed
+
+- Performance (#35, `doc/benchmarks.md`): rows are decoded from one copy of
+  each DataRow (values are slices of it; rows over 16 KiB copy each value),
+  and message bodies are read in place; parameters are
+  encoded straight into the Bind message, which each connection reuses;
+  `?` placeholders are rewritten once for repeated SQL; `insert` builds its
+  SQL once per call; COPY IN escapes runs at once and sends large data
+  without copying it; COPY OUT fields are slices of the data; numeric,
+  date/time, `inet` and array text are written without `format`; rows read
+  by column name use an index for results of 32 or more columns. Typical
+  gains: 3-4 times for reading rows and COPY OUT, 5-6 times for statements
+  with parameters, 10 times or more for `insert` and array parameters.
+- `exec` with parameters skips the rows without decoding them; notices
+  are parsed only when `onNotice` is set.
+- `parseTextLine` and `parseCsvLine` return slices of the line for fields
+  without escapes or doubled quotes.
 
 - dbwire 0.9 (`~>0.9.0`): from its code review, robustness fixes (huge TZif
   counts, a socket that can't be created moves on to the next address),
@@ -76,6 +98,16 @@ From the code review (#34):
   `runtimeParameters` of their options, which the caller may change later.
 - Geometric values and float text no longer depend on the C library's
   locale (`setlocale(LC_NUMERIC, ...)` with a decimal comma broke them).
+
+From the performance work (#35):
+
+- `query`, `exec` and `PreparedStatement.query`/`exec` with a `const`
+  argument (e.g. a `const Date`), and `Pipeline.add` with one, failed to
+  compile.
+- `getLong` (and `get!int`, ...) of an integral numeric with a scale, e.g.
+  `5.00` from a `numeric(10,2)` column, threw "out of long's range".
+- `getDouble` of a numeric is correctly rounded (it went through Phobos'
+  `to!double`, which can be one unit in the last place off).
 
 ## 0.5.0 (2026-11-07)
 

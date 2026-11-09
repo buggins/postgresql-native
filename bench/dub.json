@@ -1,0 +1,10 @@
+{
+    "name": "bench",
+    "description": "postgresql-native benchmarks (run with -b release)",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "targetName": "postgresql-native-bench",
+    "dependencies": {
+        "postgresql-native": { "path": "../" }
+    }
+}

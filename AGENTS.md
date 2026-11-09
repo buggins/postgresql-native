@@ -54,6 +54,7 @@ dub run :integration-tests-vibe1                           # ... with vibe-core 
 POSTGRES_HOST=localhost:15418 POSTGRES_PASSWORD=Test_password123 dub run :integration-tests-phobos
 sh integration-tests/setup-server.sh pgnative-18      # TLS + a user per authentication method, then add:
 POSTGRES_SETUP=1
+dub run :bench -b release [-- --filter copyOut/]           # benchmarks (doc/benchmarks.md); compare the min column
 ```
 
 Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). The server comes from `POSTGRES_HOST` (`host:port`), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (`integrationtests.server`); these are deliberately not libpq's `PG*` variables, which `fromEnvironment` reads. Tests that change process environment variables (`HOME`, `PG*`) restore them.
@@ -94,7 +95,16 @@ source/postgresql/
 integration-tests/     shared harness (dub subpackage `:integration-tests`), setup-server.sh, tls/ (test certificates)
 integration-tests-phobos/, integration-tests-vibe/, integration-tests-vibe1/   runners
 examples/              basic (`:example-basic`), vibe (`:example-vibe`); connect with fromEnvironment(args[1])
+bench/                 benchmarks (`:bench`, local runs only): runner.d (timing, GC stats), fakeserver.d (in-memory
+                       server: a Transport answering the frontend messages), cases.d; results in doc/benchmarks.md
+doc/                   hand-written documentation (benchmarks.md)
 ```
+
+Hot paths (#35): a `Message` body is a slice of the reader's buffer, valid until the next read; `Row` values are
+slices of one copy of the DataRow (rows over 16 KiB copy each value, so a kept small value doesn't keep a large one;
+null = NULL, empty values are never null; no shared arena: a kept value keeps only its row);
+parameters are written straight into the Bind message (`putParam`, `ParamEncoder` writes format codes and values;
+`encodeParam` is a wrapper over it); `MessageBuilder` writes by index into reused memory and can't be copied.
 
 ## Protocol behaviour learned from real servers
 

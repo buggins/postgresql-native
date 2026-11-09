@@ -21,7 +21,7 @@ module postgresql.pipeline;
 
 import postgresql.connection : affectedRows, Connection;
 import postgresql.exception : ServerException, ServerMessage;
-import postgresql.params : hasVariant, rewritePlaceholders;
+import postgresql.params : hasVariant;
 import postgresql.result : ColumnInfo, Row;
 import postgresql.statement : makeEncoder, ParamEncoder;
 
@@ -96,8 +96,7 @@ final class Pipeline
         }
         else
         {
-            size_t count;
-            sqls ~= conn.options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
+            sqls ~= conn.rewriteSql(sql);
             static if (hasVariant!Args)
                 encoders ~= (() @trusted => makeEncoder(args))(); // Variant copies
             else

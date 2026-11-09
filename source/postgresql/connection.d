@@ -25,7 +25,7 @@ import postgresql.exception;
 import postgresql.protocol.codes;
 import postgresql.protocol.messages;
 import postgresql.result;
-import postgresql.params : hasVariant, Param, rewritePlaceholders;
+import postgresql.params : hasVariant, rewritePlaceholders;
 import postgresql.mapping : fieldPositions, hasVariantField, insertSql, mappedFields, readStruct, readValue,
     RowRange, RowsEncoder;
 import postgresql.pipeline;
@@ -78,6 +78,8 @@ final class Connection : Poolable
     package ConnectionOptions options;
     private IoBackend backend;
     private Thread owner; // fiber mode: the thread the connection belongs to
+    private MessageBuilder request; // the Bind and Execute messages of a request, reused
+    private string lastSql, lastRewritten; // see rewriteSql
     private Transport transport;
     private TlsTransport tls;
     package MessageStream stream;
@@ -309,12 +311,15 @@ final class Connection : Poolable
             return runSql(sql, null);
         else
         {
-            size_t count;
-            const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
-            static if (hasVariant!Args)
-                return (() @trusted => runSql(text, makeEncoder(args)))(); // Variant copies
-            else
-                return runSql(text, makeEncoder(args));
+            void encode(const(uint)[] types, ref MessageBuilder b)
+            {
+                static if (hasVariant!Args)
+                    (() @trusted => putArgs(b, types, args))(); // Variant copies: they hold plain values
+                else
+                    putArgs(b, types, args);
+            }
+
+            return runSql(rewriteSql(sql), &encode);
         }
     }
 
@@ -329,9 +334,12 @@ final class Connection : Poolable
     +/
     QueryResult query(string sql, const Variant[] args)
     {
-        size_t count;
-        const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
-        return runSql(text, makeVariantEncoder(args));
+        void encode(const(uint)[] types, ref MessageBuilder b)
+        {
+            putVariants(b, types, args);
+        }
+
+        return runSql(rewriteSql(sql), &encode);
     }
 
     /// ditto, returning the number of rows affected (see `exec(sql, args...)`).
@@ -444,6 +452,7 @@ final class Connection : Poolable
         enum batchRows = min(1000, 65_535 / width);
 
         auto encoder = new RowsEncoder!E;
+        string fullBatchSql; // the same for every full batch
         ulong inserted;
         bool began;
         scope (failure)
@@ -459,7 +468,7 @@ final class Connection : Poolable
         }
         for (;;)
         {
-            encoder.rows.length = 0;
+            encoder.clear();
             while (!rows.empty && encoder.rows.length < batchRows)
             {
                 static if (hasVariantField!E)
@@ -475,7 +484,10 @@ final class Connection : Poolable
                 begin();
                 began = true;
             }
-            inserted += drainCount(runSql(insertSql!E(table, encoder.rows.length), &encoder.encode));
+            const n = encoder.rows.length;
+            if (n == batchRows && fullBatchSql is null)
+                fullBatchSql = insertSql!E(table, n);
+            inserted += drainCount(runSql(n == batchRows ? fullBatchSql : insertSql!E(table, n), &encoder.encode));
             if (rows.empty)
                 break;
         }
@@ -501,13 +513,29 @@ final class Connection : Poolable
     +/
     PreparedStatement prepare(string sql)
     {
-        size_t count;
-        const text = options.rewritePlaceholders ? rewritePlaceholders(sql, count) : sql;
+        const text = rewriteSql(sql);
         startRequest();
         auto info = describeStatement(text, nextStatementName("pgn_p"));
         sync(); // ends the Parse/Describe batch
         finishResponse();
         return new PreparedStatement(this, info);
+    }
+
+    /++
+    `sql` with `?` placeholders rewritten (when the option is on). The last
+    text is remembered: a loop running the same SQL rewrites it once.
+    +/
+    package string rewriteSql(string sql)
+    {
+        if (!options.rewritePlaceholders)
+            return sql;
+        if (sql !is lastSql) // the same characters at the same address: the same text
+        {
+            size_t count;
+            lastRewritten = rewritePlaceholders(sql, count);
+            lastSql = sql;
+        }
+        return lastRewritten;
     }
 
     /// Number of statements in the statement cache.
@@ -519,8 +547,7 @@ final class Connection : Poolable
     /// Reads a result to its end and returns the affected-row count of its command tag.
     package static ulong drainCount(QueryResult r)
     {
-        while (!r.empty)
-            r.popFront();
+        r.skipRows();
         return affectedRows(r.commandTag);
     }
 
@@ -532,7 +559,7 @@ final class Connection : Poolable
     }
 
     // Runs `sql` (one statement) through the statement cache.
-    private QueryResult runSql(string sql, ParamEncoder encode)
+    private QueryResult runSql(string sql, scope ParamEncoder encode)
     {
         foreach (attempt; 0 .. 2)
         {
@@ -563,7 +590,7 @@ final class Connection : Poolable
     }
 
     // Runs a prepared statement (PreparedStatement.query).
-    package QueryResult runStatement(StatementInfo info, ParamEncoder encode)
+    package QueryResult runStatement(StatementInfo info, scope ParamEncoder encode)
     {
         startRequest();
         return execute(info, encode, false).result;
@@ -582,14 +609,14 @@ final class Connection : Poolable
         bool retry;
     }
 
-    private Outcome execute(StatementInfo info, ParamEncoder encode, bool mayRetry)
+    private Outcome execute(StatementInfo info, scope ParamEncoder encode, bool mayRetry)
     {
         // everything is encoded before anything is sent: a value that can't be sent leaves the stream intact
-        MessageBuilder b;
+        alias b = request;
+        b.clear();
         try
         {
-            const params = encode is null ? checkNoParameters(info) : encode(info.parameterTypes);
-            appendBindExecute(b, info, params);
+            appendBindExecute(b, info, encode);
             b.begin(FrontendMessage.sync);
             b.finish();
         }
@@ -601,6 +628,7 @@ final class Connection : Poolable
         bool failed;
         guarded({
             sendRequest(b.data);
+            releaseLargeRequest();
 
             for (;;)
             {
@@ -631,28 +659,20 @@ final class Connection : Poolable
         return Outcome(new QueryResult(this, info.columns, null, false), false);
     }
 
-    // Bind (unnamed portal) and Execute (all rows) for a parsed statement.
-    private void appendBindExecute(ref MessageBuilder b, const StatementInfo info, const Param[] params)
+    // Bind (unnamed portal, parameters from `encode`) and Execute (all rows) for a parsed statement.
+    private void appendBindExecute(ref MessageBuilder b, const StatementInfo info, scope ParamEncoder encode)
     {
         b.begin(FrontendMessage.bind);
         b.putCString(""); // the unnamed portal
         b.putCString(info.name);
-        b.putInt16(cast(short) params.length);
-        foreach (p; params)
-            b.putInt16(p.format);
-        b.putInt16(cast(short) params.length);
-        foreach (p; params)
+        if (encode is null)
         {
-            if (p.isNull)
-                b.putInt32(-1);
-            else
-            {
-                if (p.data.length > int.max)
-                    throw new ClientException("A parameter value is longer than 2 GB");
-                b.putInt32(cast(int) p.data.length);
-                b.putBytes(p.data);
-            }
+            checkParameterCount(info.parameterTypes.length, 0);
+            b.putInt16(0); // no format codes
+            b.putInt16(0); // no values
         }
+        else
+            encode(info.parameterTypes, b);
         b.putInt16(cast(short) info.columns.length);
         foreach (c; info.columns)
             b.putInt16(c.format);
@@ -663,15 +683,11 @@ final class Connection : Poolable
         b.finish();
     }
 
-    private static Param[] checkNoParameters(const StatementInfo info)
+    // Frees the request builder's memory after a large request (e.g. a big bytea value).
+    private void releaseLargeRequest() nothrow
     {
-        import std.conv : to;
-
-        if (info.parameterTypes.length)
-            throw new ClientException(
-                    "The statement has " ~ info.parameterTypes.length.to!string
-                    ~ " parameter(s), but no values were given");
-        return null;
+        if (request.capacity > 1 << 20)
+            request = MessageBuilder.init;
     }
 
     /++
@@ -1045,7 +1061,7 @@ final class Connection : Poolable
                     typeQueryPrepared = true;
                     break;
                 case BackendMessage.dataRow:
-                    const row = parseDataRow(m.body, columns);
+                    const row = parseDataRow(m.data, columns, null, null);
                     TypeRow t;
                     t.name = row.getString(1);
                     const kind = row.getString(2);
@@ -1217,13 +1233,13 @@ final class Connection : Poolable
                     infos[i] = infos[*first];
 
         // encode everything before sending anything
-        MessageBuilder b;
+        alias b = request;
+        b.clear();
         try
         {
             foreach (i, info; infos)
             {
-                const params = encoders[i] is null ? checkNoParameters(info) : encoders[i](info.parameterTypes);
-                appendBindExecute(b, info, params);
+                appendBindExecute(b, info, encoders[i]);
                 if (!transactional)
                 {
                     b.begin(FrontendMessage.sync);
@@ -1248,6 +1264,7 @@ final class Connection : Poolable
         auto results = new PipelineResult[sqls.length];
         guarded({
             sendRequest(b.data);
+            releaseLargeRequest();
 
             const zone = parameterStatus("TimeZone");
             bool aborted;
@@ -1268,7 +1285,7 @@ final class Connection : Poolable
                     case BackendMessage.bindComplete, BackendMessage.closeComplete:
                         break; // CloseComplete: the pending closes sent before the first Bind
                     case BackendMessage.dataRow:
-                        r.rows ~= parseDataRow(m.body, info.columns, zone);
+                        r.rows ~= parseDataRow(m.data, info.columns, zone, null);
                         break;
                     case BackendMessage.commandComplete:
                         r.commandTag = m.body.readCString();
@@ -1901,10 +1918,27 @@ final class Connection : Poolable
 
     // --- results ---
 
-    /// Reads the next row of the current result; `has` is false at its end (CommandComplete or an error).
-    package void nextRow(const(ColumnInfo)[] columns, string timeZone, ref Row row, ref bool has, ref string tag)
+    /++
+    Reads past the rest of the rows of the current result, without decoding
+    them (see `nextRow`); `scratch` is not changed.
+    +/
+    package void skipRows(ref Row scratch, ref string tag)
     {
-        has = false;
+        readRows(null, null, null, scratch, tag, true);
+    }
+
+    /// Reads the next row of the current result; `has` is false at its end (CommandComplete or an error).
+    package void nextRow(const(ColumnInfo)[] columns, string timeZone, const(ColumnIndex)* names, ref Row row,
+            ref bool has, ref string tag)
+    {
+        has = readRows(columns, timeZone, names, row, tag, false);
+    }
+
+    // nextRow (true: a row); with `skip`, reads past all the rows to the end of the result.
+    private bool readRows(const(ColumnInfo)[] columns, string timeZone, const(ColumnIndex)* names, ref Row row,
+            ref string tag, bool skip)
+    {
+        bool has;
         guarded({
             for (;;)
             {
@@ -1912,7 +1946,9 @@ final class Connection : Poolable
                 switch (m.type)
                 {
                 case BackendMessage.dataRow:
-                    row = parseDataRow(m.body, columns, timeZone);
+                    if (skip)
+                        break;
+                    row = parseDataRow(m.data, columns, timeZone, names);
                     has = true;
                     return;
                 case BackendMessage.commandComplete:
@@ -1932,6 +1968,7 @@ final class Connection : Poolable
                 }
             }
         });
+        return has;
     }
 
     /++
@@ -2035,7 +2072,7 @@ final class Connection : Poolable
         switch (m.type)
         {
         case BackendMessage.noticeResponse:
-            notice(ServerMessage.parse(m.body));
+            notice(m);
             return true;
         case BackendMessage.parameterStatus:
             auto b = m.body;
@@ -2118,10 +2155,10 @@ final class Connection : Poolable
         }
     }
 
-    private void notice(ServerMessage n)
+    private void notice(Message m)
     {
         if (onNotice !is null)
-            onNotice(n);
+            onNotice(ServerMessage.parse(m.body)); // parsed only when someone listens
     }
 
     /++
@@ -2571,7 +2608,7 @@ final class Connection : Poolable
                 cancelKey = key.idup;
                 break;
             case BackendMessage.noticeResponse:
-                notice(ServerMessage.parse(m.body));
+                notice(m);
                 break;
             case BackendMessage.negotiateProtocolVersion:
                 negotiateVersion(m);
@@ -2709,7 +2746,7 @@ final class Connection : Poolable
                 negotiateVersion(m);
                 break;
             case BackendMessage.noticeResponse:
-                notice(ServerMessage.parse(m.body));
+                notice(m);
                 break;
             default:
                 throw new ProtocolException("Unexpected message '" ~ m.type ~ "' during authentication");
@@ -2907,8 +2944,48 @@ version (unittest)
 
     private enum readyIdle = message('Z', ['I']);
 
-    // Connects to `t` after feeding it a trust login.
-    private Connection mockConnection(MockTransport t, size_t cacheSize = 100)
+    // `MockTransport` that never reports data as available, as a server that waits for the client.
+    private final class QuietTransport : Transport
+    {
+        private MockTransport inner;
+
+        this(MockTransport inner)
+        {
+            this.inner = inner;
+        }
+
+        override size_t read(scope ubyte[] buffer)
+        {
+            return inner.read(buffer);
+        }
+
+        override void write(scope const(ubyte)[] data)
+        {
+            inner.write(data);
+        }
+
+        override bool dataAvailable()
+        {
+            return false;
+        }
+
+        override void close() nothrow
+        {
+            inner.close();
+        }
+
+        override bool connected() const nothrow
+        {
+            return inner.connected;
+        }
+
+        override void setTimeouts(Duration receive, Duration send)
+        {
+        }
+    }
+
+    // Connects to `t` after feeding it a trust login; `quiet`: through a `QuietTransport`.
+    private Connection mockConnection(MockTransport t, size_t cacheSize = 100, bool quiet = false)
     {
         t.feed(message('R', wire32(0)) ~ message('K', wire32(42) ~ wire32(7))
                 ~ message('S', cstring("server_version") ~ cstring("18.0"))
@@ -2920,7 +2997,7 @@ version (unittest)
         o.statementCacheSize = cacheSize;
         Transport factory(string, ushort, Duration)
         {
-            return t;
+            return quiet ? cast(Transport) new QuietTransport(t) : t;
         }
 
         o.transportFactory = &factory;
@@ -3066,6 +3143,28 @@ unittest
     assert(!c.isOpen);
 }
 
+// Arguments: const values (they used to fail to compile), Variants
+@system unittest
+{
+    import std.datetime.date : Date;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    const day = Date(2026, 11, 9);
+    const long id = 7;
+    t.feed(message('1') ~ message('t', wire16(2) ~ wire32(Oid.date) ~ wire32(Oid.int8)) ~ message(
+            'n') ~ message('2')
+            ~ message('C', cstring("UPDATE 1")) ~ readyIdle);
+    assert(c.exec("UPDATE t SET d = $1 WHERE id = $2", day, id) == 1);
+    t.feed(message('2') ~ message('C', cstring("UPDATE 2")) ~ readyIdle);
+    assert(c.exec("UPDATE t SET d = $1 WHERE id = $2", Variant(Date(2026, 11, 9)), Variant(8L)) == 2);
+    t.feed(message('2') ~ message('C', cstring("UPDATE 3")) ~ readyIdle);
+    assert(c.query("UPDATE t SET d = $1 WHERE id = $2", Variant(Date(2026, 11, 9)), Variant(9L))
+            .commandTag
+            == "UPDATE 3");
+
+}
+
 // A fiber-mode connection used from another thread: refused, and close() doesn't touch the socket
 unittest
 {
@@ -3084,4 +3183,105 @@ unittest
     assert(c.isOpen && t.written.length == 0);
     c.close();
     assert(!c.isOpen && t.written.length == 0); // no Terminate
+}
+
+version (unittest)
+{
+    // The payloads of the CopyData messages in `bytes`, concatenated.
+    private const(ubyte)[] copyData(const(ubyte)[] bytes)
+    {
+        const(ubyte)[] data;
+        while (bytes.length >= 5)
+        {
+            const length = bytes[1] << 24 | bytes[2] << 16 | bytes[3] << 8 | bytes[4];
+            if (bytes[0] == 'd')
+                data ~= bytes[5 .. 1 + length];
+            bytes = bytes[1 + length .. $];
+        }
+        return data;
+    }
+}
+
+// COPY IN rows: text and CSV escaping, NULL, a failed row leaves nothing behind, large raw data
+unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t, 100, true);
+    foreach (format; [CopyFormat.text, CopyFormat.csv])
+    {
+        t.feed(message('G', [ubyte(0)] ~ wire16(3) ~ wire16(0) ~ wire16(0) ~ wire16(0)));
+        auto copy = c.copyIn("COPY t FROM STDIN", format);
+        t.clearWritten();
+        copy.writeRow(1, "a\tb\\c\nd\re", null);
+        assertThrown!ClientException(copy.writeRow(2, "x", 70_000L, 4)); // 4 values for 3 columns
+        assertThrown!ClientException(copy.writeRow(2, "x", Nullable!int.init, ubyte(1)));
+        copy.writeRow(3, `say "hi"`, Nullable!int(7));
+        t.feed(message('C', cstring("COPY 2")) ~ readyIdle);
+        assert(copy.finish() == 2);
+        const expected = format == CopyFormat.text ? "1\ta\\tb\\\\c\\nd\\re\t\\N\n3\tsay \"hi\"\t7\n"
+            : "\"1\",\"a\tb\\c\nd\re\",\n\"3\",\"say \"\"hi\"\"\",\"7\"\n";
+        assert(cast(const(char)[]) copyData(t.written) == expected, cast(const(char)[]) copyData(t.written));
+    }
+
+    // raw data larger than the buffer goes in a message of its own
+    t.feed(message('G', [ubyte(0)] ~ wire16(1) ~ wire16(0)));
+    auto copy = c.copyIn("COPY t FROM STDIN");
+    t.clearWritten();
+    copy.write("1\n");
+    auto big = new ubyte[100_000];
+    big[] = 'x';
+    big[$ - 1] = '\n';
+    copy.write(big);
+    copy.write("2\n");
+    t.feed(message('C', cstring("COPY 3")) ~ readyIdle);
+    assert(copy.finish() == 3);
+    assert(frontendMessages(t.written) == "d d d c ", frontendMessages(t.written));
+    assert(copyData(t.written) == cast(const(ubyte)[]) "1\n" ~ big ~ cast(const(ubyte)[]) "2\n");
+}
+
+// Binary COPY IN rows: binary values, text converted for text types, jsonb and numeric; the trailer
+unittest
+{
+    import postgresql.types.pgtype : builtinType;
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t, 100, true);
+
+    // a first row that fails leaves no header behind (nor a trailer at the end)
+    t.feed(message('G', [ubyte(1)] ~ wire16(1) ~ wire16(1)));
+    auto failed = c.copyIn("COPY t FROM STDIN (FORMAT binary)");
+    t.clearWritten();
+    assertThrown!ClientException(failed.writeRow(1)); // no column types
+    t.feed(message('C', cstring("COPY 0")) ~ readyIdle);
+    assert(failed.finish() == 0 && frontendMessages(t.written) == "c ", frontendMessages(t.written));
+
+    t.feed(message('G', [ubyte(1)] ~ wire16(4) ~ wire16(1) ~ wire16(1) ~ wire16(1) ~ wire16(1)));
+    auto copy = c.copyIn("COPY t FROM STDIN (FORMAT binary)");
+    t.clearWritten();
+    assertThrown!ClientException(copy.writeRow(5, "ab", `{"a":1}`, "1.5")); // no types: the header is undone too
+    copy.setTypes([
+        builtinType(Oid.int4), builtinType(Oid.text), builtinType(Oid.jsonb), builtinType(Oid.numeric)
+    ]);
+    copy.writeRow(5, "ab", `{"a":1}`, "1.5");
+    assertThrown!ClientException(copy.writeRow(6, "cd", "{}", "not a number"));
+    copy.writeRow(7, null, null, "-2");
+    t.feed(message('C', cstring("COPY 2")) ~ readyIdle);
+    assert(copy.finish() == 2);
+    immutable(ubyte)[] header = cast(immutable(ubyte)[]) "PGCOPY\n\xff\r\n\0" ~ wire32(0) ~ wire32(0);
+    const row1 = wire16(4) ~ wire32(4) ~ wire32(5) ~ wire32(2) ~ cast(immutable(ubyte)[]) "ab" ~ wire32(
+            8)
+        ~ cast(immutable(ubyte)[]) "\x01{\"a\":1}" ~ wire32(12) ~ wire16(2) ~ wire16(0) ~ wire16(
+                0) ~ wire16(1)
+        ~ wire16(1) ~ wire16(5000); // numeric 1.5: digits 1 and 5000, scale 1
+    const row2 = wire16(4) ~ wire32(4) ~ wire32(7) ~ wire32(-1) ~ wire32(-1) ~ wire32(10) ~ wire16(
+            1) ~ wire16(0)
+        ~ wire16(0x4000) ~ wire16(0) ~ wire16(2);
+    {
+        import std.format : format;
+
+        assert(copyData(t.written) == header ~ row1 ~ row2 ~ wire16(-1), format("%(%02x %)", copyData(t.written)));
+    }
 }

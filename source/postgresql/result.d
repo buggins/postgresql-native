@@ -81,13 +81,17 @@ package ColumnInfo[] parseRowDescription(MessageBody body)
 /++
 One row of a result. `row[i]` and `row["name"]` give a `Value`; the getters
 here are shortcuts for the same calls on it (see `postgresql.value.Value`).
+
+The values of a row share one copy of the row's data (rows over 16 KiB copy
+each value): a value kept after the row, such as the string of `getString`
+or the bytes of `getRaw`, keeps that copy in memory.
 +/
 struct Row
 {
     private const(ColumnInfo)[] columns_;
-    private immutable(immutable(ubyte)[])[] values;
-    private immutable(bool)[] nulls;
+    private immutable(immutable(ubyte)[])[] values; // null for NULL; empty values are not null
     private string timeZone;
+    private const(ColumnIndex)* names; // for results with many columns
 
     /// The columns of the result.
     @property const(ColumnInfo)[] columns() const pure nothrow
@@ -109,7 +113,7 @@ struct Row
     Value opIndex(size_t index) const
     {
         check(index);
-        return Value(&columns_[index], values[index], nulls[index], timeZone);
+        return Value(&columns_[index], values[index], values[index] is null, timeZone);
     }
 
     /++
@@ -173,9 +177,15 @@ struct Row
     +/
     size_t columnIndex(string name) const
     {
-        foreach (i, c; columns_)
-            if (c.name == name)
-                return i;
+        if (names !is null)
+        {
+            if (auto i = name in names.byName)
+                return *i;
+        }
+        else
+            foreach (i, c; columns_)
+                if (c.name == name)
+                    return i;
         throw new ClientException("No column named '" ~ name ~ "'");
     }
 
@@ -190,40 +200,71 @@ struct Row
     }
 }
 
-/// A `Row` of `values` (null for NULL when `nulls` says so) for `columns`.
-package Row makeRow(const(ColumnInfo)[] columns, immutable(ubyte)[][] values, bool[] nulls, string timeZone)
+/++
+A `Row` of `values` for `columns`: null for NULL; empty values must not be
+null (e.g. `""` or an empty slice of a larger array).
++/
+package Row makeRow(const(ColumnInfo)[] columns, immutable(ubyte)[][] values, string timeZone)
 {
     Row row;
     row.columns_ = columns;
     row.values = (() @trusted => cast(immutable) values)(); // the caller hands them over
-    row.nulls = (() @trusted => cast(immutable) nulls)(); // ditto
     row.timeZone = timeZone;
     return row;
 }
 
-/// Parses a DataRow body into a `Row` for `columns`.
-package Row parseDataRow(MessageBody body, const(ColumnInfo)[] columns, string timeZone = null)
+/// The column of each name (the first one with it).
+package struct ColumnIndex
 {
-    const count = body.readInt16();
-    if (count != columns.length)
+    size_t[string] byName;
+}
+
+/// The `ColumnIndex` of `columns` when there are enough of them for it to pay off; else null.
+package const(ColumnIndex)* columnNameIndex(const(ColumnInfo)[] columns)
+{
+    if (columns.length < 32)
+        return null; // a few string comparisons are cheaper than building it
+    auto index = new ColumnIndex;
+    foreach_reverse (i, c; columns)
+        index.byName[c.name] = i;
+    return index;
+}
+
+/++
+Parses a DataRow body into a `Row` for `columns`. A row up to 16 KiB is
+copied at once and its values are slices of the copy (a value kept longer
+keeps that row's memory); a larger row, which has a large value, copies each
+value on its own, so that keeping a small one doesn't keep the large one.
++/
+package Row parseDataRow(scope const(ubyte)[] body, const(ColumnInfo)[] columns, string timeZone,
+        const(ColumnIndex)* names)
+{
+    static immutable ubyte[1] none;
+    if (body.length < 2 || (body[0] << 8 | body[1]) != columns.length)
         throw new ProtocolException("DataRow has a different number of values than the row description");
+    const separate = body.length > 16 * 1024;
+    const copy = separate ? null : body.idup;
+    auto values = new immutable(ubyte)[][columns.length];
+    size_t at = 2;
+    foreach (ref v; values)
+    {
+        if (body.length - at < 4)
+            throw new ProtocolException("Truncated DataRow");
+        const length = cast(int)(body[at] << 24 | body[at + 1] << 16 | body[at + 2] << 8 | body[at + 3]);
+        at += 4;
+        if (length == -1)
+            continue; // NULL: a null slice
+        if (length < 0 || length > body.length - at)
+            throw new ProtocolException("Invalid value length");
+        // not null even when empty: `copy` holds at least the count
+        v = !separate ? copy[at .. at + length] : length ? body[at .. at + length].idup : none[0 .. 0];
+        at += length;
+    }
     Row row;
     row.columns_ = columns;
-    row.timeZone = timeZone;
-    auto values = new immutable(ubyte)[][count];
-    auto nulls = new bool[count];
-    foreach (i; 0 .. count)
-    {
-        const length = body.readInt32();
-        if (length == -1)
-            nulls[i] = true;
-        else if (length < 0)
-            throw new ProtocolException("Invalid value length");
-        else
-            values[i] = body.readBytes(length).idup;
-    }
     row.values = (() @trusted => cast(immutable) values)(); // not referenced elsewhere
-    row.nulls = (() @trusted => cast(immutable) nulls)(); // ditto
+    row.timeZone = timeZone;
+    row.names = names;
     return row;
 }
 
@@ -239,14 +280,47 @@ unittest
     assert(columns[0].columnNumber == 1 && columns[1].typeSize == -1 && columns[1].typeModifier == -1);
 
     static immutable ubyte[] data = cast(immutable(ubyte)[]) "\x00\x02\x00\x00\x00\x0242\xFF\xFF\xFF\xFF";
-    auto row = parseDataRow(MessageBody(data, 'D'), columns);
+    auto row = parseDataRow(data, columns, null, null);
     assert(row.getString(0) == "42" && row.getString("id") == "42" && row.isNull("name") && row.getString(1) is null);
     assertThrown!ClientException(row.getString(2));
     assertThrown!ClientException(row.getString("nope"));
-    assertThrown!ProtocolException(parseDataRow(MessageBody(data[0 .. 7], 'D'), columns));
-    assertThrown!ProtocolException(
-            parseDataRow(MessageBody(cast(immutable(ubyte)[]) "\x00\x01\x00\x00\x00\x00",
-            'D'), columns));
+    assertThrown!ProtocolException(parseDataRow(data[0 .. 7], columns, null, null));
+    assertThrown!ProtocolException(parseDataRow(data[0 .. 1], columns, null, null));
+    assertThrown!ProtocolException(parseDataRow(cast(immutable(ubyte)[]) "\x00\x01\x00\x00\x00\x00", columns,
+            null, null));
+    assertThrown!ProtocolException(parseDataRow(cast(immutable(ubyte)[]) "\x00\x02\x00\x00\x00\x05ab", columns,
+            null, null));
+
+    // an empty value is not NULL
+    row = parseDataRow(cast(immutable(ubyte)[]) "\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00", columns, null,
+            null);
+    assert(!row.isNull(0) && row.getString(0) == "" && row.getRaw(0) !is null);
+
+    // a large row: each value copied on its own (an empty one still not NULL)
+    immutable(ubyte)[] large = cast(immutable(ubyte)[]) "\x00\x02\x00\x00\x00\x00\x00\x00\x50\x00";
+    large ~= new immutable(ubyte)[0x5000];
+    row = parseDataRow(large, columns, null, null);
+    assert(!row.isNull(0) && row.getRaw(0) !is null && row.getRaw(1).length == 0x5000);
+
+    // many columns: by name through an index; the first column of a name wins
+    import std.conv : to;
+
+    auto wide = new ColumnInfo[40];
+    foreach (i, ref c; wide)
+        c.name = i == 39 ? "c3" : "c" ~ i.to!string;
+    immutable(ubyte)[] values = [0, 40];
+    foreach (i; 0 .. 40)
+        values ~= [0, 0, 0, 1, cast(ubyte)('0' + i % 10)];
+    row = parseDataRow(values, wide, null, columnNameIndex(wide));
+    assert(row.getString("c7") == "7" && row.getString("c3") == "3" && row.columnIndex("c0") == 0);
+    assertThrown!ClientException(row.getString("c40"));
+    assert(columnNameIndex(columns) is null);
+
+    // rows copy out of const ones, and assign
+    const(Row) constant = row;
+    Row copy = constant;
+    copy = constant;
+    assert(copy.getString("c7") == "7");
 }
 
 /++
@@ -264,6 +338,7 @@ final class QueryResult
 {
     private Connection conn;
     private ColumnInfo[] columns_;
+    private const(ColumnIndex)* names; // see columnNameIndex
     private Row current;
     private bool hasCurrent;
     private bool done; // the server's response has been read up to ReadyForQuery
@@ -278,6 +353,7 @@ final class QueryResult
         this.conn = conn;
         this.timeZone = conn.parameterStatus("TimeZone");
         this.columns_ = columns;
+        this.names = columnNameIndex(columns);
         this.tag = tag;
         this.rowsDone = rowsDone;
         if (rowsDone)
@@ -357,6 +433,7 @@ final class QueryResult
             return false;
         hasNext = false;
         columns_ = nextColumns;
+        names = columnNameIndex(columns_);
         nextColumns = null;
         tag = null;
         rowsDone = false;
@@ -364,12 +441,26 @@ final class QueryResult
         return true;
     }
 
+    // Reads past the rest of the rows (for their command tag) without decoding them.
+    package void skipRows()
+    {
+        hasCurrent = false;
+        if (rowsDone)
+            return;
+        conn.skipRows(current, tag);
+        rowsDone = true;
+        if (conn.nextResult(nextColumns))
+            hasNext = true;
+        else
+            finish();
+    }
+
     private void advance()
     {
         hasCurrent = false;
         if (rowsDone)
             return;
-        conn.nextRow(columns_, timeZone, current, hasCurrent, tag);
+        conn.nextRow(columns_, timeZone, names, current, hasCurrent, tag);
         if (!hasCurrent)
         {
             rowsDone = true;
