@@ -42,10 +42,16 @@ project uses [semantic versioning](https://semver.org/).
   `postgresql.mapping.hasVariantField` was removed.
 - Connection keyword values (`sslmode`, `target_session_attrs`, ...) map to
   their enum members by name, no longer by position (#37).
+- `float4`/`float8` text (`getString` of binary values, geometric types,
+  float arrays, float parameters sent as text, COPY IN rows) takes its digits
+  from dbwire's `shortestDigits` (#36) instead of trying `%e` precisions with
+  `strtod` and a `BigInt` tie check: the same text, about 7 times faster and
+  80 instead of about 1.5 KB allocated per typical value.
 
-- dbwire 0.9 (`~>0.9.0`): from its code review, robustness fixes (huge TZif
+- dbwire 0.9 (`~>0.9.2`): from its code review, robustness fixes (huge TZif
   counts, a socket that can't be created moves on to the next address),
-  faster charset conversions, fewer allocations, and dip1000 builds.
+  faster charset conversions, fewer allocations, and dip1000 builds; 0.9.2
+  adds the shortest float digits.
 - `connect_timeout=0` waits without a time limit, as in libpq. It used to
   mean the default of 15 seconds, because dbwire 0.8 failed at once on a
   zero timeout. `ConnectionOptions.connectTimeout = Duration.zero` means the

@@ -61,5 +61,18 @@ absolute numbers). Minimum time in ms, allocated bytes per row.
 `params/exec 6 mixed types` takes a `const Date`, which did not compile
 before #35; its "before" was measured with a mutable one.
 
-The COPY IN `writeRow` cases spend most of their time formatting the `double`
-value as text (`formatFloat8`, shortest digits by trial); #36 replaces that.
+The COPY IN `writeRow` cases spent most of their time formatting the `double`
+value as text (`formatFloat8`, shortest digits by trial); #36 replaced that.
+
+Issue #36 (float text from dbwire's `shortestDigits`), same setup:
+
+| case | rows | before ms | after ms | speed-up | before B/row | after B/row |
+|---|---:|---:|---:|---:|---:|---:|
+| value/float8 getString | 100000 | 716.96 | 106.29 | 6.7× | 1568 | 80 |
+| value/float8 getString 1e-300 | 100000 | 7802.00 | 3607.50 | 2.2× | 2832 | 24864 |
+| copyIn/text writeRow 5 fields | 100000 | 191.50 | 31.55 | 6.1× | 592 | 16 |
+| copyIn/csv writeRow 5 fields | 100000 | 193.38 | 31.63 | 6.1× | 592 | 16 |
+
+`value/float8 getString` formats `0.30000000000000004` (17 digits); doubles
+from about 1e-20 to 1e35 take this path. Larger and smaller magnitudes
+(`1e-300` here) need `BigInt` arithmetic in dbwire, which allocates more.
