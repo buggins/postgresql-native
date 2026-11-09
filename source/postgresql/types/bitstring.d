@@ -6,6 +6,8 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.types.bitstring;
 
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
+
 import postgresql.exception : ClientException, ProtocolException;
 
 @safe:
@@ -32,7 +34,7 @@ struct BitString
         auto text = new char[length];
         foreach (i, ref c; text)
             c = this[i] ? '1' : '0';
-        return (() @trusted => cast(string) text)(); // not referenced elsewhere
+        return text;
     }
 
     /++
@@ -42,6 +44,12 @@ struct BitString
     +/
     static BitString parse(string text) pure
     {
+        return BitString(text.length, parseBits(text));
+    }
+
+    // The bytes of the bits in `text`.
+    private static immutable(ubyte)[] parseBits(string text) pure
+    {
         auto bytes = new ubyte[(text.length + 7) / 8];
         foreach (i, c; text)
         {
@@ -50,14 +58,14 @@ struct BitString
             else if (c != '0')
                 throw new ClientException("Invalid bit string '" ~ text ~ "'");
         }
-        return BitString(text.length, (() @trusted => cast(immutable) bytes)()); // not referenced elsewhere
+        return bytes;
     }
 
     /// The binary format (`bit_send`): an int32 bit count, then the bytes.
     immutable(ubyte)[] toBinary() const pure
     {
         const n = cast(uint) length;
-        return [cast(ubyte)(n >> 24), cast(ubyte)(n >> 16), cast(ubyte)(n >> 8), cast(ubyte) n] ~ bytes;
+        return toBigEndian(n) ~ bytes;
     }
 
     /++
@@ -69,7 +77,7 @@ struct BitString
     {
         if (data.length < 4)
             throw new ProtocolException("Malformed bit string value");
-        const n = cast(uint)(data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]);
+        const n = fromBigEndian!uint(data[0 .. 4]);
         if (data.length != 4 + (cast(size_t) n + 7) / 8)
             throw new ProtocolException("Malformed bit string value");
         return BitString(n, data[4 .. $].idup);

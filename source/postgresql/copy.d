@@ -27,6 +27,8 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.copy;
 
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
+
 import postgresql.connection : affectedRows, Connection;
 import postgresql.exception : ClientException, ServerException;
 import postgresql.params : nullValue, putParam;
@@ -35,6 +37,7 @@ import postgresql.protocol.messages : Message, MessageBuilder;
 import postgresql.result : ColumnInfo, makeRow, Row, ValueFormat;
 import postgresql.types.oids : Oid;
 import postgresql.types.pgtype : builtinType, PgType;
+import postgresql.types.textformat : hexValue;
 
 /// The data format of a `COPY` (its `FORMAT` option).
 enum CopyFormat
@@ -48,7 +51,7 @@ enum CopyFormat
 }
 
 /// The signature at the start of binary `COPY` data.
-private static immutable ubyte[11] binarySignature = [
+private immutable ubyte[11] binarySignature = [
     'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0
 ];
 
@@ -124,10 +127,7 @@ final class CopyIn
                     if (data.length > int.max - 4)
                         throw new ClientException("A COPY data chunk is longer than 2 GB");
                     const length = cast(uint)(data.length + 4);
-                    header[1 .. 5] = [
-                        cast(ubyte)(length >> 24), cast(ubyte)(length >> 16), cast(ubyte)(length >> 8),
-                        cast(ubyte) length
-                    ];
+                    header[1 .. 5] = toBigEndian(length)[];
                     conn.stream.write(header[]);
                     conn.stream.send(data);
                 });
@@ -154,7 +154,7 @@ final class CopyIn
     Throws: `ClientException` for a wrong number of values, or a value that
     has no binary form for its column (binary format); as `write`.
     +/
-    void writeRow(Args...)(Args values)
+    void writeRow(Args...)(auto ref Args values)
     {
         import std.conv : to;
 
@@ -692,7 +692,8 @@ final class CopyOut
                     "A COPY row has " ~ fields.length.to!string ~ " field(s), expected "
                     ~ columnCount_.to!string);
         // the fields are slices of the line or new strings, "" when empty: null only for NULL, as makeRow needs
-        current = makeRow(columns, (() @trusted => cast(immutable(ubyte)[][]) fields)(), timeZone); // chars as bytes
+        // a string has the layout of an immutable(ubyte)[]; the row only reads the fields
+        current = makeRow(columns, (() @trusted => cast(const(immutable(ubyte)[])[]) fields)(), timeZone);
         hasCurrent = true;
     }
 
@@ -716,7 +717,7 @@ final class CopyOut
 
         int int32()
         {
-            const v = binaryData[at] << 24 | binaryData[at + 1] << 16 | binaryData[at + 2] << 8 | binaryData[at + 3];
+            const v = fromBigEndian!int(binaryData[at .. $][0 .. 4]);
             at += 4;
             return v;
         }
@@ -795,7 +796,9 @@ string[] parseTextLine(string line) @safe pure
 // A field with backslash escapes, decoded.
 private string unescapeText(string field) @safe pure
 {
-    char[] current;
+    import std.ascii : isHexDigit;
+
+    string current = ""; // not null: null is NULL
     size_t i;
     while (i < field.length)
     {
@@ -835,7 +838,7 @@ private string unescapeText(string field) @safe pure
             break;
         case 'x':
             int value, digits;
-            while (digits < 2 && i < field.length && isHex(field[i]))
+            while (digits < 2 && i < field.length && isHexDigit(field[i]))
             {
                 value = value * 16 + hexValue(field[i++]);
                 digits++;
@@ -858,17 +861,7 @@ private string unescapeText(string field) @safe pure
             current ~= e;
         }
     }
-    return current.length ? (() @trusted => cast(string) current)() : ""; // unique: built here
-}
-
-private bool isHex(char c) @safe pure nothrow
-{
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
-private int hexValue(char c) @safe pure nothrow
-{
-    return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+    return current;
 }
 
 ///
@@ -944,7 +937,7 @@ string[] parseCsvLine(string line) @safe pure
 // A CSV field with doubled quotes, or with quoted and unquoted parts, from `i` to its comma (or the end).
 private string parseCsvField(string line, ref size_t i) @safe pure
 {
-    char[] current;
+    string current = ""; // not null: null is NULL
     while (i < line.length)
     {
         const c = line[i];
@@ -973,7 +966,7 @@ private string parseCsvField(string line, ref size_t i) @safe pure
         current ~= c;
         i++;
     }
-    return current.length ? (() @trusted => cast(string) current)() : ""; // unique: built here
+    return current;
 }
 
 ///

@@ -18,8 +18,34 @@ bool isSpace(char c) pure nothrow @nogc
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
 
-// Whether `s` is `lower` in any case, ASCII only (as the server's pg_strcasecmp compares).
-private bool equalsIgnoringCase(scope const(char)[] s, string lower) pure nothrow @nogc
+/// `prefix`, then `data` in hexadecimal digits (lowercase, or uppercase if `upper`).
+package(postgresql) string hexText(scope const(ubyte)[] data, string prefix = "", bool upper = false) pure nothrow
+{
+    const digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    auto text = new char[prefix.length + data.length * 2];
+    text[0 .. prefix.length] = prefix;
+    foreach (i, b; data)
+    {
+        text[prefix.length + 2 * i] = digits[b >> 4];
+        text[prefix.length + 2 * i + 1] = digits[b & 15];
+    }
+    return text;
+}
+
+/// The value of the hexadecimal digit `c` (one for which `std.ascii.isHexDigit` is true).
+package(postgresql) int hexValue(char c) pure nothrow @nogc
+{
+    return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+}
+
+@safe pure nothrow unittest
+{
+    assert(hexText([0x01, 0xAB], `\x`) == `\x01ab` && hexText([0xAB], "", true) == "AB" && hexText(null) == "");
+    assert(hexValue('0') == 0 && hexValue('9') == 9 && hexValue('a') == 10 && hexValue('F') == 15);
+}
+
+/// Whether `s` is `lower` in any case, ASCII only (as the server's pg_strcasecmp compares).
+package(postgresql) bool equalsIgnoringCase(scope const(char)[] s, string lower) pure nothrow @nogc
 {
     if (s.length != lower.length)
         return false;
@@ -47,7 +73,7 @@ A record field as the server writes it in record text: in double quotes
 (with `"` and `\` doubled) when it is empty or contains a parenthesis,
 `,`, `"`, `\` or a space.
 +/
-string quoteRecordField(string s) pure
+string quoteRecordField(string s) pure nothrow
 {
     bool quote = s.length == 0;
     foreach (c; s)
@@ -60,7 +86,7 @@ A range bound as the server writes it in range text: in double quotes (with
 `"` and `\` doubled) when it is empty or contains a parenthesis, a
 bracket, `,`, `"`, `\` or a space.
 +/
-string quoteRangeBound(string s) pure
+string quoteRangeBound(string s) pure nothrow
 {
     bool quote = s.length == 0;
     foreach (c; s)
@@ -70,13 +96,13 @@ string quoteRangeBound(string s) pure
 }
 
 /// A key or value as `hstore` writes it: always in double quotes, `"` and `\` escaped by `\`.
-string quoteHstore(string s) pure
+string quoteHstore(scope const(char)[] s) pure nothrow
 {
     return quoted(s, '\\');
 }
 
 // s in double quotes; `"` and `\` preceded by `escape`, or doubled when escape is 0
-private string quoted(string s, char escape) pure
+private string quoted(scope const(char)[] s, char escape) pure nothrow
 {
     auto r = new char[](0);
     r.reserve(s.length + 2);
@@ -88,7 +114,7 @@ private string quoted(string s, char escape) pure
         r ~= c;
     }
     r ~= '"';
-    return (() @trusted => cast(string) r)(); // not referenced elsewhere
+    return r;
 }
 
 ///
@@ -113,7 +139,7 @@ private string removeBackslashes(string s) pure
             k++;
         r[n++] = s[k];
     }
-    return (() @trusted => cast(string) r[0 .. n])(); // not referenced elsewhere
+    return r[0 .. n];
 }
 
 /// The parts of an array's text.
@@ -403,7 +429,7 @@ string[] parseRecordText(string text) pure
                     break;
                 continue;
             }
-            auto buf = new char[](0);
+            string buf = ""; // a quoted empty field is an empty string, not NULL
             bool inQuotes;
             while (i < text.length && (inQuotes || (text[i] != ',' && text[i] != ')')))
             {
@@ -429,7 +455,7 @@ string[] parseRecordText(string text) pure
                 else
                     buf ~= c;
             }
-            fields ~= buf.length ? (() @trusted => cast(string) buf)() : ""; // quoted empty: an empty string
+            fields ~= buf;
         }
         if (i >= text.length)
             fail();
@@ -502,7 +528,7 @@ RangeText parseRangeText(string text) pure
     {
         if (i < s.length && (s[i] == end))
             return null; // omitted: infinite
-        auto buf = new char[](0);
+        string buf = ""; // a quoted empty bound is an empty string, not infinite
         bool inQuotes, any;
         while (i < s.length && (inQuotes || (s[i] != end)))
         {
@@ -531,7 +557,7 @@ RangeText parseRangeText(string text) pure
         }
         if (!any)
             return null;
-        return buf.length ? (() @trusted => cast(string) buf)() : "";
+        return buf;
     }
 
     r.lower = bound(',');
@@ -654,7 +680,7 @@ HstorePair[] parseHstoreText(string text) pure
     Item item()
     {
         skipSpaces();
-        auto buf = new char[](0);
+        string buf = ""; // a quoted empty key or value is an empty string, not NULL
         if (i < text.length && text[i] == '"')
         {
             i++;
@@ -670,7 +696,7 @@ HstorePair[] parseHstoreText(string text) pure
                 else
                     buf ~= c;
             }
-            return Item(buf.length ? (() @trusted => cast(string) buf)() : "", true);
+            return Item(buf, true);
         }
         while (i < text.length && !isSpace(text[i]) && text[i] != ',' && text[i] != '=')
         {
@@ -680,7 +706,7 @@ HstorePair[] parseHstoreText(string text) pure
         }
         if (buf.length == 0)
             fail();
-        return Item((() @trusted => cast(string) buf)(), false);
+        return Item(buf, false);
     }
 
     skipSpaces();

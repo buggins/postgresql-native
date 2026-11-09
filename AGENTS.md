@@ -141,6 +141,7 @@ Checked on 13, 14, 16 and 18 (official Docker images).
 ## Conventions
 
 - `@safe` by default; small commented `@trusted` blocks only in I/O and reinterpret-cast hot paths.
+- `Variant` copies, assignments and destruction are `@system`. Parameters are taken by `auto ref` down to `putParam`/`putVariant` (`ref const Variant`), so a `Variant` argument is never copied; only `ArgsHolder` (pipelines) copies one, in a commented trusted lambda. `Connection.queryRow` and `insert` copy or assign struct values: they sit before the class's `@safe:` label so they infer their attributes; keep them there (a template under `@safe:` is bound to `@safe`), and don't wrap them in trusted lambdas.
 - **Every public symbol gets a Ddoc comment**; documented unittests as usage examples.
 - Every type gets golden-byte unit tests and server round trips in both I/O modes; cover NULLs, extremes, non-ASCII text, time zones, infinities and special values (NaN, ±infinity dates/timestamps).
 
@@ -180,7 +181,7 @@ Learned from the review of the MySQL 8 work in mysql-native (mysql-d/mysql-nativ
   - **`debug` statements** may break `pure`, `nothrow` and `@nogc`, which helps temporary logging. They compile only with `-debug`; don't leave them in committed code.
   - **`scope` and `return scope`** are checked only in `@safe` code compiled with `-preview=dip1000`, which is still not the default (D 2.113, August 2026).
     - Without that switch, `scope` is an unchecked promise. With it, callers may pass stack memory to a `scope` parameter, so a `@trusted` or `@system` function that keeps such a parameter has a memory bug.
-    - dbwire and clickhoused are dip1000-clean on current compilers: CI runs their unit tests with `-preview=dip1000` on dmd-latest and ldc-latest (dbwire#50, clickhoused#71). Older Phobos isn't: 2.097's `std.socket` has no `scope` annotations. postgresql-native, oracle-native and mssql-native haven't been checked yet. Don't add `scope` speculatively.
+    - dbwire, clickhoused and postgresql-native are dip1000-clean on current compilers: CI runs their unit tests with `-preview=dip1000` on dmd-latest and ldc-latest (dbwire#50, clickhoused#71, postgresql-native#37). Older Phobos isn't: 2.097's `std.socket` has no `scope` annotations. oracle-native and mssql-native haven't been checked yet. Don't add `scope` speculatively.
 - **Changes to someone else's code: keep the diff small.** Keep the existing structure, and change the input instead of the cases. For example, when MySQL 8.4 inserted a `Language` column after `Type` in `SHOW PROCEDURE STATUS` (5.7, 8.0 and MariaDB don't have it; the manual doesn't list it), the fix kept the old switch on column numbers: skip column 3 when there are 12 columns, and shift the later indexes down by one.
 - **Check facts before writing them down.** Verify server behaviour on the real servers, since manuals lag behind. Take CI failure reasons from the job logs, not from memory. A wrong reason in a commit message had to be corrected during that review.
 - **CI facts (November 2026):**

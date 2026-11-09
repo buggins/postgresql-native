@@ -15,7 +15,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module postgresql.protocol.messages;
 
 import dbwire.exception : ProtocolException;
-import dbwire.io.buffer : BufferedReader, BufferedWriter;
+import dbwire.io.buffer : BufferedReader, BufferedWriter, fromBigEndian, isFixedWireType, toBigEndian;
 import dbwire.io.transport : Transport;
 
 @safe:
@@ -78,7 +78,7 @@ struct MessageBody
     short readInt16() pure
     {
         need(2);
-        const v = cast(short)((data[pos] << 8) | data[pos + 1]);
+        const v = fromBigEndian!short(data[pos .. $][0 .. 2]);
         pos += 2;
         return v;
     }
@@ -87,9 +87,9 @@ struct MessageBody
     int readInt32() pure
     {
         need(4);
-        const v = (cast(uint) data[pos] << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3];
+        const v = fromBigEndian!int(data[pos .. $][0 .. 4]);
         pos += 4;
-        return cast(int) v;
+        return v;
     }
 
     /// Reads `n` bytes (a slice of the body).
@@ -217,12 +217,10 @@ struct MessageBuilder
         putBigEndian(v);
     }
 
-    /// Appends a big-endian integer of any size.
-    void putBigEndian(T)(T v) if (__traits(isIntegral, T))
+    /// Appends a big-endian number of any size (integers, floating point).
+    void putBigEndian(T)(T v) if (isFixedWireType!T)
     {
-        auto bytes = extend(T.sizeof);
-        static foreach (i; 0 .. T.sizeof)
-            bytes[i] = cast(ubyte)(v >> (8 * (T.sizeof - 1 - i)));
+        extend(T.sizeof)[0 .. T.sizeof] = toBigEndian(v);
     }
 
     /// Appends raw bytes.
@@ -259,17 +257,13 @@ struct MessageBuilder
     /// Writes a big-endian integer at position `at` (of bytes appended before).
     void patchInt16(size_t at, short v) pure nothrow
     {
-        buffer[at] = cast(ubyte)(v >> 8);
-        buffer[at + 1] = cast(ubyte) v;
+        buffer[at .. at + 2][0 .. 2] = toBigEndian(v);
     }
 
     /// ditto
     void patchInt32(size_t at, int v) pure nothrow
     {
-        buffer[at] = cast(ubyte)(v >> 24);
-        buffer[at + 1] = cast(ubyte)(v >> 16);
-        buffer[at + 2] = cast(ubyte)(v >> 8);
-        buffer[at + 3] = cast(ubyte) v;
+        buffer[at .. at + 4][0 .. 4] = toBigEndian(v);
     }
 
     /++
@@ -369,7 +363,7 @@ final class MessageStream
     {
         const header = reader.ensure(5);
         const type = cast(char) header[0];
-        const length = (cast(uint) header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
+        const length = fromBigEndian!uint(header[1 .. 5]);
         if (length < 4 || length - 4 > maxMessageLength)
             throw new ProtocolException("Invalid length of a '" ~ type ~ "' message");
         const size = length - 4;

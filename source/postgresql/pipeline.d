@@ -21,7 +21,6 @@ module postgresql.pipeline;
 
 import postgresql.connection : affectedRows, Connection;
 import postgresql.exception : ServerException, ServerMessage;
-import postgresql.params : hasVariant;
 import postgresql.result : ColumnInfo, Row;
 import postgresql.statement : makeEncoder, ParamEncoder;
 
@@ -87,7 +86,7 @@ final class Pipeline
     Adds a statement with its parameter values (placeholders as in
     `Connection.query`). Returns its index in the results.
     +/
-    size_t add(Args...)(string sql, Args args)
+    size_t add(Args...)(string sql, auto ref Args args)
     {
         static if (Args.length == 0)
         {
@@ -97,10 +96,7 @@ final class Pipeline
         else
         {
             sqls ~= conn.rewriteSql(sql);
-            static if (hasVariant!Args)
-                encoders ~= (() @trusted => makeEncoder(args))(); // Variant copies
-            else
-                encoders ~= makeEncoder(args);
+            encoders ~= makeEncoder(args);
         }
         const index = sqls.length;
         return index - 1; // added above: at least one

@@ -11,7 +11,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.auth;
 
-import std.base64 : Base64;
+import std.base64 : Base64, Base64Exception;
 import std.digest.hmac : HMAC;
 import std.digest.sha : SHA256, sha256Of;
 
@@ -31,7 +31,7 @@ enum uint maxScramIterations = 1 << 24;
 The response to an MD5 password request:
 `"md5" ~ hex(md5(hex(md5(password ~ user)) ~ salt))`.
 +/
-string md5PasswordResponse(const(char)[] user, const(char)[] password, const(ubyte)[] salt)
+string md5PasswordResponse(const(char)[] user, const(char)[] password, const(ubyte)[] salt) pure nothrow
 {
     import std.digest : LetterCase, toHexString;
     import std.digest.md : md5Of;
@@ -142,11 +142,7 @@ struct ScramClient
             throw new ProtocolException("SCRAM: the server sent no salt or iteration count");
         if (iterations > maxScramIterations)
             throw new ProtocolException("SCRAM: the server asks for too many iterations");
-        ubyte[] saltBytes;
-        try
-            saltBytes = Base64.decode(salt);
-        catch (Exception)
-            throw new ProtocolException("SCRAM: the salt is not valid base64");
+        const saltBytes = decodeBase64(salt, "salt");
 
         auto saltedPassword = pbkdf2!SHA256(password, saltBytes, iterations, 32);
         scope (exit)
@@ -187,11 +183,7 @@ struct ScramClient
                 throw new ClientException("SCRAM authentication failed: " ~ attribute[2 .. $].idup);
             if (attribute.startsWith("v="))
             {
-                ubyte[] signature;
-                try
-                    signature = Base64.decode(attribute[2 .. $]);
-                catch (Exception)
-                    throw new ProtocolException("SCRAM: the server signature is not valid base64");
+                const signature = decodeBase64(attribute[2 .. $], "server signature");
                 if (!constantTimeEqual(signature, expectedServerSignature[]))
                     throw new ProtocolException("SCRAM: the server's signature is wrong");
                 return;
@@ -269,7 +261,7 @@ without control characters are returned as they are.
 const(ubyte)[] saslPrep(const(char)[] password)
 {
     import std.uni : NFKC, normalize;
-    import std.utf : byDchar, UTFException;
+    import std.utf : UTFException, validate;
 
     bool ascii = true;
     foreach (char c; password)
@@ -278,20 +270,17 @@ const(ubyte)[] saslPrep(const(char)[] password)
     if (ascii)
         return cast(const(ubyte)[]) password;
 
-    dchar[] mapped;
     try
-    {
-        foreach (dchar c; password.byDchar)
-        {
-            if (c == dchar.init)
-                return cast(const(ubyte)[]) password; // invalid UTF-8
-            if (mapsToNothing(c))
-                continue;
-            mapped ~= isNonAsciiSpace(c) ? ' ' : c;
-        }
-    }
+        validate(password);
     catch (UTFException)
-        return cast(const(ubyte)[]) password;
+        return cast(const(ubyte)[]) password; // not UTF-8: used unchanged
+    dchar[] mapped;
+    foreach (dchar c; password)
+    {
+        if (mapsToNothing(c))
+            continue;
+        mapped ~= isNonAsciiSpace(c) ? ' ' : c;
+    }
     const normalized = normalize!NFKC(mapped.idup);
     bool randAl, letter;
     foreach (c; normalized)
@@ -323,18 +312,54 @@ unittest
     assert(saslPrep("a\x07b") == cast(const(ubyte)[]) "a\x07b"); // prohibited: used unchanged
     assert(saslPrep("пароль") == cast(const(ubyte)[]) "пароль");
     assert(saslPrep("אaא") == cast(const(ubyte)[]) "אaא"); // mixed bidi: unchanged
+    const invalid = cast(const(char)[])[cast(ubyte) 'a', 0xFF, 'b'];
+    assert(saslPrep(invalid) == cast(const(ubyte)[]) invalid); // not UTF-8: unchanged
 }
 
 private:
 
-ubyte[32] hmacSha256(scope const(ubyte)[] key, scope const(ubyte)[] data)
+// `text` decoded from base64; `what` names it in the error. Phobos' decoder asserts (instead of throwing) on
+// some malformed input, e.g. padding in the middle, so the text is checked first.
+ubyte[] decodeBase64(const(char)[] text, string what)
+{
+    import std.ascii : isAlphaNum;
+
+    bool valid = text.length % 4 == 0;
+    foreach (i, c; text)
+    {
+        const padding = c == '=' && (i + 1 == text.length || (i + 2 == text.length && text[$ - 1] == '='));
+        valid = valid && (isAlphaNum(c) || c == '+' || c == '/' || padding);
+    }
+    try
+    {
+        if (valid)
+            return Base64.decode(text);
+    }
+    catch (Base64Exception)
+    {
+    }
+    throw new ProtocolException("SCRAM: the " ~ what ~ " is not valid base64");
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+
+    assert(decodeBase64("YWI=", "x") == cast(const(ubyte)[]) "ab" && decodeBase64("", "x").length == 0);
+    assertThrown!ProtocolException(decodeBase64("ab==ab==", "x")); // Phobos asserts on this one
+    assertThrown!ProtocolException(decodeBase64("YWI", "x"));
+    assertThrown!ProtocolException(decodeBase64("YW=I", "x"));
+    assertThrown!ProtocolException(decodeBase64("YW I", "x"));
+}
+
+ubyte[32] hmacSha256(scope const(ubyte)[] key, scope const(ubyte)[] data) pure nothrow @nogc
 {
     auto mac = HMAC!SHA256(key);
     mac.put(data);
     return mac.finish();
 }
 
-bool constantTimeEqual(const(ubyte)[] a, const(ubyte)[] b) pure nothrow
+bool constantTimeEqual(const(ubyte)[] a, const(ubyte)[] b) pure nothrow @nogc
 {
     if (a.length != b.length)
         return false;

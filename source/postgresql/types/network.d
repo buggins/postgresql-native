@@ -250,7 +250,7 @@ private immutable(ubyte)[] parseIPv4(const(char)[] s) pure
         catch (ConvException)
             return null;
     }
-    return (() @trusted => cast(immutable) a)(); // not referenced elsewhere
+    return a;
 }
 
 private immutable(ubyte)[] parseIPv6(const(char)[] s) pure
@@ -312,7 +312,7 @@ private immutable(ubyte)[] parseIPv6(const(char)[] s) pure
     }
     if (ipv4 !is null)
         a[12 .. 16] = ipv4[];
-    return (() @trusted => cast(immutable) a)(); // not referenced elsewhere
+    return a;
 }
 
 /// A `macaddr` (6 bytes) or `macaddr8` (8 bytes) as PostgreSQL writes it: `08:00:2b:01:02:03`.
@@ -350,7 +350,7 @@ immutable(ubyte)[] parseMacAddress(string text) pure
     auto bytes = new ubyte[digits.length / 2];
     foreach (i, ref b; bytes)
         b = digits[2 * i .. 2 * i + 2].to!ubyte(16);
-    return (() @trusted => cast(immutable) bytes)(); // not referenced elsewhere
+    return bytes;
 }
 
 ///

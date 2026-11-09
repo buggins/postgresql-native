@@ -17,6 +17,7 @@ import std.variant : Variant;
 import dbwire.client.hosts : connectFirst, HostPort, orderHosts;
 import dbwire.client.pool : Poolable;
 import dbwire.io.backend : backendFor, IoBackend;
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
 
@@ -25,8 +26,8 @@ import postgresql.exception;
 import postgresql.protocol.codes;
 import postgresql.protocol.messages;
 import postgresql.result;
-import postgresql.params : hasVariant, rewritePlaceholders;
-import postgresql.mapping : fieldPositions, hasVariantField, insertSql, mappedFields, readStruct, readValue,
+import postgresql.params : rewritePlaceholders;
+import postgresql.mapping : fieldPositions, insertSql, mappedFields, readStruct, readValue,
     RowRange, RowsEncoder;
 import postgresql.pipeline;
 import postgresql.settings;
@@ -34,8 +35,6 @@ import postgresql.statement;
 import postgresql.copy : CopyFormat, CopyIn, CopyOut;
 import postgresql.types.oids : Oid;
 import postgresql.types.pgtype : PgType;
-
-@safe:
 
 /// The authentication method the server used for the session.
 enum AuthMethod
@@ -67,6 +66,101 @@ connection.
 +/
 final class Connection : Poolable
 {
+    // These templates come before the `@safe:` label below, so they infer their attributes: they copy and
+    // assign struct values, which are `@system` for `Variant` fields.
+
+    /++
+    The first row of a query as a `T` (see `query!T`); the other rows are discarded.
+
+    Throws: `ClientException` if there is no row, a field has no column or a
+    value can't be read into its field; as `query`.
+    +/
+    T queryRow(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
+    {
+        auto result = query(sql, args);
+        scope (exit)
+            result.close();
+        const positions = fieldPositions!T(result);
+        if (result.empty)
+            throw new ClientException("The query returned no rows");
+        return readStruct!T(result, positions);
+    }
+
+    /++
+    Inserts structs as rows of `table`: one column per mapped field (see
+    `postgresql.mapping`), with multi-row `INSERT ... VALUES` statements of up
+    to 1000 rows (fewer for structs with more than 65 fields: at most 65535
+    parameters each).
+
+    The insert is atomic: outside a transaction block, an insert that needs
+    several statements runs in a transaction of its own; inside one, the rows
+    are part of it. `table` is used as given (e.g. `orders` or
+    `sales.orders`); column names as `sqlColumnName` writes them.
+
+    Returns: the number of rows inserted.
+    Throws: `ServerException` if the server refuses a row (then no row is
+    inserted, outside a transaction block); `ClientException` for a value
+    that can't be sent.
+    +/
+    ulong insert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
+    {
+        import std.algorithm.comparison : min;
+
+        alias E = Unqual!(ElementType!R);
+        enum width = mappedFields!E.length;
+        static assert(width > 0, E.stringof ~ " has no mapped fields");
+        enum batchRows = min(1000, 65_535 / width);
+
+        auto encoder = new RowsEncoder!E;
+        string fullBatchSql; // the same for every full batch
+        ulong inserted;
+        bool began;
+        scope (failure)
+        {
+            if (began && state == State.ready && txStatus != TransactionStatus.idle)
+            {
+                try
+                    rollback();
+                catch (Exception)
+                {
+                }
+            }
+        }
+        for (;;)
+        {
+            encoder.clear();
+            while (!rows.empty && encoder.rows.length < batchRows)
+            {
+                encoder.rows ~= rows.front;
+                rows.popFront();
+            }
+            if (encoder.rows.length == 0)
+                break;
+            if (!rows.empty && !began && !inTransaction)
+            {
+                begin();
+                began = true;
+            }
+            const n = encoder.rows.length;
+            if (n == batchRows && fullBatchSql is null)
+                fullBatchSql = insertSql!E(table, n);
+            inserted += drainCount(runSql(n == batchRows ? fullBatchSql : insertSql!E(table, n), &encoder.encode));
+            if (rows.empty)
+                break;
+        }
+        if (began)
+            commit();
+        return inserted;
+    }
+
+    /// ditto
+    ulong insert(T)(string table, T row) if (is(T == struct) && !isInputRange!T)
+    {
+        return insert(table, [row]);
+    }
+
+@safe:
+
     package enum State
     {
         closed,
@@ -305,7 +399,7 @@ final class Connection : Poolable
     Throws: `ClientException` for a wrong number of values or values that
     don't fit the parameter types; `ServerException`, from here or from the result.
     +/
-    QueryResult query(Args...)(string sql, Args args)
+    QueryResult query(Args...)(string sql, auto ref Args args)
     {
         static if (Args.length == 0)
             return runSql(sql, null);
@@ -313,10 +407,7 @@ final class Connection : Poolable
         {
             void encode(const(uint)[] types, ref MessageBuilder b)
             {
-                static if (hasVariant!Args)
-                    (() @trusted => putArgs(b, types, args))(); // Variant copies: they hold plain values
-                else
-                    putArgs(b, types, args);
+                putArgs(b, types, args);
             }
 
             return runSql(rewriteSql(sql), &encode);
@@ -355,12 +446,9 @@ final class Connection : Poolable
 
     Throws: `ClientException`, `ServerException`.
     +/
-    ulong exec(Args...)(string sql, Args args) if (Args.length > 0)
+    ulong exec(Args...)(string sql, auto ref Args args) if (Args.length > 0)
     {
-        static if (hasVariant!Args)
-            return (() @trusted => drainCount(query(sql, args)))(); // Variant copies
-        else
-            return drainCount(query(sql, args));
+        return drainCount(query(sql, args));
     }
 
     /++
@@ -371,35 +459,9 @@ final class Connection : Poolable
     Throws: `ClientException` if a field has no column, or a value can't be
     read into its field; as `query`.
     +/
-    RowRange!T query(T, Args...)(string sql, Args args) if (is(T == struct))
+    RowRange!T query(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
     {
-        static if (hasVariant!Args)
-            return (() @trusted => RowRange!T(query(sql, args)))(); // Variant copies
-        else
-            return RowRange!T(query(sql, args));
-    }
-
-    /++
-    The first row of a query as a `T` (see `query!T`); the other rows are discarded.
-
-    Throws: `ClientException` if there is no row, a field has no column or a
-    value can't be read into its field; as `query`.
-    +/
-    T queryRow(T, Args...)(string sql, Args args) if (is(T == struct))
-    {
-        static if (hasVariant!Args)
-            auto result = (() @trusted => query(sql, args))(); // Variant copies
-        else
-            auto result = query(sql, args);
-        scope (exit)
-            result.close();
-        const positions = fieldPositions!T(result);
-        if (result.empty)
-            throw new ClientException("The query returned no rows");
-        static if (hasVariantField!T)
-            return (() @trusted => readStruct!T(result, positions))(); // Variant copies
-        else
-            return readStruct!T(result, positions);
+        return RowRange!T(query(sql, args));
     }
 
     /++
@@ -410,99 +472,14 @@ final class Connection : Poolable
     Throws: `ClientException` if there is no row, or the value can't be
     converted (NULL included, unless `T` can hold it); as `query`.
     +/
-    T queryValue(T, Args...)(string sql, Args args)
+    T queryValue(T, Args...)(string sql, auto ref Args args)
     {
-        static if (hasVariant!Args)
-            auto result = (() @trusted => query(sql, args))(); // Variant copies
-        else
-            auto result = query(sql, args);
+        auto result = query(sql, args);
         scope (exit)
             result.close();
         if (result.empty || result.columns.length == 0)
             throw new ClientException("The query returned no value");
-        static if (hasVariant!T)
-            return (() @trusted => readValue!T(result.front[0]))(); // Variant copies
-        else
-            return readValue!T(result.front[0]);
-    }
-
-    /++
-    Inserts structs as rows of `table`: one column per mapped field (see
-    `postgresql.mapping`), with multi-row `INSERT ... VALUES` statements of up
-    to 1000 rows (fewer for structs with more than 65 fields: at most 65535
-    parameters each).
-
-    The insert is atomic: outside a transaction block, an insert that needs
-    several statements runs in a transaction of its own; inside one, the rows
-    are part of it. `table` is used as given (e.g. `orders` or
-    `sales.orders`); column names as `sqlColumnName` writes them.
-
-    Returns: the number of rows inserted.
-    Throws: `ServerException` if the server refuses a row (then no row is
-    inserted, outside a transaction block); `ClientException` for a value
-    that can't be sent.
-    +/
-    ulong insert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
-    {
-        import std.algorithm.comparison : min;
-
-        alias E = Unqual!(ElementType!R);
-        enum width = mappedFields!E.length;
-        static assert(width > 0, E.stringof ~ " has no mapped fields");
-        enum batchRows = min(1000, 65_535 / width);
-
-        auto encoder = new RowsEncoder!E;
-        string fullBatchSql; // the same for every full batch
-        ulong inserted;
-        bool began;
-        scope (failure)
-        {
-            if (began && state == State.ready && txStatus != TransactionStatus.idle)
-            {
-                try
-                    rollback();
-                catch (Exception)
-                {
-                }
-            }
-        }
-        for (;;)
-        {
-            encoder.clear();
-            while (!rows.empty && encoder.rows.length < batchRows)
-            {
-                static if (hasVariantField!E)
-                    (() @trusted { encoder.rows ~= rows.front; })(); // Variant copies
-                else
-                    encoder.rows ~= rows.front;
-                rows.popFront();
-            }
-            if (encoder.rows.length == 0)
-                break;
-            if (!rows.empty && !began && !inTransaction)
-            {
-                begin();
-                began = true;
-            }
-            const n = encoder.rows.length;
-            if (n == batchRows && fullBatchSql is null)
-                fullBatchSql = insertSql!E(table, n);
-            inserted += drainCount(runSql(n == batchRows ? fullBatchSql : insertSql!E(table, n), &encoder.encode));
-            if (rows.empty)
-                break;
-        }
-        if (began)
-            commit();
-        return inserted;
-    }
-
-    /// ditto
-    ulong insert(T)(string table, T row) if (is(T == struct) && !isInputRange!T)
-    {
-        static if (hasVariantField!T)
-            return (() @trusted => insert(table, [row]))(); // Variant copies
-        else
-            return insert(table, [row]);
+        return readValue!T(result.front[0]);
     }
 
     /++
@@ -1036,19 +1013,16 @@ final class Connection : Poolable
             b.finish();
             stream.send(b.data);
 
-            static ColumnInfo[] columns;
-            if (columns is null)
-            {
-                import postgresql.types.pgtype : builtinType;
+            import postgresql.types.pgtype : builtinType;
 
-                foreach (oid; [Oid.oid, Oid.name, Oid.text, Oid.oid, Oid.char_, 1009u, 1028u])
-                {
-                    ColumnInfo c;
-                    c.typeOid = oid;
-                    c.format = ValueFormat.binary;
-                    c.type = builtinType(oid);
-                    columns ~= c;
-                }
+            ColumnInfo[] columns;
+            foreach (oid; [Oid.oid, Oid.name, Oid.text, Oid.oid, Oid.char_, 1009u, 1028u])
+            {
+                ColumnInfo c;
+                c.typeOid = oid;
+                c.format = ValueFormat.binary;
+                c.type = builtinType(oid);
+                columns ~= c;
             }
             for (;;)
             {
@@ -1099,7 +1073,7 @@ final class Connection : Poolable
         ubyte[] data;
         void int32(uint v)
         {
-            data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+            data ~= toBigEndian(v)[];
         }
 
         int32(1); // dimensions
@@ -1112,7 +1086,7 @@ final class Connection : Poolable
             int32(4);
             int32(oid);
         }
-        return (() @trusted => cast(immutable) data)(); // not referenced elsewhere
+        return data;
     }
 
     private enum typeQueryName = "pgn_types";
@@ -1674,12 +1648,7 @@ final class Connection : Poolable
         scope (failure)
             copy.abort();
         foreach (ref row; rows)
-        {
-            static if (hasVariantField!E)
-                (() @trusted => copy.writeStruct(row))(); // Variant copies
-            else
-                copy.writeStruct(row);
-        }
+            copy.writeStruct(row);
         return copy.finish();
     }
 
@@ -2834,6 +2803,8 @@ final class Connection : Poolable
     }
 }
 
+@safe:
+
 /// Thrown internally when the TLS handshake fails, so `sslmode=prefer` can retry without TLS.
 private class TlsHandshakeFailed : ConnectionException
 {
@@ -2847,23 +2818,26 @@ private class TlsHandshakeFailed : ConnectionException
 The number of rows a command tag reports: `INSERT 0 5` → 5, `UPDATE 3` → 3,
 `SELECT 2` → 2; 0 for tags without a count (`CREATE TABLE`, `BEGIN`, ...).
 +/
-ulong affectedRows(string tag) pure
+ulong affectedRows(string tag) pure nothrow @nogc
 {
-    import std.algorithm.searching : startsWith;
-    import std.conv : ConvException, to;
-    import std.string : lastIndexOf;
-
     static immutable counted = [
         "INSERT ", "UPDATE ", "DELETE ", "SELECT ", "MERGE ", "MOVE ", "FETCH ", "COPY "
     ];
     foreach (prefix; counted)
-        if (tag.startsWith(prefix))
+        if (tag.length > prefix.length && tag[0 .. prefix.length] == prefix)
         {
-            const space = tag.lastIndexOf(' ');
-            try
-                return tag[space + 1 .. $].to!ulong;
-            catch (ConvException)
-                return 0;
+            // the number after the last space
+            size_t start = tag.length;
+            while (tag[start - 1] != ' ')
+                start--; // stops at the prefix's space at the latest
+            ulong n;
+            foreach (c; tag[start .. $])
+            {
+                if (c < '0' || c > '9' || n > (ulong.max - (c - '0')) / 10)
+                    return 0;
+                n = n * 10 + (c - '0');
+            }
+            return n;
         }
     return 0;
 }
@@ -2873,35 +2847,42 @@ unittest
 {
     assert(affectedRows("INSERT 0 5") == 5 && affectedRows("UPDATE 3") == 3 && affectedRows("SELECT 0") == 0);
     assert(affectedRows("CREATE TABLE") == 0 && affectedRows("COPY 10") == 10 && affectedRows("MERGE 2") == 2);
-    assert(affectedRows("") == 0);
+    assert(affectedRows("") == 0 && affectedRows("SELECT ") == 0 && affectedRows("SELECT x") == 0);
+    assert(affectedRows("SELECT 18446744073709551615") == ulong.max);
+    assert(affectedRows("SELECT 18446744073709551616") == 0);
 }
 
 /++
 The server version as a number from the `server_version` text: 180006 for
 `18.6 (Debian ...)`, 130023 for `13.23`, 90624 for `9.6.24`; 0 if it can't be read.
 +/
-uint parseServerVersion(string text) pure
+uint parseServerVersion(string text) pure nothrow @nogc
 {
-    import std.algorithm.searching : until;
-    import std.array : array, split;
     import std.ascii : isDigit;
-    import std.conv : ConvException, to;
 
-    uint[] parts;
-    foreach (p; text.until!(c => !isDigit(c) && c != '.').array.split("."))
+    // up to three numbers separated by dots, at the start
+    uint[3] parts;
+    size_t count, i;
+    while (count < parts.length && i < text.length && isDigit(text[i]))
     {
-        if (p.length == 0)
+        uint n;
+        for (; i < text.length && isDigit(text[i]); i++)
+        {
+            if (n > 999)
+                return 0; // no such version: at most 4 digits
+            n = n * 10 + (text[i] - '0');
+        }
+        parts[count++] = n;
+        if (i < text.length && text[i] == '.')
+            i++;
+        else
             break;
-        try
-            parts ~= p.to!uint;
-        catch (ConvException)
-            return 0;
     }
-    if (parts.length == 0)
+    if (count == 0)
         return 0;
     if (parts[0] >= 10)
-        return parts[0] * 10_000 + (parts.length > 1 ? parts[1] : 0);
-    return parts[0] * 10_000 + (parts.length > 1 ? parts[1] * 100 : 0) + (parts.length > 2 ? parts[2] : 0);
+        return parts[0] * 10_000 + parts[1];
+    return parts[0] * 10_000 + parts[1] * 100 + parts[2];
 }
 
 ///
@@ -2910,6 +2891,8 @@ unittest
     assert(parseServerVersion("18.6 (Debian 18.6-1.pgdg13+2)") == 180_006);
     assert(parseServerVersion("13.23") == 130_023 && parseServerVersion("9.6.24") == 90_624);
     assert(parseServerVersion("17beta1") == 170_000 && parseServerVersion("") == 0);
+    assert(parseServerVersion("1234567") == 0 && parseServerVersion("10.") == 100_000);
+    assert(parseServerVersion("999999") == 0 && parseServerVersion("9999.9999.9999") == 99_999_999);
 }
 
 // A scripted server for the tests below: backend messages are fed to a MockTransport.
@@ -2919,22 +2902,17 @@ version (unittest)
 
     private immutable(ubyte)[] message(char type, scope const(ubyte)[] body = null) pure
     {
-        const length = cast(uint)(body.length + 4);
-        return [
-            cast(ubyte) type, cast(ubyte)(length >> 24), cast(ubyte)(length >> 16),
-            cast(ubyte)(length >> 8),
-            cast(ubyte) length
-        ] ~ body.idup;
+        return cast(ubyte) type ~ toBigEndian(cast(uint)(body.length + 4)) ~ body;
     }
 
     private immutable(ubyte)[] wire16(int v) pure
     {
-        return [cast(ubyte)(v >> 8), cast(ubyte) v];
+        return toBigEndian(cast(short) v).idup;
     }
 
     private immutable(ubyte)[] wire32(int v) pure
     {
-        return [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+        return toBigEndian(v).idup;
     }
 
     private immutable(ubyte)[] cstring(string s) pure
@@ -3011,7 +2989,7 @@ version (unittest)
         while (bytes.length >= 5)
         {
             const type = cast(char) bytes[0];
-            const length = bytes[1] << 24 | bytes[2] << 16 | bytes[3] << 8 | bytes[4];
+            const length = fromBigEndian!int(bytes[1 .. 5]);
             auto body = bytes[5 .. 1 + length];
             s ~= type;
             if (type == 'C' || type == 'P' || type == 'B')
@@ -3165,6 +3143,41 @@ unittest
 
 }
 
+// @safe callers: Variant lvalues go to the parameters without a copy; the struct-mapping templates infer
+// their attributes, so a @system copy of another field type isn't hidden behind a Variant field
+@safe unittest
+{
+    static struct Evil
+    {
+        int x;
+        this(this) @system
+        {
+        }
+    }
+
+    static struct Bad
+    {
+        int id;
+        Variant v;
+        Evil e;
+    }
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    auto id = (() @trusted => Variant(8L))(); // constructing a Variant isn't @safe
+    t.feed(message('1') ~ message('t', wire16(1) ~ wire32(Oid.int8)) ~ message('n') ~ message('2')
+            ~ message('C', cstring("UPDATE 1")) ~ readyIdle);
+    assert(c.exec("UPDATE t SET n = n + 1 WHERE id = $1", id) == 1);
+    static assert(!__traits(compiles, c.insert("t", Bad.init)));
+    static assert(!__traits(compiles, c.queryRow!Bad("SELECT 1")));
+    void system() @system
+    {
+        c.insert("t", Bad.init);
+        c.queryRow!Bad("SELECT 1");
+    }
+
+}
+
 // A fiber-mode connection used from another thread: refused, and close() doesn't touch the socket
 unittest
 {
@@ -3193,7 +3206,7 @@ version (unittest)
         const(ubyte)[] data;
         while (bytes.length >= 5)
         {
-            const length = bytes[1] << 24 | bytes[2] << 16 | bytes[3] << 8 | bytes[4];
+            const length = fromBigEndian!int(bytes[1 .. 5]);
             if (bytes[0] == 'd')
                 data ~= bytes[5 .. 1 + length];
             bytes = bytes[1 + length .. $];

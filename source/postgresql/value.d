@@ -14,9 +14,11 @@ module postgresql.value;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
-import std.uuid : UUID;
+import std.traits : hasElaborateCopyConstructor, hasElaborateDestructor;
+import std.uuid : UUID, UUIDParsingException;
 import std.variant : Variant;
 
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
 import dbwire.types.decimal : Decimal;
 
 import postgresql.exception : ClientException, ProtocolException;
@@ -171,7 +173,7 @@ struct Value
         case hstoreCodec:
             return hstoreText(getHstorePairs());
         case postgisCodec:
-            return upperHex(data);
+            return hexText(data, "", true);
         case Oid.jsonb:
             return jsonbText();
         case Oid.bool_:
@@ -187,7 +189,7 @@ struct Value
         case Oid.numeric:
             return Numeric.decode(data).toString();
         case Oid.bytea:
-            return byteaHex();
+            return hexText(data, `\x`);
         case Oid.char_:
             return charText();
         case Oid.uuid:
@@ -287,8 +289,6 @@ struct Value
     +/
     double getDouble() const @safe
     {
-        import std.conv : ConvException, to;
-
         notNull();
         if (binary)
         {
@@ -307,8 +307,8 @@ struct Value
             }
         }
         try
-            return text.to!double;
-        catch (ConvException)
+            return parseFloat8(cast(string) data);
+        catch (ClientException)
             throw wrongType("double");
     }
 
@@ -331,7 +331,7 @@ struct Value
         }
         try
             return Decimal.fromString(text);
-        catch (Exception)
+        catch (ClientException)
             throw wrongType("Decimal");
     }
 
@@ -508,7 +508,8 @@ struct Value
             throw wrongType("Interval");
         if (data.length != 16)
             throw new ProtocolException("Malformed interval value");
-        return Interval(bigEndian!int(data[12 .. 16]), bigEndian!int(data[8 .. 12]), bigEndian!long(data[0 .. 8]));
+        return Interval(fromBigEndian!int(data[12 .. 16]), fromBigEndian!int(data[8 .. 12]),
+                fromBigEndian!long(data[0 .. 8]));
     }
 
     /++
@@ -530,7 +531,7 @@ struct Value
         }
         try
             return UUID(text);
-        catch (Exception)
+        catch (UUIDParsingException)
             throw wrongType("UUID");
     }
 
@@ -545,71 +546,70 @@ struct Value
     NULL. Infinite dates and timestamps, times of 24:00:00, arrays, ranges,
     composite values and the other types are strings (their text).
     +/
-    Variant getVariant() const @trusted
+    Variant getVariant() const @safe
     {
-        // Variant's copy constructor isn't @safe; the values put in it are plain data
         if (null_)
-            return Variant();
+            return Variant.init;
         if (!binary || kind != TypeKind.base)
-            return Variant(getString());
+            return makeVariant(getString());
         try
         {
             switch (codec)
             {
             case Oid.inet, Oid.cidr:
-                return Variant(getInet());
+                return makeVariant(getInet());
             case Oid.bit, Oid.varbit:
-                return Variant(getBitString());
+                return makeVariant(getBitString());
             case Oid.point:
-                return Variant(get!Point());
+                return makeVariant(get!Point());
             case Oid.line:
-                return Variant(get!Line());
+                return makeVariant(get!Line());
             case Oid.lseg:
-                return Variant(get!LineSegment());
+                return makeVariant(get!LineSegment());
             case Oid.box:
-                return Variant(get!Box());
+                return makeVariant(get!Box());
             case Oid.path:
-                return Variant(get!Path());
+                return makeVariant(get!Path());
             case Oid.polygon:
-                return Variant(get!Polygon());
+                return makeVariant(get!Polygon());
             case Oid.circle:
-                return Variant(get!Circle());
+                return makeVariant(get!Circle());
             case Oid.bool_:
-                return Variant(getBool());
+                return makeVariant(getBool());
             case Oid.int2:
-                return Variant(cast(short) integer());
+                return makeVariant(cast(short) integer());
             case Oid.int4:
-                return Variant(cast(int) integer());
+                return makeVariant(cast(int) integer());
             case Oid.int8:
-                return Variant(integer());
+                return makeVariant(integer());
             case Oid.oid:
-                return Variant(cast(uint) integer());
+                return makeVariant(cast(uint) integer());
             case Oid.float4:
-                return Variant(float4());
+                return makeVariant(float4());
             case Oid.float8:
-                return Variant(float8());
+                return makeVariant(float8());
             case Oid.numeric:
-                return Variant(getDecimal());
+                return makeVariant(getDecimal());
             case Oid.bytea:
-                return Variant(data);
+                return makeVariant(data);
             case Oid.date:
-                return Variant(getDate());
+                return makeVariant(getDate());
             case Oid.time:
-                return Variant(getTimeOfDay());
+                return makeVariant(getTimeOfDay());
             case Oid.timestamp:
-                return Variant(getDateTime());
+                return makeVariant(getDateTime());
             case Oid.timestamptz:
-                return Variant(getSysTime());
+                return makeVariant(getSysTime());
             case Oid.interval:
-                return Variant(getInterval());
+                return makeVariant(getInterval());
             case Oid.uuid:
-                return Variant(getUUID());
+                return makeVariant(getUUID());
             default:
-                return Variant(getString());
+                return makeVariant(getString());
             }
         }
         catch (ClientException)
-            return Variant(getString()); // NaN, infinity, out of D's ranges
+            return makeVariant(getString()); // NaN, infinity, out of D's ranges
     }
 
     /++
@@ -833,11 +833,9 @@ struct Value
             }
             // the member's name, or its value (as text)
             const text = getString();
-            try
-                return text.to!U;
-            catch (ConvException)
-            {
-            }
+            foreach (member; __traits(allMembers, U))
+                if (text == member)
+                    return __traits(getMember, U, member);
             foreach (member; __traits(allMembers, U))
                 if ((cast(OriginalType!U) __traits(getMember, U, member)).to!string == text)
                     return __traits(getMember, U, member);
@@ -853,6 +851,13 @@ struct Value
                 {
                     if (codec == Oid.pgLsn)
                         return binary ? cast(ulong) fixed!long() : parseLsn(cast(string) data);
+                    if (binary)
+                    {
+                        const n = Numeric.decode(data);
+                        if (n.isIntegral)
+                            return n.toUlong();
+                        throw new ClientException("The numeric value " ~ n.toString() ~ " is not an integer");
+                    }
                     try
                         return getString().to!ulong;
                     catch (ConvException)
@@ -1346,11 +1351,11 @@ struct Value
         return t == Oid.int2 || t == Oid.int4 || t == Oid.int8 || t == Oid.oid;
     }
 
-    private T fixed(T)() const @safe
+    private T fixed(T)() const
     {
         if (data.length != T.sizeof)
             throw new ProtocolException("Malformed " ~ typeName() ~ " value: " ~ T.sizeof.stringof ~ " bytes expected");
-        return bigEndian!T(data);
+        return fromBigEndian!T(data[0 .. T.sizeof]);
     }
 
     private long integer() const @safe
@@ -1370,14 +1375,12 @@ struct Value
 
     private float float4() const @safe
     {
-        const bits = cast(uint) fixed!int();
-        return (() @trusted => *cast(const(float)*)&bits)(); // reinterprets the 4 bytes
+        return fixed!float();
     }
 
     private double float8() const @safe
     {
-        const bits = cast(ulong) fixed!long();
-        return (() @trusted => *cast(const(double)*)&bits)(); // reinterprets the 8 bytes
+        return fixed!double();
     }
 
     private long timestampValue() const @safe
@@ -1395,7 +1398,7 @@ struct Value
     {
         if (data.length != 12)
             throw new ProtocolException("Malformed timetz value");
-        return TimeTz(bigEndian!long(data[0 .. 8]), bigEndian!int(data[8 .. 12]));
+        return TimeTz(fromBigEndian!long(data[0 .. 8]), fromBigEndian!int(data[8 .. 12]));
     }
 
     private string jsonbText() const @safe
@@ -1403,19 +1406,6 @@ struct Value
         if (data.length == 0 || data[0] != 1)
             throw new ProtocolException("Unsupported jsonb format version");
         return cast(string) data[1 .. $];
-    }
-
-    private string byteaHex() const @safe pure
-    {
-        static immutable digits = "0123456789abcdef";
-        auto text = new char[2 + data.length * 2];
-        text[0 .. 2] = `\x`;
-        foreach (i, b; data)
-        {
-            text[2 + 2 * i] = digits[b >> 4];
-            text[3 + 2 * i] = digits[b & 15];
-        }
-        return text;
     }
 
     // "char": the byte itself, or \ooo for bytes with the high bit set; empty for 0
@@ -1505,6 +1495,14 @@ struct RecordValue
     }
 }
 
+// `value` in a Variant. The Variant constructor isn't @safe; it copies `value`, which is safe for types
+// without copy constructors or destructors.
+private Variant makeVariant(T)(T value) @trusted
+        if (!hasElaborateCopyConstructor!T && !hasElaborateDestructor!T)
+{
+    return Variant(value);
+}
+
 // The number of array dimensions of D type `T` (strings and ubyte[] are values, not arrays).
 private template arrayDepth(T)
 {
@@ -1515,25 +1513,6 @@ private template arrayDepth(T)
         enum arrayDepth = 1 + arrayDepth!(typeof(T.init[0]));
     else
         enum arrayDepth = 0;
-}
-
-// The OID of a geometric type.
-private template geometricOid(T)
-{
-    static if (is(T == Point))
-        enum geometricOid = Oid.point;
-    else static if (is(T == Line))
-        enum geometricOid = Oid.line;
-    else static if (is(T == LineSegment))
-        enum geometricOid = Oid.lseg;
-    else static if (is(T == Box))
-        enum geometricOid = Oid.box;
-    else static if (is(T == Path))
-        enum geometricOid = Oid.path;
-    else static if (is(T == Polygon))
-        enum geometricOid = Oid.polygon;
-    else
-        enum geometricOid = Oid.circle;
 }
 
 // Reads the parts of binary container values (arrays, ranges, records, hstore).
@@ -1553,7 +1532,7 @@ private struct Reader
     {
         if (at + 4 > data.length)
             throw new ProtocolException("Malformed " ~ what ~ " value");
-        const v = bigEndian!int(data[at .. at + 4]);
+        const v = fromBigEndian!int(data[at .. $][0 .. 4]);
         at += 4;
         return v;
     }
@@ -1609,40 +1588,10 @@ private ulong parseLsn(string text) @safe pure
     throw new ClientException("Invalid pg_lsn '" ~ text ~ "'");
 }
 
-private T bigEndian(T)(scope const(ubyte)[] bytes) @safe pure nothrow
-{
-    ulong v;
-    foreach (b; bytes[0 .. T.sizeof])
-        v = (v << 8) | b;
-    return cast(T) v;
-}
-
-// Uppercase hexadecimal digits (PostGIS's text of EWKB).
-private string upperHex(scope const(ubyte)[] data) @safe pure
-{
-    static immutable digits = "0123456789ABCDEF";
-    auto text = new char[data.length * 2];
-    foreach (i, b; data)
-    {
-        text[2 * i] = digits[b >> 4];
-        text[2 * i + 1] = digits[b & 15];
-    }
-    return (() @trusted => cast(string) text)(); // not referenced elsewhere
-}
-
 // Decodes bytea's hex text (\x0102...).
 private immutable(ubyte)[] decodeHex(const(char)[] text) @safe pure
 {
-    static int digit(char c)
-    {
-        if (c >= '0' && c <= '9')
-            return c - '0';
-        if (c >= 'a' && c <= 'f')
-            return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F')
-            return c - 'A' + 10;
-        return -1;
-    }
+    import std.ascii : isHexDigit;
 
     if (text.length < 2 || text[0 .. 2] != `\x` || text.length % 2 != 0)
         throw new ClientException("Unsupported bytea text (hex format expected)");
@@ -1650,10 +1599,10 @@ private immutable(ubyte)[] decodeHex(const(char)[] text) @safe pure
     auto bytes = new ubyte[half - 1];
     foreach (i, ref b; bytes)
     {
-        const hi = digit(text[2 + 2 * i]), lo = digit(text[3 + 2 * i]);
-        if (hi < 0 || lo < 0)
+        const hi = text[2 + 2 * i], lo = text[3 + 2 * i];
+        if (!isHexDigit(hi) || !isHexDigit(lo))
             throw new ClientException("Invalid bytea hex text");
-        b = cast(ubyte)(hi << 4 | lo);
+        b = cast(ubyte)(hexValue(hi) << 4 | hexValue(lo));
     }
     return bytes;
 }
@@ -1688,10 +1637,7 @@ private immutable(ubyte)[] decodeHex(const(char)[] text) @safe pure
         {
             const n = record.length;
             immutable(ubyte)[] field = [0, 0, 0, 1, 0, 0, 0x08, 0xC9]; // one field of type record (2249)
-            immutable(ubyte)[] length = [
-                cast(ubyte)(n >> 24), cast(ubyte)(n >> 16), cast(ubyte)(n >> 8), cast(ubyte) n
-            ];
-            record = field ~ length ~ record;
+            record = field ~ toBigEndian(cast(uint) n).idup ~ record;
         }
         return record;
     }

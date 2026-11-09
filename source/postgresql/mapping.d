@@ -43,11 +43,8 @@ module postgresql.mapping;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
-import std.traits : FieldNameTuple, getUDAs, hasUDA, isFloatingPoint, isIntegral, isSomeString, OriginalType,
-    Unqual;
 import std.typecons : Nullable;
 import std.uuid : UUID;
-import std.variant : Variant;
 
 import dbwire.types.decimal : Decimal;
 
@@ -60,20 +57,6 @@ import postgresql.types.temporal : Interval;
 import postgresql.value : Value;
 
 public import postgresql.attributes : column, ColumnName, columnNames, ignore, IgnoreField, mappedFields;
-
-/// Whether a mapped field of `T` is a `Variant`, whose copies are `@system`.
-template hasVariantField(T) if (is(T == struct))
-{
-    enum hasVariantField = () {
-        bool found;
-        static foreach (name; mappedFields!T)
-        {
-            static if (is(Unqual!(typeof(__traits(getMember, T, name))) == Variant))
-                found = true;
-        }
-        return found;
-    }();
-}
 
 /++
 `v` converted to the field type `T`: `v.get!T` (see `Value.get` and the module documentation).
@@ -95,26 +78,16 @@ released) if a field has no column.
 +/
 size_t[] fieldPositions(T)(QueryResult result)
 {
-    import std.uni : icmp;
+    import postgresql.attributes : findName;
 
     enum names = columnNames!T;
+    auto columns = new string[result.columns.length];
+    foreach (c, col; result.columns)
+        columns[c] = col.name;
     auto positions = new size_t[names.length];
     foreach (i, name; names)
     {
-        ptrdiff_t found = -1;
-        foreach (c, col; result.columns)
-            if (col.name == name)
-            {
-                found = c;
-                break;
-            }
-        if (found < 0)
-            foreach (c, col; result.columns)
-                if (icmp(col.name, name) == 0)
-                {
-                    found = c;
-                    break;
-                }
+        const found = findName(columns, name);
         if (found < 0)
         {
             result.close();
@@ -307,12 +280,7 @@ package final class RowsEncoder(T)
         rows = memory;
     }
 
-    static if (hasVariantField!T)
-        enum attributes = "@trusted"; // copies of Variant values, which hold plain values
-    else
-        enum attributes = "@safe";
-
-    mixin("void encode(const(uint)[] types, ref MessageBuilder b) " ~ attributes ~ q{
+    void encode(const(uint)[] types, ref MessageBuilder b)
     {
         import std.conv : to;
         import postgresql.statement : beginParameters, setFormat;
@@ -320,7 +288,7 @@ package final class RowsEncoder(T)
         enum width = mappedFields!T.length;
         if (types.length != rows.length * width)
             throw new ClientException("The insert statement has " ~ types.length.to!string
-                ~ " parameter(s), expected " ~ (rows.length * width).to!string);
+                    ~ " parameter(s), expected " ~ (rows.length * width).to!string);
         const formats = beginParameters(b, types.length);
         size_t i;
         foreach (ref row; rows)
@@ -328,23 +296,16 @@ package final class RowsEncoder(T)
             static foreach (name; mappedFields!T)
             {
                 try
-                {
-                    static if (is(Unqual!(typeof(__traits(getMember, T, name))) == Variant))
-                        const format = putParam(b, cast() __traits(getMember, row, name), types[i]); // a copy
-                    else
-                        const format = putParam(b, __traits(getMember, row, name), types[i]);
-                    setFormat(b, formats, i, format);
-                }
+                    setFormat(b, formats, i, putParam(b, __traits(getMember, row, name), types[i]));
                 catch (ClientException e)
                     throw new ClientException(T.stringof ~ "." ~ name ~ ": " ~ e.msg);
                 i++;
             }
         }
     }
-    });
 }
 
-unittest
+@safe unittest
 {
     import std.exception : assertThrown;
     import postgresql.result : ColumnInfo, ValueFormat;

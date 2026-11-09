@@ -10,6 +10,8 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.result;
 
+import dbwire.io.buffer : fromBigEndian;
+
 import postgresql.connection : Connection;
 import postgresql.exception : ClientException, ProtocolException;
 import postgresql.protocol.messages : MessageBody;
@@ -89,7 +91,7 @@ or the bytes of `getRaw`, keeps that copy in memory.
 struct Row
 {
     private const(ColumnInfo)[] columns_;
-    private immutable(immutable(ubyte)[])[] values; // null for NULL; empty values are not null
+    private const(immutable(ubyte)[])[] values; // null for NULL; empty values are not null
     private string timeZone;
     private const(ColumnIndex)* names; // for results with many columns
 
@@ -204,11 +206,11 @@ struct Row
 A `Row` of `values` for `columns`: null for NULL; empty values must not be
 null (e.g. `""` or an empty slice of a larger array).
 +/
-package Row makeRow(const(ColumnInfo)[] columns, immutable(ubyte)[][] values, string timeZone)
+package Row makeRow(const(ColumnInfo)[] columns, const(immutable(ubyte)[])[] values, string timeZone)
 {
     Row row;
     row.columns_ = columns;
-    row.values = (() @trusted => cast(immutable) values)(); // the caller hands them over
+    row.values = values;
     row.timeZone = timeZone;
     return row;
 }
@@ -250,7 +252,7 @@ package Row parseDataRow(scope const(ubyte)[] body, const(ColumnInfo)[] columns,
     {
         if (body.length - at < 4)
             throw new ProtocolException("Truncated DataRow");
-        const length = cast(int)(body[at] << 24 | body[at + 1] << 16 | body[at + 2] << 8 | body[at + 3]);
+        const length = fromBigEndian!int(body[at .. $][0 .. 4]);
         at += 4;
         if (length == -1)
             continue; // NULL: a null slice
@@ -262,7 +264,7 @@ package Row parseDataRow(scope const(ubyte)[] body, const(ColumnInfo)[] columns,
     }
     Row row;
     row.columns_ = columns;
-    row.values = (() @trusted => cast(immutable) values)(); // not referenced elsewhere
+    row.values = values;
     row.timeZone = timeZone;
     row.names = names;
     return row;

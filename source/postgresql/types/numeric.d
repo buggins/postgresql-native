@@ -11,6 +11,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.types.numeric;
 
+import dbwire.io.buffer : toBigEndian;
 import dbwire.types.decimal : Decimal;
 
 import postgresql.exception : ClientException, ProtocolException;
@@ -114,7 +115,7 @@ struct Numeric
         case Kind.finite:
             auto text = new char[textLength];
             writeText(text);
-            return (() @trusted => cast(string) text)(); // unique: allocated here
+            return text;
         }
     }
 
@@ -125,20 +126,45 @@ struct Numeric
     +/
     package(postgresql) long toLong() const pure
     {
+        const m = magnitude();
+        if (m.fits && negative && m.value <= cast(ulong) long.max + 1)
+            return cast(long)(0 - m.value); // two's complement: also right for long.min
+        if (m.fits && !negative && m.value <= long.max)
+            return cast(long) m.value;
+        throw new ClientException("The numeric value " ~ toString() ~ " is out of long's range");
+    }
+
+    /++
+    The value as a `ulong`, when it is integral (`isIntegral`).
+
+    Throws: `ClientException` if it is out of `ulong`'s range.
+    +/
+    package(postgresql) ulong toUlong() const pure
+    {
+        const m = magnitude();
+        if (m.fits && (!negative || m.value == 0))
+            return m.value;
+        throw new ClientException("The numeric value " ~ toString() ~ " is out of ulong's range");
+    }
+
+    private static struct Magnitude
+    {
+        ulong value;
+        bool fits; // false beyond ulong.max
+    }
+
+    // The absolute value of an integral value.
+    private Magnitude magnitude() const pure nothrow @nogc
+    {
         assert(isIntegral);
-        ulong magnitude;
-        bool fits = true;
-        for (long w = weight; w >= 0 && fits; w--)
+        Magnitude m = {fits: true};
+        for (long w = weight; w >= 0 && m.fits; w--)
         {
             const d = digitAt(w);
-            fits = magnitude <= (ulong.max - d) / 10_000;
-            magnitude = magnitude * 10_000 + d;
+            m.fits = m.value <= (ulong.max - d) / 10_000;
+            m.value = m.value * 10_000 + d;
         }
-        if (fits && negative && magnitude <= cast(ulong) long.max + 1)
-            return cast(long)(0 - magnitude); // two's complement: also right for long.min
-        if (fits && !negative && magnitude <= long.max)
-            return cast(long) magnitude;
-        throw new ClientException("The numeric value " ~ toString() ~ " is out of long's range");
+        return m;
     }
 
     // The base-10000 digit with weight `i` (0 beyond the stored digits).
@@ -221,7 +247,7 @@ struct Numeric
         writeText(text);
         try
             return Decimal.fromString(text);
-        catch (Exception e)
+        catch (ClientException)
             throw new ClientException("The numeric value has too many digits for a Decimal (76 at most)");
     }
 
@@ -331,6 +357,17 @@ unittest
         0x65, 0x16, 0xB0
     ]).toLong()); // 9223372036854775808
     assertThrown!ClientException(Numeric.decode([0, 1, 0, 100, 0, 0, 0, 0, 0, 1]).toLong()); // 10^400
+    assert(Numeric.decode([
+        0, 5, 0, 4, 0, 0, 0, 0, 0x03, 0x9A, 0x0D, 0x2C, 0x01, 0x70, 0x15, 0x65, 0x16, 0xB0
+    ]).toUlong() == 9_223_372_036_854_775_808UL);
+    // ulong.max = 18446744073709551615: 1844, 6744, 0737, 0955, 1615; then 18446744073709551616
+    assert(Numeric.decode([
+        0, 5, 0, 4, 0, 0, 0, 0, 0x07, 0x34, 0x1A, 0x58, 0x02, 0xE1, 0x03, 0xBB, 0x06, 0x4F
+    ]).toUlong() == ulong.max);
+    assertThrown!ClientException(Numeric.decode([
+        0, 5, 0, 4, 0, 0, 0, 0, 0x07, 0x34, 0x1A, 0x58, 0x02, 0xE1, 0x03, 0xBB, 0x06, 0x50
+    ]).toUlong());
+    assertThrown!ClientException(Numeric.decode([0, 1, 0, 0, 0x40, 0, 0, 0, 0, 5]).toUlong()); // -5
     // the longest exponent: many digits at the lowest weight (only a malformed value has them)
     ubyte[] bytes = [0, 62, 0x80, 0, 0x40, 0, 0, 0];
     foreach (i; 0 .. 62)
@@ -359,7 +396,7 @@ immutable(ubyte)[] encodeNumericText(string text) pure
     void header(ref ubyte[] data, int count, int weight, ushort signBits, int scale)
     {
         foreach (v; [count, weight, cast(int) signBits, scale])
-            data ~= [cast(ubyte)(v >> 8), cast(ubyte) v];
+            data ~= toBigEndian(cast(ushort) v)[];
     }
 
     ubyte[] data;
@@ -367,13 +404,13 @@ immutable(ubyte)[] encodeNumericText(string text) pure
     {
     case "NaN":
         header(data, 0, 0, NumericSign.nan, 0);
-        return (() @trusted => cast(immutable) data)();
+        return data;
     case "Infinity":
         header(data, 0, 0, NumericSign.positiveInfinity, 0);
-        return (() @trusted => cast(immutable) data)();
+        return data;
     case "-Infinity":
         header(data, 0, 0, NumericSign.negativeInfinity, 0);
-        return (() @trusted => cast(immutable) data)();
+        return data;
     default:
         break;
     }
@@ -432,8 +469,8 @@ immutable(ubyte)[] encodeNumericText(string text) pure
     }
     header(data, cast(int)(last - first), weight, sign, scale);
     foreach (g; groups[first .. last])
-        data ~= [cast(ubyte)(g >> 8), cast(ubyte) g];
-    return (() @trusted => cast(immutable) data)(); // not referenced elsewhere
+        data ~= toBigEndian(cast(ushort) g)[];
+    return data;
 }
 
 ///
