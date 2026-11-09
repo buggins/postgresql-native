@@ -26,6 +26,7 @@ import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 
 import postgresql.exception : ClientException;
+import postgresql.protocol.messages : MessageBuilder;
 import postgresql.types.floats : formatFloat4, formatFloat8;
 import postgresql.types.oids : Oid;
 import postgresql.types.temporal;
@@ -79,13 +80,31 @@ an unsupported D type.
 +/
 Param encodeParam(T)(T value, uint oid)
 {
+    MessageBuilder b;
+    const format = putParam(b, value, oid);
+    if (format == nullValue)
+        return Param(true);
+    return Param(false, format, (() @trusted => cast(immutable) b.data[4 .. $])()); // b's memory isn't used again
+}
+
+/// What `putParam` returns for NULL (else the format).
+package enum short nullValue = -1;
+
+/++
+Writes `value`, encoded as `encodeParam` encodes it, into a Bind message:
+its length (-1 for NULL) and bytes.
+
+Returns: the format, text (0) or binary (1); `nullValue` (-1) for NULL.
++/
+package short putParam(T)(ref MessageBuilder b, T value, uint oid)
+{
     alias U = Unqual!T;
     static if (is(U == typeof(null)))
-        return Param(true);
+        return b.putNull();
     else static if (is(U : Nullable!V, V))
-        return value.isNull ? Param(true) : encodeParam(value.get, oid);
+        return value.isNull ? b.putNull() : putParam(b, value.get, oid);
     else static if (is(U == Variant))
-        return encodeVariant(value, oid);
+        return putVariant(b, value, oid);
     else static if (is(U == enum))
     {
         // integer enums: their value for numeric parameters, else their member name (text, varchar,
@@ -95,120 +114,126 @@ Param encodeParam(T)(T value, uint oid)
             if (!isNumericOid(oid))
                 foreach (member; __traits(allMembers, U))
                     if (__traits(getMember, U, member) == value)
-                        return text(member);
+                        return b.putText(member);
         }
-        return encodeParam(cast(OriginalType!U) value, oid);
+        return putParam(b, cast(OriginalType!U) value, oid);
     }
     else static if (is(U == bool))
     {
         if (oid == Oid.bool_)
-            return binary([value ? ubyte(1) : ubyte(0)]);
-        return text(value ? "true" : "false");
+            return b.putBinary(ubyte(value ? 1 : 0));
+        return b.putText(value ? "true" : "false");
     }
     else static if (isSomeChar!U)
     {
-        import std.conv : to;
+        import std.utf : encode;
 
-        return text([value].to!string);
+        char[4] chars;
+        return b.putText(chars[0 .. encode(chars, value)]);
     }
     else static if (isIntegral!U)
-        return encodeInteger(value, oid);
+        return putInteger(b, value, oid);
     else static if (isFloatingPoint!U)
     {
         if (oid == Oid.float8)
-            return binary(bigEndianBytes(doubleBits(cast(double) value)));
+            return b.putBinary(doubleBits(cast(double) value));
         if (oid == Oid.float4)
-            return binary(bigEndianBytes(floatBits(cast(float) value)));
-        return text(is(U == float) ? formatFloat4(value) : formatFloat8(cast(double) value));
+            return b.putBinary(floatBits(cast(float) value));
+        return b.putText(is(U == float) ? formatFloat4(value) : formatFloat8(cast(double) value));
     }
     else static if (is(U == Decimal))
-        return text(value.toFixedString());
+        return b.putText(value.toFixedString());
     else static if (isSomeString!U)
     {
-        import std.conv : to;
+        static if (is(U : const(char)[]))
+            return b.putText(value);
+        else
+        {
+            import std.conv : to;
 
-        return text(value.to!string);
+            return b.putText(value.to!string);
+        }
     }
     else static if (is(U : const(ubyte)[]))
     {
         if (oid == Oid.bytea || oid == 0)
-            return binary(value.idup);
-        return text(hexBytea(value));
+            return b.putBinaryBytes(value);
+        return b.putText(hexBytea(value));
     }
     else static if (is(U == Date))
     {
         if (oid == Oid.date)
-            return binary(bigEndianBytes(dateToPostgres(value)));
-        return text(dateText(value));
+            return b.putBinary(dateToPostgres(value));
+        return b.putText(dateText(value));
     }
     else static if (is(U == DateTime))
     {
         if (oid == Oid.timestamp)
-            return binary(bigEndianBytes(dateTimeToPostgres(value)));
-        return text(dateText(value.date) ~ " " ~ value.timeOfDay.toISOExtString());
+            return b.putBinary(dateTimeToPostgres(value));
+        return b.putText(dateText(value.date) ~ " " ~ value.timeOfDay.toISOExtString());
     }
     else static if (is(U == SysTime))
     {
         // timestamptz: the point in time; timestamp: the wall time in UTC (as getSysTime reads it)
         if (oid == Oid.timestamptz || oid == Oid.timestamp)
-            return binary(bigEndianBytes(sysTimeToPostgres(value)));
-        return text(formatTimestampTz(sysTimeToPostgres(value), "UTC"));
+            return b.putBinary(sysTimeToPostgres(value));
+        return b.putText(formatTimestampTz(sysTimeToPostgres(value), "UTC"));
     }
     else static if (is(U == TimeOfDay))
     {
         const us = ((value.hour * 60L + value.minute) * 60 + value.second) * 1_000_000;
         if (oid == Oid.time)
-            return binary(bigEndianBytes(us));
-        return text(value.toISOExtString());
+            return b.putBinary(us);
+        return b.putText(value.toISOExtString());
     }
     else static if (is(U == Duration))
     {
         const us = value.total!"usecs";
         if (oid == Oid.interval)
-            return binary(intervalBytes(Interval(0, 0, us)));
+            return b.putInterval(Interval(0, 0, us));
         if (oid == Oid.time && us >= 0 && us <= microsecondsPerDay)
-            return binary(bigEndianBytes(us));
+            return b.putBinary(us);
         import std.conv : to;
 
-        return text(us.to!string ~ " microseconds");
+        return b.putText(us.to!string ~ " microseconds");
     }
     else static if (is(U == Interval))
     {
         if (oid == Oid.interval)
-            return binary(intervalBytes(value));
-        return text(value.toString());
+            return b.putInterval(value);
+        return b.putText(value.toString());
     }
     else static if (is(U == UUID))
     {
         if (oid == Oid.uuid)
-            return binary(value.data.idup);
-        return text(value.toString());
+            return b.putBinaryBytes(value.data[]);
+        return b.putText(value.toString());
     }
     else static if (is(U == Inet))
     {
         if (oid == Oid.inet || oid == Oid.cidr)
-            return binary(Inet(value.address, value.prefix, oid == Oid.cidr).toBinary());
-        return text(value.toString());
+            return b.putBinaryBytes(Inet(value.address, value.prefix, oid == Oid.cidr).toBinary());
+        return b.putText(value.toString());
     }
     else static if (is(U == BitString))
     {
         if (oid == Oid.bit || oid == Oid.varbit)
-            return binary(value.toBinary());
-        return text(value.toString());
+            return b.putBinaryBytes(value.toBinary());
+        return b.putText(value.toString());
     }
     else static if (isGeometric!U)
     {
         if (oid == geometricOidOf!U)
-            return binary(geometricToBinary(value));
-        return text(value.toString());
+            return b.putBinaryBytes(geometricToBinary(value));
+        return b.putText(value.toString());
     }
     else static if (isRange!U)
     {
         if (value.empty)
-            return text("empty");
-        return text((value.lowerInclusive ? "[" : "(") ~ (value.lowerInfinite ? "" : literalItem(value.lower)) ~ ","
-                ~ (
-                    value.upperInfinite ? "" : literalItem(value.upper)) ~ (value.upperInclusive ? "]" : ")"));
+            return b.putText("empty");
+        const lower = value.lowerInfinite ? "" : literalItem(value.lower);
+        const upper = value.upperInfinite ? "" : literalItem(value.upper);
+        return b.putText((value.lowerInclusive ? "[" : "(") ~ lower ~ "," ~ upper ~ (value.upperInclusive ? "]" : ")"));
     }
     else static if (is(U : V[K], V, K))
     {
@@ -223,10 +248,10 @@ Param encodeParam(T)(T value, uint oid)
             else
                 literal ~= quoteHstore(textOf(v));
         }
-        return text(literal);
+        return b.putText(literal);
     }
     else static if (isDynamicArray!U)
-        return encodeArray(value, oid);
+        return putArray(b, value, oid);
     else static if (is(U == struct))
     {
         // a composite value: (field,field,...)
@@ -235,7 +260,7 @@ Param encodeParam(T)(T value, uint oid)
         string literal = "(";
         static foreach (i, name; mappedFields!U)
             literal ~= (i ? "," : "") ~ literalItem(__traits(getMember, value, name));
-        return text(literal ~ ")");
+        return b.putText(literal ~ ")");
     }
     else
         static assert(false, "Unsupported parameter type " ~ T.stringof);
@@ -295,15 +320,22 @@ Returns: the rewritten SQL; `count` is set to the number of placeholders.
 +/
 string rewritePlaceholders(string sql, out size_t count) @safe pure
 {
-    import std.conv : to;
+    import std.array : appender;
+    import std.string : indexOf;
 
-    string result;
+    if (sql.indexOf('?') < 0)
+        return sql; // nothing to rewrite
+    auto result = appender!string;
+    result.reserve(sql.length + 16);
+    size_t copied; // sql[0 .. copied] is in result
     size_t i;
+    char[20] digits;
     while (i < sql.length)
     {
         const c = sql[i];
         if (c == '?')
         {
+            result ~= sql[copied .. i];
             if (i + 1 < sql.length && sql[i + 1] == '?')
             {
                 result ~= '?';
@@ -311,25 +343,22 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
             }
             else
             {
-                result ~= "$" ~ (++count).to!string;
+                result ~= '$';
+                result ~= digits[integerText(++count, digits) .. $];
                 i++;
             }
+            copied = i;
         }
         else if (c == '\'' || c == '"')
         {
             const escapes = c == '\'' && i > 0 && (sql[i - 1] == 'E' || sql[i - 1] == 'e')
                 && (i < 2 || !isIdentifierChar(sql[i - 2]));
-            const end = quotedEnd(sql, i, c, escapes);
-            result ~= sql[i .. end];
-            i = end;
+            i = quotedEnd(sql, i, c, escapes);
         }
         else if (c == '-' && i + 1 < sql.length && sql[i + 1] == '-')
         {
-            size_t end = i;
-            while (end < sql.length && sql[end] != '\n')
-                end++;
-            result ~= sql[i .. end];
-            i = end;
+            while (i < sql.length && sql[i] != '\n')
+                i++;
         }
         else if (c == '/' && i + 1 < sql.length && sql[i + 1] == '*')
         {
@@ -350,7 +379,6 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
                 else
                     end++;
             }
-            result ~= sql[i .. end];
             i = end;
         }
         else if (c == '$' && (i == 0 || !isIdentifierChar(sql[i - 1])))
@@ -365,23 +393,18 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure
                 size_t end = t + 1;
                 while (end < sql.length && !(end + tag.length <= sql.length && sql[end .. end + tag.length] == tag))
                     end++;
-                end = end + tag.length <= sql.length ? end + tag.length : sql.length;
-                result ~= sql[i .. end];
-                i = end;
+                i = end + tag.length <= sql.length ? end + tag.length : sql.length;
             }
             else
-            {
-                result ~= c;
                 i++;
-            }
         }
         else
-        {
-            result ~= c;
             i++;
-        }
     }
-    return result;
+    if (copied == 0)
+        return sql; // the ? were all in literals or comments
+    result ~= sql[copied .. $];
+    return result.data;
 }
 
 ///
@@ -417,7 +440,7 @@ string literalItem(T)(T value)
 
 // An array parameter: binary when the parameter is an array of a built-in type and every element is sent in
 // binary; else array text.
-Param encodeArray(A)(A value, uint oid)
+short putArray(A)(ref MessageBuilder b, A value, uint oid)
 {
     import std.traits : isDynamicArray, isSomeString;
     import postgresql.types.pgtype : builtinType, TypeKind;
@@ -446,54 +469,44 @@ Param encodeArray(A)(A value, uint oid)
     const element = t !is null && t.kind == TypeKind.array ? t.element : null;
     if (element !is null && element.kind == TypeKind.base)
     {
-        // binary: dimensions, NULL flag, element OID, (length, lower bound) per dimension, elements
-        Param[] parts;
+        // binary: dimensions, NULL flag, element OID, (length, lower bound) per dimension, elements; written
+        // in place, and undone if an element goes as text
+        const start = b.skip(4); // the length
+        b.putInt32(cast(int) lengths.length);
+        const nullFlag = b.skip(4);
+        b.putInt32(cast(int) element.oid);
+        foreach (l; lengths)
+        {
+            b.putInt32(l);
+            b.putInt32(1);
+        }
         bool allBinary = true, hasNull;
-        void collect(X)(X items)
+        void put(X)(X items)
         {
             foreach (item; items)
             {
                 static if (isValue!(typeof(X.init[0])))
                 {
-                    const p = encodeParam(item, element.oid);
-                    hasNull = hasNull || p.isNull;
-                    allBinary = allBinary && (p.isNull || p.format == 1);
-                    parts ~= p;
+                    const format = putParam(b, item, element.oid);
+                    if (format == nullValue)
+                        hasNull = true;
+                    else if (format != 1)
+                        allBinary = false;
                 }
                 else
-                    collect(item);
+                    put(item);
+                if (!allBinary)
+                    return;
             }
         }
 
-        collect(value);
+        put(value);
         if (allBinary)
         {
-            ubyte[] data;
-            void int32(int v)
-            {
-                data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
-            }
-
-            int32(cast(int) lengths.length);
-            int32(hasNull ? 1 : 0);
-            int32(cast(int) element.oid);
-            foreach (l; lengths)
-            {
-                int32(l);
-                int32(1);
-            }
-            foreach (p; parts)
-            {
-                if (p.isNull)
-                    int32(-1);
-                else
-                {
-                    int32(cast(int) p.data.length);
-                    data ~= p.data;
-                }
-            }
-            return binary((() @trusted => cast(immutable) data)()); // not referenced elsewhere
+            b.patchInt32(nullFlag, hasNull ? 1 : 0);
+            return b.endValue(start);
         }
+        b.truncate(start);
     }
     // text: {"a","b"}, NULL for NULL, nested braces for more dimensions
     const delimiter = element !is null ? element.delimiter : ',';
@@ -517,7 +530,7 @@ Param encodeArray(A)(A value, uint oid)
     }
 
     write(value);
-    return text(literal);
+    return b.putText(literal);
 }
 
 template geometricOidOf(T)
@@ -538,6 +551,59 @@ template geometricOidOf(T)
         enum geometricOidOf = Oid.circle;
 }
 
+// The value parts of a Bind message: the length (-1 for NULL), then the bytes; each returns the format, or
+// nullValue.
+short putNull(ref MessageBuilder b) @safe pure nothrow
+{
+    b.putInt32(-1);
+    return nullValue;
+}
+
+short putText(ref MessageBuilder b, scope const(char)[] s) @safe pure
+{
+    b.putBinaryBytes(cast(const(ubyte)[]) s);
+    return 0;
+}
+
+short putBinaryBytes(ref MessageBuilder b, scope const(ubyte)[] bytes) @safe pure
+{
+    checkLength(bytes.length);
+    b.putInt32(cast(int) bytes.length);
+    b.putBytes(bytes);
+    return 1;
+}
+
+short putBinary(T)(ref MessageBuilder b, T value) if (isIntegral!T)
+{
+    b.putInt32(T.sizeof);
+    b.putBigEndian(value);
+    return 1;
+}
+
+short putInterval(ref MessageBuilder b, const Interval value) @safe pure nothrow
+{
+    b.putInt32(16);
+    b.putBigEndian(value.microseconds);
+    b.putBigEndian(value.days);
+    b.putBigEndian(value.months);
+    return 1;
+}
+
+// Ends a binary value whose length was reserved at `start` (b.skip(4)).
+short endValue(ref MessageBuilder b, size_t start) @safe pure
+{
+    const length = b.length - start - 4;
+    checkLength(length);
+    b.patchInt32(start, cast(int) length);
+    return 1;
+}
+
+void checkLength(size_t length) @safe pure
+{
+    if (length > int.max)
+        throw new ClientException("A parameter value is longer than 2 GB");
+}
+
 bool isNumericOid(uint oid) @safe pure nothrow
 {
     switch (oid)
@@ -549,17 +615,7 @@ bool isNumericOid(uint oid) @safe pure nothrow
     }
 }
 
-Param binary(immutable(ubyte)[] data) @safe pure nothrow
-{
-    return Param(false, 1, data);
-}
-
-Param text(string s) @safe pure nothrow
-{
-    return Param(false, 0, cast(immutable(ubyte)[]) s);
-}
-
-Param encodeInteger(T)(T value, uint oid) @safe
+short putInteger(T)(ref MessageBuilder b, T value, uint oid) @safe
 {
     import std.conv : to;
 
@@ -576,26 +632,68 @@ Param encodeInteger(T)(T value, uint oid) @safe
     case Oid.int2:
         if (!fits(short.min, short.max))
             throw outOfRange(value.to!string, "smallint");
-        return binary(bigEndianBytes(cast(short) value));
+        return b.putBinary(cast(short) value);
     case Oid.int4:
         if (!fits(int.min, int.max))
             throw outOfRange(value.to!string, "integer");
-        return binary(bigEndianBytes(cast(int) value));
+        return b.putBinary(cast(int) value);
     case Oid.int8:
         if (!fits(long.min, long.max))
             throw outOfRange(value.to!string, "bigint");
-        return binary(bigEndianBytes(cast(long) value));
+        return b.putBinary(cast(long) value);
     case Oid.oid:
         if (!fits(0, uint.max))
             throw outOfRange(value.to!string, "oid");
-        return binary(bigEndianBytes(cast(uint) value));
+        return b.putBinary(cast(uint) value);
     case Oid.float8:
-        return binary(bigEndianBytes(doubleBits(cast(double) value)));
+        return b.putBinary(doubleBits(cast(double) value));
     case Oid.float4:
-        return binary(bigEndianBytes(floatBits(cast(float) value)));
+        return b.putBinary(floatBits(cast(float) value));
     default:
-        return text(value.to!string);
+        char[20] digits;
+        return b.putText(digits[integerText(value, digits) .. $]);
     }
+}
+
+/// Writes the decimal digits of `value` at the end of `buffer`; returns where they start.
+package size_t integerText(T)(T value, ref char[20] buffer)
+{
+    static if (T.min < 0)
+    {
+        const negative = value < 0;
+        ulong v = negative ? -cast(ulong) value : value; // also right for T.min
+    }
+    else
+    {
+        enum negative = false;
+        ulong v = value;
+    }
+    size_t at = buffer.length;
+    do
+    {
+        buffer[--at] = cast(char)('0' + v % 10);
+        v /= 10;
+    }
+    while (v);
+    if (negative)
+        buffer[--at] = '-';
+    return at;
+}
+
+@safe pure nothrow @nogc unittest
+{
+    char[20] digits;
+    assert(digits[integerText(-42, digits) .. $] == "-42" && digits[integerText(0u, digits) .. $] == "0");
+    assert(digits[integerText(long.min, digits) .. $] == "-9223372036854775808");
+    assert(digits[integerText(ulong.max, digits) .. $] == "18446744073709551615");
+}
+
+@safe pure nothrow unittest
+{
+    MessageBuilder b;
+    b.putBinary(short(-2));
+    b.putBinary(ulong(1));
+    assert(b.data == [0, 0, 0, 2, 0xFF, 0xFE, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
 ClientException outOfRange(string value, string type) @safe pure
@@ -603,22 +701,30 @@ ClientException outOfRange(string value, string type) @safe pure
     return new ClientException("The value " ~ value ~ " is out of the range of the parameter's type " ~ type);
 }
 
-package Param encodeVariant(Variant value, uint oid) @trusted
+/// Encodes a `Variant` holding a type `encodeParam` takes (empty or `null`: NULL) into a Bind message.
+package short putVariant(ref MessageBuilder b, Variant value, uint oid) @trusted
 {
     // Variant's accessors aren't @safe; each branch copies a plain value out of it
-    if (!value.hasValue || value.type == typeid(typeof(null)))
-        return Param(true);
-    if (value.type == typeid(byte[]))
-        return encodeParam(cast(const(ubyte)[]) value.get!(byte[]), oid);
-    static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
-            Decimal, string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime,
-            SysTime, TimeOfDay, Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line,
-            LineSegment, Box, Path, Polygon, Circle))
-    {
-        if (value.type == typeid(T))
-            return encodeParam(value.get!T, oid);
-    }
-    throw new ClientException("Unsupported parameter type in a Variant: " ~ value.type.toString());
+    const type = value.type;
+    if (!value.hasValue || type is typeid(typeof(null)))
+        return b.putNull();
+    if (type is typeid(byte[]))
+        return putParam(b, cast(const(ubyte)[]) value.get!(byte[]), oid);
+    alias Types = AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real, Decimal,
+            string, const(char)[], char[], immutable(ubyte)[], const(ubyte)[], ubyte[], Date, DateTime, SysTime,
+            TimeOfDay, Duration, Interval, UUID, char, wchar, dchar, Inet, BitString, Point, Line, LineSegment, Box,
+            Path, Polygon, Circle);
+    static foreach (T; Types)
+        if (type is typeid(T)) // the usual case: one TypeInfo object per type
+            return putParam(b, value.get!T, oid);
+    if (type == typeid(typeof(null)))
+        return b.putNull();
+    if (type == typeid(byte[]))
+        return putParam(b, cast(const(ubyte)[]) value.get!(byte[]), oid);
+    static foreach (T; Types)
+        if (type == typeid(T)) // e.g. a TypeInfo of another shared library
+            return putParam(b, value.get!T, oid);
+    throw new ClientException("Unsupported parameter type in a Variant: " ~ type.toString());
 }
 
 import std.meta : AliasSeq;
@@ -631,19 +737,6 @@ uint floatBits(float f) @trusted pure nothrow
 ulong doubleBits(double d) @trusted pure nothrow
 {
     return *cast(ulong*)&d; // reinterprets the 8 bytes
-}
-
-immutable(ubyte)[] bigEndianBytes(T)(T value) @safe pure nothrow
-{
-    auto bytes = new ubyte[T.sizeof];
-    foreach (i; 0 .. T.sizeof)
-        bytes[i] = cast(ubyte)(cast(ulong) value >> (8 * (T.sizeof - 1 - i)));
-    return (() @trusted => cast(immutable) bytes)();
-}
-
-immutable(ubyte)[] intervalBytes(const Interval value) @safe pure nothrow
-{
-    return bigEndianBytes(value.microseconds) ~ bigEndianBytes(value.days) ~ bigEndianBytes(value.months);
 }
 
 string hexBytea(const(ubyte)[] bytes) @safe pure
@@ -661,11 +754,7 @@ string hexBytea(const(ubyte)[] bytes) @safe pure
 
 string dateText(Date d) @safe pure
 {
-    import std.format : format;
-
-    if (d.year > 0)
-        return format("%04d-%02d-%02d", d.year, cast(int) d.month, d.day);
-    return format("%04d-%02d-%02d BC", 1 - d.year, cast(int) d.month, d.day);
+    return formatDate(dateToPostgres(d)); // 2026-11-09, 0044-03-15 BC
 }
 
 bool isIdentifierChar(char c) @safe pure nothrow

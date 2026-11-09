@@ -44,12 +44,17 @@ struct Inet
     +/
     string toString() const pure
     {
-        import std.conv : to;
-
-        string text = isIPv6 ? ipv6Text(address) : ipv4Text(address);
+        AddressText t;
+        if (isIPv6)
+            t.ipv6(address);
+        else
+            t.ipv4(address);
         if (isCidr || prefix != address.length * 8)
-            text ~= "/" ~ prefix.to!string;
-        return text;
+        {
+            t.put('/');
+            t.decimal(prefix);
+        }
+        return t.chars[0 .. t.length].idup;
     }
 
     /++
@@ -128,65 +133,100 @@ unittest
     assert(Inet.fromBinary(i.toBinary()) == i && i.toBinary() == [2, 8, 0, 4, 10, 1, 2, 3]);
 }
 
-private string ipv4Text(scope const(ubyte)[] a) pure
+// The text of an address, written in place (at most 49 characters: a mapped IPv6 address and a prefix).
+private struct AddressText
 {
-    import std.format : format;
+    char[64] chars;
+    size_t length;
 
-    return format("%d.%d.%d.%d", a[0], a[1], a[2], a[3]);
-}
-
-private string ipv6Text(scope const(ubyte)[] a) pure
-{
-    import std.format : format;
-
-    ushort[8] words;
-    foreach (i; 0 .. 8)
-        words[i] = cast(ushort)(a[2 * i] << 8 | a[2 * i + 1]);
-    // the longest run of zero words (the first of equal ones), if at least 2
-    int bestBase = -1, bestLength, currentBase = -1, currentLength;
-    foreach (i; 0 .. 8)
+    void put(char c) pure nothrow @nogc
     {
-        if (words[i] == 0)
-        {
-            if (currentBase < 0)
-            {
-                currentBase = i;
-                currentLength = 0;
-            }
-            currentLength++;
-            if (currentLength > bestLength)
-            {
-                bestBase = currentBase;
-                bestLength = currentLength;
-            }
-        }
-        else
-            currentBase = -1;
+        chars[length++] = c;
     }
-    if (bestLength < 2)
-        bestBase = -1;
-    string text;
-    foreach (i; 0 .. 8)
+
+    void decimal(uint v) pure nothrow @nogc
     {
-        if (bestBase >= 0 && i >= bestBase && i < bestBase + bestLength)
-        {
-            if (i == bestBase)
-                text ~= ":";
-            continue;
-        }
-        if (i != 0)
-            text ~= ":";
-        // an IPv4 address embedded (compatible, ::a.b.c.d, or mapped, ::ffff:a.b.c.d)
-        if (i == 6 && bestBase == 0 && (bestLength == 6 || (bestLength == 5 && words[5] == 0xFFFF)))
-        {
-            text ~= ipv4Text(a[12 .. 16]);
-            return text;
-        }
-        text ~= format("%x", words[i]);
+        if (v >= 100)
+            put(cast(char)('0' + v / 100));
+        if (v >= 10)
+            put(cast(char)('0' + v / 10 % 10));
+        put(cast(char)('0' + v % 10));
     }
-    if (bestBase >= 0 && bestBase + bestLength == 8)
-        text ~= ":";
-    return text;
+
+    void hex(uint v) pure nothrow @nogc
+    {
+        static immutable digits = "0123456789abcdef";
+        bool started;
+        foreach_reverse (k; 0 .. 4)
+        {
+            const d = v >> (4 * k) & 15;
+            if (d || started || k == 0)
+            {
+                put(digits[d]);
+                started = true;
+            }
+        }
+    }
+
+    void ipv4(scope const(ubyte)[] a) pure nothrow @nogc
+    {
+        foreach (i; 0 .. 4)
+        {
+            if (i)
+                put('.');
+            decimal(a[i]);
+        }
+    }
+
+    void ipv6(scope const(ubyte)[] a) pure nothrow @nogc
+    {
+        ushort[8] words;
+        foreach (i; 0 .. 8)
+            words[i] = cast(ushort)(a[2 * i] << 8 | a[2 * i + 1]);
+        // the longest run of zero words (the first of equal ones), if at least 2
+        int bestBase = -1, bestLength, currentBase = -1, currentLength;
+        foreach (i; 0 .. 8)
+        {
+            if (words[i] == 0)
+            {
+                if (currentBase < 0)
+                {
+                    currentBase = i;
+                    currentLength = 0;
+                }
+                currentLength++;
+                if (currentLength > bestLength)
+                {
+                    bestBase = currentBase;
+                    bestLength = currentLength;
+                }
+            }
+            else
+                currentBase = -1;
+        }
+        if (bestLength < 2)
+            bestBase = -1;
+        foreach (i; 0 .. 8)
+        {
+            if (bestBase >= 0 && i >= bestBase && i < bestBase + bestLength)
+            {
+                if (i == bestBase)
+                    put(':');
+                continue;
+            }
+            if (i != 0)
+                put(':');
+            // an IPv4 address embedded (compatible, ::a.b.c.d, or mapped, ::ffff:a.b.c.d)
+            if (i == 6 && bestBase == 0 && (bestLength == 6 || (bestLength == 5 && words[5] == 0xFFFF)))
+            {
+                ipv4(a[12 .. 16]);
+                return;
+            }
+            hex(words[i]);
+        }
+        if (bestBase >= 0 && bestBase + bestLength == 8)
+            put(':');
+    }
 }
 
 private immutable(ubyte)[] parseIPv4(const(char)[] s) pure

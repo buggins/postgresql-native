@@ -52,7 +52,8 @@ import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 
 import postgresql.exception : ClientException;
-import postgresql.params : encodeParam, Param;
+import postgresql.params : integerText, putParam;
+import postgresql.protocol.messages : MessageBuilder;
 import postgresql.result : QueryResult;
 import postgresql.types.oids : Oid;
 import postgresql.types.temporal : Interval;
@@ -262,7 +263,9 @@ package string insertSql(T)(string table, size_t rows)
         sql ~= sqlColumnName(c);
     }
     sql ~= ") VALUES ";
+    sql.reserve(sql.data.length + rows * columns.length * 8);
     size_t n;
+    char[20] digits;
     foreach (r; 0 .. rows)
     {
         sql ~= r ? ", (" : "(";
@@ -271,7 +274,7 @@ package string insertSql(T)(string table, size_t rows)
             if (c)
                 sql ~= ", ";
             sql ~= "$";
-            sql ~= (++n).to!string;
+            sql ~= digits[integerText(++n, digits) .. $];
         }
         sql ~= ")";
     }
@@ -294,21 +297,31 @@ package final class RowsEncoder(T)
 {
     const(T)[] rows;
 
+    /// Empties `rows`, keeping their memory for the next batch.
+    void clear() @trusted nothrow
+    {
+        // the rows of the last batch are no longer used: their memory can take the next ones
+        auto memory = cast(T[]) rows;
+        memory.length = 0;
+        memory.assumeSafeAppend();
+        rows = memory;
+    }
+
     static if (hasVariantField!T)
         enum attributes = "@trusted"; // copies of Variant values, which hold plain values
     else
         enum attributes = "@safe";
 
-    mixin("Param[] encode(const(uint)[] types) " ~ attributes ~ q{
+    mixin("void encode(const(uint)[] types, ref MessageBuilder b) " ~ attributes ~ q{
     {
         import std.conv : to;
+        import postgresql.statement : beginParameters, setFormat;
 
         enum width = mappedFields!T.length;
         if (types.length != rows.length * width)
             throw new ClientException("The insert statement has " ~ types.length.to!string
                 ~ " parameter(s), expected " ~ (rows.length * width).to!string);
-        Param[] params;
-        params.reserve(types.length);
+        const formats = beginParameters(b, types.length);
         size_t i;
         foreach (ref row; rows)
         {
@@ -317,16 +330,16 @@ package final class RowsEncoder(T)
                 try
                 {
                     static if (is(Unqual!(typeof(__traits(getMember, T, name))) == Variant))
-                        params ~= encodeParam(cast() __traits(getMember, row, name), types[i]); // a copy to encode
+                        const format = putParam(b, cast() __traits(getMember, row, name), types[i]); // a copy
                     else
-                        params ~= encodeParam(__traits(getMember, row, name), types[i]);
+                        const format = putParam(b, __traits(getMember, row, name), types[i]);
+                    setFormat(b, formats, i, format);
                 }
                 catch (ClientException e)
                     throw new ClientException(T.stringof ~ "." ~ name ~ ": " ~ e.msg);
                 i++;
             }
         }
-        return params;
     }
     });
 }

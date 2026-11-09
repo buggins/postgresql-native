@@ -29,7 +29,7 @@ module postgresql.copy;
 
 import postgresql.connection : affectedRows, Connection;
 import postgresql.exception : ClientException, ServerException;
-import postgresql.params : encodeParam, Param;
+import postgresql.params : nullValue, putParam;
 import postgresql.protocol.codes : BackendMessage, FrontendMessage;
 import postgresql.protocol.messages : Message, MessageBuilder;
 import postgresql.result : ColumnInfo, makeRow, Row, ValueFormat;
@@ -73,7 +73,8 @@ final class CopyIn
     private CopyFormat format_;
     private size_t columnCount_;
     private const(PgType)[] types;
-    private ubyte[] buffer;
+    private MessageBuilder message; // the CopyData message being filled (begun when it has data)
+    private MessageBuilder value; // a value encoded by writeRow, before it is escaped into `message`
     private bool binaryStarted; // the binary header was written by writeRow
     private bool done;
     private enum bufferLimit = 64 * 1024;
@@ -113,8 +114,28 @@ final class CopyIn
     void write(scope const(ubyte)[] data) @safe
     {
         checkOpen();
-        buffer ~= data;
-        if (buffer.length >= bufferLimit)
+        if (data.length >= bufferLimit)
+        {
+            // large data: a message of its own, sent without copying it into the buffer
+            flush();
+            if (!done)
+                conn.guarded({
+                    ubyte[5] header = [FrontendMessage.copyData, 0, 0, 0, 0];
+                    if (data.length > int.max - 4)
+                        throw new ClientException("A COPY data chunk is longer than 2 GB");
+                    const length = cast(uint)(data.length + 4);
+                    header[1 .. 5] = [
+                        cast(ubyte)(length >> 24), cast(ubyte)(length >> 16), cast(ubyte)(length >> 8),
+                        cast(ubyte) length
+                    ];
+                    conn.stream.write(header[]);
+                    conn.stream.send(data);
+                });
+            return;
+        }
+        startMessage();
+        message.putBytes(data);
+        if (message.length >= bufferLimit)
             flush();
     }
 
@@ -143,11 +164,30 @@ final class CopyIn
                 throw new ClientException("The copy has " ~ columnCount_.to!string ~ " column(s), but "
                         ~ Args.length.to!string ~ " value(s) were given");
         }
-        Param[Args.length] fields;
-        static foreach (i; 0 .. Args.length)
-            fields[i] = format_ == CopyFormat.binary ? encodeParam(values[i], columnOid(i)) : encodeParam(values[i], Oid
-                    .text);
-        writeFields(fields[]);
+        checkOpen();
+        const rowBegin = startRow(Args.length);
+        try
+        {
+            static foreach (i; 0 .. Args.length)
+            {
+                if (format_ == CopyFormat.binary)
+                {
+                    const at = message.length;
+                    putBinaryField(i, at, putParam(message, values[i], columnOid(i)));
+                }
+                else
+                {
+                    value.clear();
+                    putTextField(i, putParam(value, values[i], Oid.text) == nullValue);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            undoRow(rowBegin); // nothing of the row is sent
+            throw e;
+        }
+        endRow();
     }
 
     /++
@@ -159,11 +199,30 @@ final class CopyIn
         import postgresql.attributes : mappedFields;
 
         enum names = mappedFields!T;
-        Param[names.length] fields;
-        static foreach (i, name; names)
-            fields[i] = format_ == CopyFormat.binary ? encodeParam(__traits(getMember, value, name), columnOid(i))
-                : encodeParam(__traits(getMember, value, name), Oid.text);
-        writeFields(fields[]);
+        checkOpen();
+        const rowBegin = startRow(names.length);
+        try
+        {
+            static foreach (i, name; names)
+            {
+                if (format_ == CopyFormat.binary)
+                {
+                    const at = message.length;
+                    putBinaryField(i, at, putParam(message, __traits(getMember, value, name), columnOid(i)));
+                }
+                else
+                {
+                    this.value.clear();
+                    putTextField(i, putParam(this.value, __traits(getMember, value, name), Oid.text) == nullValue);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            undoRow(rowBegin); // nothing of the row is sent
+            throw e;
+        }
+        endRow();
     }
 
     private uint columnOid(size_t i) const @safe
@@ -173,116 +232,135 @@ final class CopyIn
         return types[i] is null ? 0 : types[i].oid;
     }
 
-    private void writeFields(scope Param[] fields) @safe
+    // Starts a row of `writeRow`/`writeStruct` of `count` fields: the binary header before the first one, the
+    // field count. Returns where the row begins in `message`, with the header if this row wrote it.
+    private size_t startRow(size_t count) @safe
     {
-        import std.conv : to;
-
-        checkOpen();
-        final switch (format_)
+        startMessage();
+        const rowBegin = message.length;
+        if (format_ == CopyFormat.binary)
         {
-        case CopyFormat.text:
-            foreach (i, f; fields)
-            {
-                if (i)
-                    buffer ~= '\t';
-                if (f.isNull)
-                    buffer ~= `\N`;
-                else
-                    foreach (c; f.data)
-                    {
-                        switch (c)
-                        {
-                        case '\\':
-                            buffer ~= `\\`;
-                            break;
-                        case '\t':
-                            buffer ~= `\t`;
-                            break;
-                        case '\n':
-                            buffer ~= `\n`;
-                            break;
-                        case '\r':
-                            buffer ~= `\r`;
-                            break;
-                        default:
-                            buffer ~= c;
-                        }
-                    }
-            }
-            buffer ~= '\n';
-            break;
-        case CopyFormat.csv:
-            foreach (i, f; fields)
-            {
-                if (i)
-                    buffer ~= ',';
-                if (f.isNull)
-                    continue; // an unquoted empty value
-                buffer ~= '"';
-                foreach (c; f.data)
-                {
-                    if (c == '"')
-                        buffer ~= '"';
-                    buffer ~= c;
-                }
-                buffer ~= '"';
-            }
-            buffer ~= '\n';
-            break;
-        case CopyFormat.binary:
             if (!binaryStarted)
             {
-                buffer ~= binarySignature[];
-                buffer ~= [0, 0, 0, 0, 0, 0, 0, 0]; // flags, header extension length
+                message.putBytes(binarySignature[]);
+                message.putBigEndian(ulong(0)); // flags, header extension length
                 binaryStarted = true;
+                headerRow = true;
             }
-            const n = cast(ushort) fields.length;
-            buffer ~= [cast(ubyte)(n >> 8), cast(ubyte) n];
-            foreach (i, f; fields)
-            {
-                if (f.isNull)
-                {
-                    buffer ~= [0xFF, 0xFF, 0xFF, 0xFF];
-                    continue;
-                }
-                const bytes = binaryForm(f, i);
-                const length = cast(uint) bytes.length;
-                buffer ~= [
-                    cast(ubyte)(length >> 24), cast(ubyte)(length >> 16), cast(ubyte)(length >> 8),
-                    cast(ubyte) length
-                ];
-                buffer ~= bytes;
-            }
-            break;
+            message.putInt16(cast(short) count);
         }
-        if (buffer.length >= bufferLimit)
+        return rowBegin;
+    }
+
+    private bool headerRow; // the current row wrote the binary header
+
+    // After a row failed: removes what it wrote (the header too, if it wrote it).
+    private void undoRow(size_t rowBegin) @safe pure nothrow
+    {
+        message.truncate(rowBegin);
+        if (message.length == 5)
+            message.clear(); // only the CopyData header is left: nothing to send
+        if (headerRow)
+            binaryStarted = false;
+        headerRow = false;
+    }
+
+    private void endRow() @safe
+    {
+        headerRow = false;
+        if (format_ != CopyFormat.binary)
+            message.putByte('\n');
+        if (message.length >= bufferLimit)
             flush();
     }
 
-    // The binary form of an encoded value: binary as it is; text for types whose binary form is their text
-    // (text types, enums, json), jsonb (a version byte first), numeric (converted).
-    private immutable(ubyte)[] binaryForm(const Param p, size_t column) @safe
+    // Writes the text of field `i` (encoded in `value`) into the row: escaped, or quoted for CSV.
+    private void putTextField(size_t i, bool isNull) @safe
+    {
+        const text = value.data[4 .. $];
+        if (format_ == CopyFormat.text)
+        {
+            if (i)
+                message.putByte('\t');
+            if (isNull)
+            {
+                message.putBytes(cast(const(ubyte)[]) `\N`);
+                return;
+            }
+            // runs without special characters at once
+            size_t start;
+            foreach (k, c; text)
+            {
+                const escape = c == '\\' ? '\\' : c == '\t' ? 't' : c == '\n' ? 'n' : c == '\r' ? 'r' : '\0';
+                if (escape)
+                {
+                    message.putBytes(text[start .. k]);
+                    message.putByte('\\');
+                    message.putByte(escape);
+                    start = k + 1;
+                }
+            }
+            message.putBytes(text[start .. $]);
+        }
+        else
+        {
+            if (i)
+                message.putByte(',');
+            if (isNull)
+                return; // an unquoted empty value
+            message.putByte('"');
+            size_t start;
+            foreach (k, c; text)
+                if (c == '"')
+                {
+                    message.putBytes(text[start .. k + 1]);
+                    start = k; // the quote again: doubled
+                }
+            message.putBytes(text[start .. $]);
+            message.putByte('"');
+        }
+    }
+
+    // After putParam wrote field `i` into `message` at `at`, returning `format`: converts text to the binary
+    // form where the binary form is the text (text types, enums, json), jsonb (a version byte first) and numeric.
+    private void putBinaryField(size_t i, size_t at, short format) @safe
     {
         import postgresql.types.numeric : encodeNumericText;
 
-        if (p.format == 1)
-            return p.data;
-        const t = types[column];
+        if (format != 0)
+            return; // binary, or NULL
+        const t = types[i];
         const codec = t is null ? 0 : t.codec;
         switch (codec)
         {
         case Oid.text, Oid.varchar, Oid.bpchar, Oid.name, Oid.json, Oid.unknown, Oid.xml:
-            return p.data;
+            return;
         case Oid.jsonb:
-            immutable(ubyte)[] version1 = [1];
-            return version1 ~ p.data;
+            const text = message.data[at + 4 .. $].idup;
+            message.truncate(at);
+            message.putInt32(cast(int) text.length + 1);
+            message.putByte(1);
+            message.putBytes(text);
+            return;
         case Oid.numeric:
-            return encodeNumericText(cast(string) p.data);
+            const text = cast(string) message.data[at + 4 .. $].idup;
+            message.truncate(at);
+            const bytes = encodeNumericText(text);
+            message.putInt32(cast(int) bytes.length);
+            message.putBytes(bytes);
+            return;
         default:
-            throw new ClientException("The value '" ~ cast(string) p.data ~ "' has no binary form for column type "
-                    ~ (
-                        t is null ? "unknown" : t.name) ~ ": use text or CSV COPY");
+            const text = cast(string) message.data[at + 4 .. $].idup;
+            throw new ClientException("The value '" ~ text ~ "' has no binary form for column type "
+                    ~ (t is null ? "unknown" : t.name) ~ ": use text or CSV COPY");
         }
+    }
+
+    // Begins a CopyData message in `message` unless one is begun.
+    private void startMessage() @safe pure nothrow
+    {
+        if (message.length == 0)
+            message.begin(FrontendMessage.copyData);
     }
 
     /++
@@ -296,7 +374,10 @@ final class CopyIn
     {
         checkOpen();
         if (binaryStarted)
-            buffer ~= [0xFF, 0xFF]; // the trailer
+        {
+            startMessage();
+            message.putInt16(-1); // the trailer
+        }
         flush();
         done = true;
         string tag;
@@ -324,7 +405,7 @@ final class CopyIn
         b.putCString(reason); // a NUL in it throws here, before anything changes
         b.finish();
         done = true;
-        buffer = null;
+        message = MessageBuilder.init;
         if (!conn.isOpen)
             return; // e.g. after a FATAL error, which is the one to report
         conn.guarded({ conn.stream.send(b.data); readToEnd(); });
@@ -353,17 +434,14 @@ final class CopyIn
                 if (conn.isReadyForQuery)
                 {
                     done = true;
-                    buffer = null;
+                    message = MessageBuilder.init;
                 }
             }
-            if (!done && buffer.length)
+            if (!done && message.length)
             {
-                MessageBuilder b;
-                b.begin(FrontendMessage.copyData);
-                b.putBytes(buffer);
-                b.finish();
-                conn.stream.send(b.data);
-                buffer.length = 0;
+                message.finish();
+                conn.stream.send(message.data);
+                message.clear();
             }
         });
         if (done)
@@ -395,6 +473,8 @@ final class CopyIn
     }
 }
 
+private static immutable ubyte[1] emptyChunk; // an empty chunk that isn't null (null means the end)
+
 /++
 A running `COPY ... TO STDOUT`: the data comes in chunks (one row each, as
 the server sends them), readable as bytes (`readChunk`, `readAll`) or as
@@ -414,7 +494,7 @@ final class CopyOut
     private string timeZone;
     private bool done;
     private ulong rows;
-    private ubyte[] binaryBuffer; // binary data not parsed yet
+    private immutable(ubyte)[] binaryData; // binary data not parsed yet
     private bool binaryHeaderRead;
     private Row current;
     private bool hasCurrent;
@@ -488,7 +568,7 @@ final class CopyOut
                 switch (m.type)
                 {
                 case BackendMessage.copyData:
-                    chunk = m.body.readRest().idup;
+                    chunk = m.data.length ? m.data.idup : emptyChunk[0 .. 0]; // empty, but not null (the end)
                     return;
                 case BackendMessage.copyDone:
                     break;
@@ -599,11 +679,11 @@ final class CopyOut
             line = line[0 .. $ - 1];
         if (line.length && line[$ - 1] == '\r')
             line = line[0 .. $ - 1];
-        const fields = format_ == CopyFormat.csv ? parseCsvLine(line) : parseTextLine(line);
+        auto fields = format_ == CopyFormat.csv ? parseCsvLine(line) : parseTextLine(line);
         setRow(fields);
     }
 
-    private void setRow(const string[] fields) @safe
+    private void setRow(string[] fields) @safe
     {
         import std.conv : to;
 
@@ -611,14 +691,8 @@ final class CopyOut
             throw new ClientException(
                     "A COPY row has " ~ fields.length.to!string ~ " field(s), expected "
                     ~ columnCount_.to!string);
-        auto values = new immutable(ubyte)[][fields.length];
-        auto nulls = new bool[fields.length];
-        foreach (i, f; fields)
-        {
-            nulls[i] = f is null;
-            values[i] = cast(immutable(ubyte)[]) f;
-        }
-        current = makeRow(columns, values, nulls, timeZone);
+        // the fields are slices of the line or new strings, "" when empty: null only for NULL, as makeRow needs
+        current = makeRow(columns, (() @trusted => cast(immutable(ubyte)[][]) fields)(), timeZone); // chars as bytes
         hasCurrent = true;
     }
 
@@ -626,23 +700,23 @@ final class CopyOut
     {
         import std.conv : to;
 
+        // the row starts at binaryData[0]; the values are slices of it (rows within one chunk: no copy)
         size_t at;
         bool need(size_t n)
         {
-            while (binaryBuffer.length < at + n)
+            while (binaryData.length < at + n)
             {
                 const chunk = readChunk();
                 if (chunk is null)
                     return false;
-                binaryBuffer ~= chunk;
+                binaryData = binaryData.length ? binaryData ~ chunk : chunk;
             }
             return true;
         }
 
         int int32()
         {
-            const v = binaryBuffer[at] << 24 | binaryBuffer[at + 1] << 16 | binaryBuffer[at + 2] << 8
-                | binaryBuffer[at + 3];
+            const v = binaryData[at] << 24 | binaryData[at + 1] << 16 | binaryData[at + 2] << 8 | binaryData[at + 3];
             at += 4;
             return v;
         }
@@ -651,7 +725,7 @@ final class CopyOut
         {
             if (!need(19))
                 return;
-            if (binaryBuffer[0 .. 11] != binarySignature[])
+            if (binaryData[0 .. 11] != binarySignature[])
                 throw new ClientException("Invalid binary COPY signature");
             at = 15; // signature, flags
             const extension = int32();
@@ -659,15 +733,17 @@ final class CopyOut
                 throw new ClientException("Invalid binary COPY header");
             at += extension;
             binaryHeaderRead = true;
+            binaryData = binaryData[at .. $];
+            at = 0;
         }
         if (!need(2))
             return;
-        const count = cast(short)(binaryBuffer[at] << 8 | binaryBuffer[at + 1]);
-        at += 2;
+        const count = cast(short)(binaryData[0] << 8 | binaryData[1]);
+        at = 2;
         if (count == -1)
         {
             // the trailer: read to the end
-            binaryBuffer = null;
+            binaryData = null;
             close();
             return;
         }
@@ -676,24 +752,20 @@ final class CopyOut
                     "A binary COPY row has " ~ count.to!string ~ " field(s), expected "
                     ~ columnCount_.to!string);
         auto values = new immutable(ubyte)[][count];
-        auto nulls = new bool[count];
-        foreach (i; 0 .. count)
+        foreach (ref v; values)
         {
             if (!need(4))
                 throw new ClientException("Truncated binary COPY row");
             const length = int32();
             if (length == -1)
-            {
-                nulls[i] = true;
-                continue;
-            }
+                continue; // NULL
             if (length < 0 || !need(length))
                 throw new ClientException("Truncated binary COPY row");
-            values[i] = binaryBuffer[at .. at + length].idup;
+            v = binaryData[at .. at + length]; // not null: binaryData holds at least the count
             at += length;
         }
-        binaryBuffer = binaryBuffer[at .. $].dup;
-        current = makeRow(columns, values, nulls, timeZone);
+        binaryData = binaryData[at .. $];
+        current = makeRow(columns, values, timeZone);
         hasCurrent = true;
     }
 }
@@ -701,42 +773,48 @@ final class CopyOut
 /++
 Splits a line of text-format COPY data into its fields: tab-separated,
 `\N` for NULL (null), backslash escapes decoded (`\t`, `\n`, `\\`, `\b`,
-`\f`, `\r`, `\v`, octal `\nnn`, hexadecimal `\xhh`).
+`\f`, `\r`, `\v`, octal `\nnn`, hexadecimal `\xhh`). Fields without escapes are
+slices of `line`.
 +/
 string[] parseTextLine(string line) @safe pure
 {
-    string[] fields;
-    char[] current;
-    bool isNullMarker;
-    size_t i;
-    void endField()
-    {
-        fields ~= isNullMarker ? null : current.length ? (() @trusted => cast(string) current)() : "";
-        current = null;
-        isNullMarker = false;
-    }
+    import std.string : indexOf;
 
-    while (i < line.length)
+    string[] fields;
+    for (;;)
     {
-        const c = line[i++];
-        if (c == '\t')
+        auto end = line.indexOf('\t');
+        const field = end < 0 ? line : line[0 .. end];
+        fields ~= field == `\N` ? null : field.indexOf('\\') >= 0 ? unescapeText(field) : field.length ? field : "";
+        if (end < 0)
+            return fields;
+        line = line[end + 1 .. $];
+    }
+}
+
+// A field with backslash escapes, decoded.
+private string unescapeText(string field) @safe pure
+{
+    char[] current;
+    size_t i;
+    while (i < field.length)
+    {
+        // up to the next escape at once
+        size_t run = i;
+        while (run < field.length && field[run] != '\\')
+            run++;
+        current ~= field[i .. run];
+        i = run;
+        if (i >= field.length)
+            break;
+        if (++i >= field.length)
         {
-            endField();
-            continue;
+            current ~= '\\'; // a lone backslash at the end
+            break;
         }
-        if (c != '\\' || i >= line.length)
-        {
-            current ~= c;
-            continue;
-        }
-        const e = line[i++];
+        const e = field[i++];
         switch (e)
         {
-        case 'N':
-            isNullMarker = current.length == 0 && (i >= line.length || line[i] == '\t');
-            if (!isNullMarker)
-                current ~= 'N';
-            break;
         case 'b':
             current ~= '\b';
             break;
@@ -757,9 +835,9 @@ string[] parseTextLine(string line) @safe pure
             break;
         case 'x':
             int value, digits;
-            while (digits < 2 && i < line.length && isHex(line[i]))
+            while (digits < 2 && i < field.length && isHex(field[i]))
             {
-                value = value * 16 + hexValue(line[i++]);
+                value = value * 16 + hexValue(field[i++]);
                 digits++;
             }
             if (digits == 0)
@@ -769,19 +847,18 @@ string[] parseTextLine(string line) @safe pure
             break;
         case '0': .. case '7':
             int value = e - '0', digits = 1;
-            while (digits < 3 && i < line.length && line[i] >= '0' && line[i] <= '7')
+            while (digits < 3 && i < field.length && field[i] >= '0' && field[i] <= '7')
             {
-                value = value * 8 + (line[i++] - '0');
+                value = value * 8 + (field[i++] - '0');
                 digits++;
             }
             current ~= cast(char) value;
             break;
-        default:
+        default: // \N inside a value is an N
             current ~= e;
         }
     }
-    endField();
-    return fields;
+    return current.length ? (() @trusted => cast(string) current)() : ""; // unique: built here
 }
 
 private bool isHex(char c) @safe pure nothrow
@@ -803,10 +880,22 @@ private int hexValue(char c) @safe pure nothrow
     assert(f.length == 2 && f[0]!is null && f[0].length == 0);
 }
 
+@safe unittest
+{
+    assert(parseTextLine("") == [""] && parseTextLine("a\\") == ["a\\"] && parseTextLine(`a\Nb`) == [
+        "aNb"
+    ]);
+    assert(parseTextLine("\\N\t\\\\N") == [null, `\N`] && parseTextLine(`x\x4`) == ["x\x04"]);
+    assert(parseTextLine(`\x`) == ["x"] && parseTextLine(`\0101`) == ["\x081"]);
+    const line = "plain\tmore";
+    const f = parseTextLine(line);
+    assert(&f[0][0] is &line[0] && &f[1][0] is &line[6]); // slices, not copies
+}
+
 /++
 Splits a line of CSV COPY data into its fields: comma-separated, `"` quotes
 (doubled inside quotes); an unquoted empty field is NULL (null), a quoted
-one an empty string.
+one an empty string. Fields without doubled quotes are slices of `line`.
 +/
 string[] parseCsvLine(string line) @safe pure
 {
@@ -814,43 +903,37 @@ string[] parseCsvLine(string line) @safe pure
     size_t i;
     for (;;)
     {
-        char[] current;
-        bool quoted, any;
-        while (i < line.length)
+        // most fields are slices of the line: unquoted, or quoted without doubled quotes
+        string field;
+        bool isNull;
+        if (i < line.length && line[i] == '"')
         {
-            const c = line[i];
-            if (c == '"')
+            size_t close = i + 1;
+            while (close < line.length && line[close] != '"')
+                close++;
+            if (close < line.length && (close + 1 == line.length || line[close + 1] == ','))
             {
-                quoted = true;
-                any = true;
-                i++;
-                while (i < line.length)
-                {
-                    if (line[i] == '"')
-                    {
-                        if (i + 1 < line.length && line[i + 1] == '"')
-                        {
-                            current ~= '"';
-                            i += 2;
-                            continue;
-                        }
-                        i++;
-                        break;
-                    }
-                    current ~= line[i++];
-                }
-                continue;
+                field = line[i + 1 .. close];
+                i = close + 1;
             }
-            if (c == ',')
-                break;
-            current ~= c;
-            any = true;
-            i++;
+            else
+                field = parseCsvField(line, i);
         }
-        if (!any && !quoted)
-            fields ~= null;
         else
-            fields ~= current.length ? (() @trusted => cast(string) current)() : "";
+        {
+            size_t end = i;
+            while (end < line.length && line[end] != ',' && line[end] != '"')
+                end++;
+            if (end < line.length && line[end] == '"')
+                field = parseCsvField(line, i);
+            else
+            {
+                field = line[i .. end];
+                isNull = end == i;
+                i = end;
+            }
+        }
+        fields ~= isNull ? null : field.length ? field : "";
         if (i >= line.length)
             break;
         i++; // the comma
@@ -858,9 +941,57 @@ string[] parseCsvLine(string line) @safe pure
     return fields;
 }
 
+// A CSV field with doubled quotes, or with quoted and unquoted parts, from `i` to its comma (or the end).
+private string parseCsvField(string line, ref size_t i) @safe pure
+{
+    char[] current;
+    while (i < line.length)
+    {
+        const c = line[i];
+        if (c == '"')
+        {
+            i++;
+            while (i < line.length)
+            {
+                if (line[i] == '"')
+                {
+                    if (i + 1 < line.length && line[i + 1] == '"')
+                    {
+                        current ~= '"';
+                        i += 2;
+                        continue;
+                    }
+                    i++;
+                    break;
+                }
+                current ~= line[i++];
+            }
+            continue;
+        }
+        if (c == ',')
+            break;
+        current ~= c;
+        i++;
+    }
+    return current.length ? (() @trusted => cast(string) current)() : ""; // unique: built here
+}
+
 ///
 @safe unittest
 {
     const f = parseCsvLine(`1,"a ""b"", c",,""`);
     assert(f.length == 4 && f[0] == "1" && f[1] == `a "b", c` && f[2] is null && f[3]!is null && f[3].length == 0);
+}
+
+@safe unittest
+{
+    assert(parseCsvLine("") == [null] && parseCsvLine("a,") == ["a", null] && parseCsvLine(",") == [
+        null, null
+    ]);
+    assert(parseCsvLine(`"a,b",c`) == ["a,b", "c"] && parseCsvLine(`ab"c,d"e,f`) == ["abc,de", "f"]);
+    assert(parseCsvLine(`"unterminated, x`) == ["unterminated, x"]);
+    assert(parseCsvLine(`"",""""`) == ["", `"`] && parseCsvLine(`"x"y`) == ["xy"]);
+    const line = "plain,\"quoted\"";
+    const f = parseCsvLine(line);
+    assert(&f[0][0] is &line[0] && &f[1][0] is &line[7]); // slices, not copies
 }

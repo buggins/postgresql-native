@@ -147,45 +147,88 @@ unittest
 
 /++
 Composes a frontend message: `begin` writes the type and reserves the length,
-the `put*` functions append fields, `finish` fills in the length.
+the `put*` functions append fields, `finish` fills in the length. Several
+messages can follow each other; `clear` starts again, keeping the memory.
+It can't be copied: pass it by `ref`.
 +/
 struct MessageBuilder
 {
-    /// The bytes composed so far.
-    ubyte[] data;
+    private ubyte[] buffer;
+    private size_t used;
     private size_t start;
+
+    @disable this(this);
+
+    /// The bytes composed so far.
+    @property const(ubyte)[] data() const pure nothrow
+    {
+        return buffer[0 .. used];
+    }
+
+    /// Number of bytes composed so far.
+    @property size_t length() const pure nothrow
+    {
+        return used;
+    }
+
+    /// Size of the memory held.
+    @property size_t capacity() const pure nothrow
+    {
+        return buffer.length;
+    }
+
+    /// Discards the composed bytes, keeping the memory for the next messages.
+    void clear() pure nothrow
+    {
+        used = 0;
+    }
+
+    /// Discards the bytes from `length` on (e.g. a part that has to be written differently).
+    void truncate(size_t length) pure nothrow
+    {
+        assert(length <= used);
+        used = length;
+    }
 
     /// Starts a message of `type`; a startup-phase packet (no type byte) when `type` is 0.
     void begin(char type) pure nothrow
     {
         if (type != 0)
-            data ~= cast(ubyte) type;
-        start = data.length;
-        data ~= [ubyte(0), 0, 0, 0];
+            putByte(cast(ubyte) type);
+        start = used;
+        skip(4);
     }
 
     /// Appends a byte.
     void putByte(ubyte b) pure nothrow
     {
-        data ~= b;
+        extend(1)[0] = b;
     }
 
     /// Appends a big-endian int16.
     void putInt16(short v) pure nothrow
     {
-        data ~= [cast(ubyte)(v >> 8), cast(ubyte) v];
+        putBigEndian(v);
     }
 
     /// Appends a big-endian int32.
     void putInt32(int v) pure nothrow
     {
-        data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+        putBigEndian(v);
+    }
+
+    /// Appends a big-endian integer of any size.
+    void putBigEndian(T)(T v) if (__traits(isIntegral, T))
+    {
+        auto bytes = extend(T.sizeof);
+        static foreach (i; 0 .. T.sizeof)
+            bytes[i] = cast(ubyte)(v >> (8 * (T.sizeof - 1 - i)));
     }
 
     /// Appends raw bytes.
     void putBytes(scope const(ubyte)[] bytes) pure nothrow
     {
-        data ~= bytes;
+        extend(bytes.length)[] = bytes[];
     }
 
     /++
@@ -200,8 +243,33 @@ struct MessageBuilder
 
         if (s.indexOf('\0') >= 0)
             throw new ClientException("A string sent to the server contains a NUL character");
-        data ~= cast(const(ubyte)[]) s;
-        data ~= 0;
+        auto bytes = extend(s.length + 1);
+        bytes[0 .. $ - 1] = cast(const(ubyte)[]) s;
+        bytes[$ - 1] = 0;
+    }
+
+    /// Appends `n` bytes to be filled in later (`patchInt16`, `patchInt32`); returns their position.
+    size_t skip(size_t n) pure nothrow
+    {
+        const at = used;
+        extend(n);
+        return at;
+    }
+
+    /// Writes a big-endian integer at position `at` (of bytes appended before).
+    void patchInt16(size_t at, short v) pure nothrow
+    {
+        buffer[at] = cast(ubyte)(v >> 8);
+        buffer[at + 1] = cast(ubyte) v;
+    }
+
+    /// ditto
+    void patchInt32(size_t at, int v) pure nothrow
+    {
+        buffer[at] = cast(ubyte)(v >> 24);
+        buffer[at + 1] = cast(ubyte)(v >> 16);
+        buffer[at + 2] = cast(ubyte)(v >> 8);
+        buffer[at + 3] = cast(ubyte) v;
     }
 
     /++
@@ -213,13 +281,25 @@ struct MessageBuilder
     {
         import dbwire.exception : ClientException;
 
-        const length = data.length - start;
+        const length = used - start;
         if (length > int.max)
             throw new ClientException("A message to the server is longer than 2 GB");
-        data[start] = cast(ubyte)(length >> 24);
-        data[start + 1] = cast(ubyte)(length >> 16);
-        data[start + 2] = cast(ubyte)(length >> 8);
-        data[start + 3] = cast(ubyte) length;
+        patchInt32(start, cast(int) length);
+    }
+
+    // `n` more bytes at the end, to be written by the caller.
+    private ubyte[] extend(size_t n) pure nothrow
+    {
+        if (buffer.length - used < n)
+        {
+            size_t size = buffer.length ? buffer.length * 2 : 64;
+            while (size - used < n)
+                size *= 2;
+            buffer.length = size;
+        }
+        auto bytes = buffer[used .. used + n];
+        used += n;
+        return bytes;
     }
 }
 
@@ -237,6 +317,22 @@ unittest
     s.putInt32(80_877_103);
     s.finish();
     assert(s.data == [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F]); // SSLRequest
+}
+
+unittest
+{
+    MessageBuilder b;
+    b.putBigEndian(ulong(0x0102030405060708));
+    const at = b.skip(2);
+    b.putBytes(new ubyte[300]); // grows
+    b.patchInt16(at, -2);
+    assert(b.length == 310 && b.data[0 .. 10] == [1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0xFE]);
+    b.truncate(8);
+    assert(b.data == [1, 2, 3, 4, 5, 6, 7, 8]);
+    const capacity = b.capacity;
+    b.clear();
+    b.putInt16(7);
+    assert(b.data == [0, 7] && b.capacity == capacity);
 }
 
 /++
@@ -271,13 +367,23 @@ final class MessageStream
     +/
     Message read()
     {
-        ubyte[5] header;
-        reader.readExact(header[]);
+        const header = reader.ensure(5);
+        const type = cast(char) header[0];
         const length = (cast(uint) header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
         if (length < 4 || length - 4 > maxMessageLength)
-            throw new ProtocolException("Invalid length of a '" ~ cast(char) header[0] ~ "' message");
+            throw new ProtocolException("Invalid length of a '" ~ type ~ "' message");
         const size = length - 4;
-        // a buffer grown for a large message isn't kept for the small ones after it
+        if (5 + size <= reader.capacity)
+        {
+            // most messages: a slice of the reader's buffer, valid until it reads again
+            const bytes = reader.ensure(5 + size);
+            reader.consume(5 + size);
+            if (buffer.length > keptBufferSize)
+                buffer = null; // grown for a large message: not kept for the small ones after it
+            return Message(type, bytes[5 .. 5 + size]);
+        }
+        reader.consume(5);
+        // messages longer than the reader's buffer: into `buffer`
         if (buffer.length > keptBufferSize && size <= keptBufferSize)
             buffer = null;
         if (buffer.length >= size)
@@ -295,7 +401,7 @@ final class MessageStream
                 done = next;
             }
         }
-        return Message(cast(char) header[0], buffer[0 .. size]);
+        return Message(type, buffer[0 .. size]);
     }
 
     private enum size_t keptBufferSize = 1 << 20;
@@ -360,5 +466,5 @@ unittest
     m = s.read();
     assert(m.type == 'D' && m.data.length == 3 << 20 && m.data[$ - 1] == 7);
     m = s.read();
-    assert(m.type == 'Z' && m.data == cast(const(ubyte)[]) "I" && s.buffer.length == 1);
+    assert(m.type == 'Z' && m.data == cast(const(ubyte)[]) "I" && s.buffer is null);
 }

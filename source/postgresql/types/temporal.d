@@ -73,7 +73,7 @@ struct CivilDate
 }
 
 /// The calendar date `days` days after 1970-01-01 (negative before).
-CivilDate civilFromDays(long days) pure nothrow
+CivilDate civilFromDays(long days) pure nothrow @nogc
 {
     // Count from 0000-03-01 in 400-year eras of 146097 days; March-based years put the leap day last.
     days += 719_468;
@@ -90,7 +90,7 @@ CivilDate civilFromDays(long days) pure nothrow
 }
 
 /// The number of days from 1970-01-01 to `date` (negative before).
-long daysFromCivil(CivilDate date) pure nothrow
+long daysFromCivil(CivilDate date) pure nothrow @nogc
 {
     const year = date.year - (date.month <= 2 ? 1 : 0);
     const era = (year >= 0 ? year : year - 399) / 400;
@@ -122,7 +122,11 @@ string formatDate(int pgDays) pure
     if (pgDays == dateNegativeInfinity)
         return "-infinity";
     const d = civilFromDays(pgDays + postgresEpochDays);
-    return datePart(d) ~ (d.year <= 0 ? " BC" : "");
+    TextBuffer t;
+    t.date(d);
+    if (d.year <= 0)
+        t.put(" BC");
+    return t.get();
 }
 
 /++
@@ -130,11 +134,9 @@ The text of a `time` (microseconds since midnight): `12:34:56`, `00:00:00.000001
 +/
 string formatTime(long microseconds) pure
 {
-    import std.format : format;
-
-    const seconds = microseconds / 1_000_000;
-    return format("%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60) ~ fraction(
-            microseconds % 1_000_000);
+    TextBuffer t;
+    t.time(microseconds);
+    return t.get();
 }
 
 /++
@@ -143,7 +145,10 @@ west of UTC, as on the wire): `12:34:56+05:30`, `12:34:56.5-08`.
 +/
 string formatTimeTz(long microseconds, int zoneWest) pure
 {
-    return formatTime(microseconds) ~ formatOffset(-cast(long) zoneWest);
+    TextBuffer t;
+    t.time(microseconds);
+    t.offset(-cast(long) zoneWest);
+    return t.get();
 }
 
 /++
@@ -155,15 +160,9 @@ string formatTimestamp(long microseconds) pure
         return "infinity";
     if (microseconds == timestampNegativeInfinity)
         return "-infinity";
-    long days = microseconds / microsecondsPerDay;
-    long time = microseconds % microsecondsPerDay;
-    if (time < 0)
-    {
-        days--;
-        time += microsecondsPerDay;
-    }
-    const d = civilFromDays(days + postgresEpochDays);
-    return datePart(d) ~ " " ~ formatTime(time) ~ (d.year <= 0 ? " BC" : "");
+    TextBuffer t;
+    t.timestamp(microseconds, false, 0);
+    return t.get();
 }
 
 /++
@@ -179,12 +178,9 @@ string formatTimestampTz(long microseconds, string zoneName)
     if (microseconds == timestampInfinity || microseconds == timestampNegativeInfinity)
         return formatTimestamp(microseconds);
     const offset = offsetSeconds(microseconds, resolveTimeZone(zoneName));
-    const local = microseconds + offset * 1_000_000;
-    const text = formatTimestamp(local);
-    // the offset goes before a " BC" suffix
-    if (text.length > 3 && text[$ - 3 .. $] == " BC")
-        return text[0 .. $ - 3] ~ formatOffset(offset) ~ " BC";
-    return text ~ formatOffset(offset);
+    TextBuffer t;
+    t.timestamp(microseconds + offset * 1_000_000, true, offset);
+    return t.get();
 }
 
 /++
@@ -194,39 +190,46 @@ and `-infinity` (PostgreSQL 17 and later).
 +/
 string formatInterval(const Interval value) pure
 {
-    import std.format : format;
-    import std.math : abs;
-
     if (value.months == int.max && value.days == int.max && value.microseconds == long.max)
         return "infinity";
     if (value.months == int.min && value.days == int.min && value.microseconds == long.min)
         return "-infinity";
-    string text;
-    bool zero = true; // nothing printed yet
-    bool previousNegative; // the last part printed was negative
+    TextBuffer t;
+    bool previousNegative; // the last part written was negative
     void part(long amount, string unit)
     {
         if (amount == 0)
             return;
-        text ~= format("%s%s%d %s%s", zero ? "" : " ", previousNegative && amount > 0 ? "+" : "", amount, unit,
-                amount != 1 ? "s" : "");
+        if (t.length)
+            t.put(' ');
+        if (previousNegative && amount > 0)
+            t.put('+');
+        if (amount < 0)
+            t.put('-');
+        t.number(amount < 0 ? -amount : amount, 1);
+        t.put(' ');
+        t.put(unit);
+        if (amount != 1)
+            t.put('s');
         previousNegative = amount < 0;
-        zero = false;
     }
 
     part(value.months / 12, "year");
     part(value.months % 12, "mon");
     part(value.days, "day");
-    if (zero || value.microseconds != 0)
+    if (t.length == 0 || value.microseconds != 0)
     {
         const negative = value.microseconds < 0;
+        if (t.length)
+            t.put(' ');
+        if (negative)
+            t.put('-');
+        else if (previousNegative)
+            t.put('+');
         // long.min has no positive counterpart; it is -infinity's, handled above with the other fields
-        const us = negative ? -value.microseconds : value.microseconds;
-        const seconds = us / 1_000_000;
-        text ~= format("%s%s%02d:%02d:%02d", zero ? "" : " ", negative ? "-" : previousNegative ? "+" : "",
-                seconds / 3600, seconds / 60 % 60, seconds % 60) ~ fraction(us % 1_000_000);
+        t.time(negative ? -value.microseconds : value.microseconds);
     }
-    return text;
+    return t.get();
 }
 
 ///
@@ -468,40 +471,113 @@ enum long postgresEpochStdTime = 630_822_816_000_000_000L;
 enum long minSysTimeMicros = -postgresEpochStdTime / 10;
 enum long maxSysTimeMicros = (3_155_378_975_999_999_999L - postgresEpochStdTime) / 10;
 
-string datePart(CivilDate d) pure
+// Text of up to 128 characters, written in place: one allocation for the result.
+struct TextBuffer
 {
-    import std.format : format;
+    char[128] chars;
+    size_t length;
 
-    const year = d.year <= 0 ? 1 - d.year : d.year;
-    return format("%04d-%02d-%02d", year, d.month, d.day);
-}
+    void put(char c) pure nothrow @nogc
+    {
+        chars[length++] = c;
+    }
 
-// ".ffffff" without trailing zeros; empty for 0
-string fraction(long microseconds) pure
-{
-    import std.format : format;
+    void put(scope const(char)[] s) pure nothrow @nogc
+    {
+        chars[length .. length + s.length] = s;
+        length += s.length;
+    }
 
-    if (microseconds == 0)
-        return null;
-    auto text = format(".%06d", microseconds);
-    while (text[$ - 1] == '0')
-        text = text[0 .. $ - 1];
-    return text;
-}
+    // `value` (not negative) in decimal, zero-padded to `width` digits
+    void number(ulong value, size_t width) pure nothrow @nogc
+    {
+        char[20] digits;
+        size_t at = digits.length;
+        do
+        {
+            digits[--at] = cast(char)('0' + value % 10);
+            value /= 10;
+        }
+        while (value);
+        while (digits.length - at < width)
+            digits[--at] = '0';
+        put(digits[at .. $]);
+    }
 
-// "+05:30", "-08", "+00", "+05:41:16"
-string formatOffset(long seconds) pure
-{
-    import std.format : format;
+    // yyyy-mm-dd, the year of a BC date counted from 1
+    void date(CivilDate d) pure nothrow @nogc
+    {
+        number(d.year <= 0 ? 1 - d.year : d.year, 4);
+        put('-');
+        number(d.month, 2);
+        put('-');
+        number(d.day, 2);
+    }
 
-    const sign = seconds < 0 ? "-" : "+";
-    const s = seconds < 0 ? -seconds : seconds;
-    auto text = format("%s%02d", sign, s / 3600);
-    if (s % 3600 != 0)
-        text ~= format(":%02d", s / 60 % 60);
-    if (s % 60 != 0)
-        text ~= format(":%02d", s % 60);
-    return text;
+    // hh:mm:ss[.ffffff] (the fraction without trailing zeros); hours may go past 24 (intervals)
+    void time(long microseconds) pure nothrow @nogc
+    {
+        const seconds = microseconds / 1_000_000;
+        number(seconds / 3600, 2);
+        put(':');
+        number(seconds / 60 % 60, 2);
+        put(':');
+        number(seconds % 60, 2);
+        auto us = microseconds % 1_000_000;
+        if (us == 0)
+            return;
+        size_t width = 6;
+        while (us % 10 == 0)
+        {
+            us /= 10;
+            width--;
+        }
+        put('.');
+        number(us, width);
+    }
+
+    // +05:30, -08, +00, +05:41:16
+    void offset(long seconds) pure nothrow @nogc
+    {
+        put(seconds < 0 ? '-' : '+');
+        const s = seconds < 0 ? -seconds : seconds;
+        number(s / 3600, 2);
+        if (s % 3600 != 0)
+        {
+            put(':');
+            number(s / 60 % 60, 2);
+        }
+        if (s % 60 != 0)
+        {
+            put(':');
+            number(s % 60, 2);
+        }
+    }
+
+    // a timestamp (local microseconds since 2000-01-01): date, time, the offset if `withOffset`, BC
+    void timestamp(long microseconds, bool withOffset, long offsetSeconds) pure nothrow @nogc
+    {
+        long days = microseconds / microsecondsPerDay;
+        long time = microseconds % microsecondsPerDay;
+        if (time < 0)
+        {
+            days--;
+            time += microsecondsPerDay;
+        }
+        const d = civilFromDays(days + postgresEpochDays);
+        date(d);
+        put(' ');
+        this.time(time);
+        if (withOffset)
+            offset(offsetSeconds);
+        if (d.year <= 0)
+            put(" BC");
+    }
+
+    string get() const pure nothrow
+    {
+        return chars[0 .. length].idup;
+    }
 }
 
 // The zone's UTC offset in seconds at a point in time (microseconds since 2000-01-01 UTC).

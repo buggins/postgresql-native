@@ -259,12 +259,7 @@ struct Value
             {
                 const n = Numeric.decode(data);
                 if (n.isIntegral)
-                {
-                    try
-                        return n.toString().to!long; // integral: digits only, no point
-                    catch (ConvException)
-                        throw new ClientException("The numeric value " ~ n.toString() ~ " is out of long's range");
-                }
+                    return n.toLong();
                 throw new ClientException("The numeric value " ~ n.toString() ~ " is not an integer");
             }
             throw wrongType("long");
@@ -642,31 +637,17 @@ struct Value
                 a.elements[i] = Value(info, cast(immutable(ubyte)[]) e, e is null, timeZone);
             return a;
         }
-        auto r = Reader(data, "array");
-        const dims = r.int32();
-        r.int32(); // has NULLs
-        const elementOid = cast(uint) r.int32();
-        if (dims < 0 || dims > 6)
-            throw new ProtocolException("Malformed array value: " ~ "dimensions");
-        size_t total = dims > 0 ? 1 : 0;
-        a.lengths = new int[dims];
-        a.lowerBounds = new int[dims];
-        foreach (d; 0 .. dims)
-        {
-            a.lengths[d] = r.int32();
-            a.lowerBounds[d] = r.int32();
-            if (a.lengths[d] < 0 || total * a.lengths[d] > data.length)
-                throw new ProtocolException("Malformed array value: " ~ "lengths");
-            total *= a.lengths[d];
-        }
-        const info = partInfo(element !is null ? element : builtinType(elementOid), ValueFormat.binary, elementOid);
-        a.elements = new Value[total];
+        auto h = binaryArray();
+        a.lengths = h.lengths[0 .. h.dims].dup;
+        a.lowerBounds = h.lowerBounds[0 .. h.dims].dup;
+        const info = h.elementInfo;
+        a.elements = new Value[h.total];
         foreach (ref e; a.elements)
         {
-            const p = r.part();
+            const p = h.reader.part();
             e = Value(info, p.bytes, p.isNull, timeZone);
         }
-        r.end();
+        h.reader.end();
         return a;
     }
 
@@ -979,6 +960,13 @@ struct Value
                     return cast(T) list;
                 }
             }
+            static if (arrayDepth!U == 1)
+            {
+                // one dimension in binary: the elements straight from the data, without a Value[]
+                E[] list;
+                if (kind == TypeKind.array && (binary ? binaryElements(list) : textElements(list)))
+                    return cast(T) list;
+            }
             const a = getArray();
             if (a.elements.length == 0)
                 return T.init;
@@ -1028,6 +1016,73 @@ struct Value
         }
         else
             static assert(0, "Values can't be read as " ~ T.stringof);
+    }
+
+    // The header of a binary array; `reader` is at the elements.
+    private static struct BinaryArray
+    {
+        Reader reader;
+        int dims;
+        int[6] lengths;
+        int[6] lowerBounds;
+        size_t total; // number of elements
+        const(ColumnInfo)* elementInfo;
+    }
+
+    // Reads the header of a binary array value.
+    private BinaryArray binaryArray() const @safe
+    {
+        BinaryArray h;
+        h.reader = Reader(data, "array");
+        h.dims = h.reader.int32();
+        h.reader.int32(); // has NULLs
+        const elementOid = cast(uint) h.reader.int32();
+        if (h.dims < 0 || h.dims > 6)
+            throw new ProtocolException("Malformed array value: " ~ "dimensions");
+        h.total = h.dims > 0 ? 1 : 0;
+        foreach (d; 0 .. h.dims)
+        {
+            h.lengths[d] = h.reader.int32();
+            h.lowerBounds[d] = h.reader.int32();
+            // each element takes at least 4 bytes: a bound on the total before anything is allocated
+            if (h.lengths[d] < 0 || h.total * h.lengths[d] > data.length)
+                throw new ProtocolException("Malformed array value: " ~ "lengths");
+            h.total *= h.lengths[d];
+        }
+        const element = type.withoutDomain.element;
+        h.elementInfo = partInfo(element !is null ? element : builtinType(elementOid), ValueFormat.binary, elementOid);
+        return h;
+    }
+
+    // The elements of an array text of one dimension (or none) as `E`s; false for other arrays.
+    private bool textElements(E)(out E[] list) const
+    {
+        const element = type.withoutDomain.element;
+        auto parts = parseArrayText(cast(string) data, element is null ? ',' : element.delimiter);
+        if (parts.lengths.length > 1)
+            return false;
+        const info = partInfo(element, ValueFormat.text, 0);
+        list = new E[parts.elements.length];
+        foreach (i, e; parts.elements)
+            list[i] = Value(info, cast(immutable(ubyte)[]) e, e is null, timeZone).get!E();
+        return true;
+    }
+
+    // The elements of a binary array of one dimension (or none) as `E`s; false for other arrays.
+    private bool binaryElements(E)(out E[] list) const
+    {
+        auto h = binaryArray();
+        if (h.dims > 1)
+            return false;
+        const info = h.elementInfo;
+        list = new E[h.total];
+        foreach (ref item; list)
+        {
+            const p = h.reader.part();
+            item = Value(info, p.bytes, p.isNull, timeZone).get!E();
+        }
+        h.reader.end();
+        return true;
     }
 
     // The array (or nested arrays) of `A` from `a`, starting at dimension `level` and element `at`.
@@ -1120,14 +1175,45 @@ struct Value
 
     private string arrayText() const @safe
     {
+        import postgresql.params : integerText;
+        import std.array : appender;
         import std.conv : to;
 
+        const element = type.withoutDomain.element;
+        const delimiter = element is null ? ',' : element.delimiter;
+        auto text = appender!string;
+        text.reserve(data.length * 2 + 2);
+        if (binary)
+        {
+            // one dimension, lower bound 1 (most arrays): straight from the data
+            auto h = binaryArray();
+            if (h.dims == 1 && h.lowerBounds[0] == 1)
+            {
+                text ~= '{';
+                foreach (i; 0 .. h.total)
+                {
+                    if (i)
+                        text ~= delimiter;
+                    const p = h.reader.part();
+                    const v = Value(h.elementInfo, p.bytes, p.isNull, timeZone);
+                    if (p.isNull)
+                        text ~= "NULL";
+                    else if (v.isIntegerType)
+                    {
+                        char[20] digits;
+                        text ~= digits[integerText(v.integer(), digits) .. $]; // never quoted
+                    }
+                    else
+                        text ~= quoteArrayElement(v.getString(), delimiter);
+                }
+                h.reader.end();
+                text ~= '}';
+                return text.data;
+            }
+        }
         const a = getArray();
         if (a.elements.length == 0)
             return "{}";
-        const element = type.withoutDomain.element;
-        const delimiter = element is null ? ',' : element.delimiter;
-        string text;
         foreach (d; 0 .. a.lengths.length)
             if (a.lowerBounds[d] != 1)
             {
@@ -1166,7 +1252,7 @@ struct Value
         }
         foreach (k; 0 .. a.lengths.length)
             text ~= "}";
-        return text;
+        return text.data;
     }
 
     private static string rangeText(const RangeValue r) @safe
@@ -1587,6 +1673,12 @@ private immutable(ubyte)[] decodeHex(const(char)[] text) @safe pure
     }
 
     assert(v(Oid.int4, [0xFF, 0xFF, 0xFF, 0xFE]).getLong() == -2);
+
+    // numeric: 5.00 (numeric(10,2)) is an integer; 5.5 isn't; 10^20 is out of range
+    assert(v(Oid.numeric, [0, 1, 0, 0, 0, 0, 0, 2, 0, 5]).getLong() == 5);
+    assert(v(Oid.numeric, [0, 1, 0, 0, 0x40, 0, 0, 0, 0, 5]).get!int == -5);
+    assertThrown!ClientException(v(Oid.numeric, [0, 2, 0, 0, 0, 0, 0, 1, 0, 5, 0x13, 0x88]).getLong());
+    assertThrown!ClientException(v(Oid.numeric, [0, 1, 0, 5, 0, 0, 0, 0, 0, 1]).getLong());
 
     // anonymous records in records: the field types come from the data, so the nesting is limited
     immutable(ubyte)[] nested(size_t depth)

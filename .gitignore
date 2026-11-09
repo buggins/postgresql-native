@@ -32,3 +32,4 @@ dub.selections.json
 /postgresql-native-test-*
 /integration-tests*/postgresql-native_integration-tests*
 /examples/*/postgresql-native_example-*
+/bench/postgresql-native-bench
