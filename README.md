@@ -125,10 +125,12 @@ else `~/.pg_service.conf`) and then the system's (`pg_service.conf` in
 file is used when the server asks (`passfile`, `PGPASSFILE`, else
 `~/.pgpass`; `%APPDATA%\postgresql\pgpass.conf` on Windows). The TLS files
 default to `root.crt`, `root.crl`, `postgresql.crt` and `postgresql.key` in
-`~/.postgresql` when they exist; with `root.crt`, `sslmode=require` verifies
-the certificate. TLS is never used over Unix-domain sockets, and the default
-host is `localhost` over TCP (libpq's default is the socket directory). When no CA is given, `verify-ca` and `verify-full` use the
-system's trusted certificates.
+`~/.postgresql` when they exist (`postgresql.key` with permissions 0600 or
+less, as libpq checks); with `root.crt`, `sslmode=require` verifies the
+certificate. TLS is never used over Unix-domain sockets, and the default
+host is `localhost` over TCP (libpq's default is the socket directory). When no CA is given, `verify-full` uses the
+system's trusted certificates, and `verify-ca` fails (as in libpq: without the
+host name check, any certificate those CAs issued would be accepted).
 
 Without TLS (`sslmode=disable`, or `prefer` with a server without TLS), the
 session travels in clear; SCRAM still keeps the password itself off the

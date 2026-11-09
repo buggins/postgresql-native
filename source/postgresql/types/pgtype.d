@@ -44,13 +44,13 @@ final class PgType
     /// Its kind.
     TypeKind kind;
     /// The element type of an array, the subtype of a range, the range type of a multirange, the base of a domain.
-    PgType element;
+    const(PgType) element;
     /// The delimiter between array elements of this type in text (`;` for `box`, else `,`).
     char delimiter = ',';
     /// The field names of a composite type (empty for `record`).
     string[] fieldNames;
     /// The field types of a composite type.
-    PgType[] fieldTypes;
+    const(PgType)[] fieldTypes;
     /++
     The OID of the built-in type whose decoder reads this type's values:
     the type itself for built-in base types, the base type's for domains,
@@ -60,7 +60,7 @@ final class PgType
     uint codec;
 
     /// Makes a type.
-    this(uint oid, string name, TypeKind kind, PgType element = null, char delimiter = ',') pure nothrow
+    this(uint oid, string name, TypeKind kind, const(PgType) element = null, char delimiter = ',') pure nothrow
     {
         this.oid = oid;
         this.name = name;
@@ -134,11 +134,10 @@ bool hasBinaryCodec(uint codec) pure nothrow @nogc
 }
 
 /// The built-in type with OID `oid`, or null.
-PgType builtinType(uint oid) @trusted nothrow
+immutable(PgType) builtinType(uint oid) @safe pure nothrow
 {
-    // the table is built once and never changed afterwards
     if (auto t = oid in builtins)
-        return cast(PgType)*t;
+        return *t;
     return null;
 }
 
@@ -156,9 +155,9 @@ unittest
     assert(builtinType(123_456) is null);
 }
 
-private __gshared immutable(PgType)[uint] builtins;
+private immutable PgType[uint] builtins;
 
-shared static this() @trusted
+shared static this() @safe
 {
     PgType[uint] table;
     void base(uint oid, string name, uint arrayOid, char delimiter = ',')
@@ -258,5 +257,5 @@ shared static this() @trusted
     table[2249] = record;
     table[2287] = new PgType(2287, "_record", TypeKind.array, record);
 
-    builtins = cast(immutable(PgType)[uint]) table; // not changed after this
+    builtins = (() @trusted => cast(immutable) table)(); // the only reference to the table and its types
 }

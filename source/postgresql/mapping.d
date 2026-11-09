@@ -151,11 +151,17 @@ struct RowRange(T) if (is(T == struct))
     private QueryResult result;
     private size_t[] positions;
 
-    /// Maps the rows of `result`.
+    /// Maps the rows of `result`; closes it if a field has no column.
     this(QueryResult result)
     {
         this.result = result;
-        positions = fieldPositions!T(result);
+        try
+            positions = fieldPositions!T(result);
+        catch (Exception e)
+        {
+            closeAfterError();
+            throw e;
+        }
     }
 
     /// Whether there are no more rows.
@@ -164,10 +170,21 @@ struct RowRange(T) if (is(T == struct))
         return result.empty;
     }
 
-    /// The current row.
+    /++
+    The current row.
+
+    Throws: `ClientException` if a value can't be read into its field; the
+    result is closed then, so the connection is free again.
+    +/
     @property T front()
     {
-        return readStruct!T(result, positions);
+        try
+            return readStruct!T(result, positions);
+        catch (Exception e)
+        {
+            closeAfterError();
+            throw e;
+        }
     }
 
     /// Moves to the next row.
@@ -180,6 +197,16 @@ struct RowRange(T) if (is(T == struct))
     void close()
     {
         result.close();
+    }
+
+    // Closes the result after a mapping error, which is the one reported.
+    private void closeAfterError() nothrow
+    {
+        try
+            result.close();
+        catch (Exception)
+        {
+        }
     }
 
     /// The underlying result (columns, command tag).

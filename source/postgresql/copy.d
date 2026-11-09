@@ -28,7 +28,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module postgresql.copy;
 
 import postgresql.connection : affectedRows, Connection;
-import postgresql.exception : ClientException, ProtocolException, ServerException;
+import postgresql.exception : ClientException, ServerException;
 import postgresql.params : encodeParam, Param;
 import postgresql.protocol.codes : BackendMessage, FrontendMessage;
 import postgresql.protocol.messages : Message, MessageBuilder;
@@ -319,16 +319,15 @@ final class CopyIn
     {
         if (done)
             return;
+        MessageBuilder b;
+        b.begin(FrontendMessage.copyFail);
+        b.putCString(reason); // a NUL in it throws here, before anything changes
+        b.finish();
         done = true;
         buffer = null;
-        conn.guarded({
-            MessageBuilder b;
-            b.begin(FrontendMessage.copyFail);
-            b.putCString(reason);
-            b.finish();
-            conn.stream.send(b.data);
-            readToEnd();
-        });
+        if (!conn.isOpen)
+            return; // e.g. after a FATAL error, which is the one to report
+        conn.guarded({ conn.stream.send(b.data); readToEnd(); });
         conn.discardPendingError(); // the server's "COPY from stdin failed" error
     }
 
@@ -529,7 +528,13 @@ final class CopyOut
         return cast(string) readAll();
     }
 
-    /// Whether there are no more rows.
+    /++
+    Whether there are no more rows.
+
+    Throws: `ClientException` if a row doesn't have the expected format (the
+    rest of the data is read then, so the connection is ready again);
+    `ServerException` if the copy failed.
+    +/
     @property bool empty() @safe
     {
         if (!hasCurrent && !done)
@@ -564,6 +569,23 @@ final class CopyOut
 
     private void advance() @safe
     {
+        try
+            readRow();
+        catch (ClientException e)
+        {
+            // the data doesn't have the expected format (e.g. other COPY options): read the rest, so the
+            // connection is ready again
+            try
+                close();
+            catch (Exception)
+            {
+            }
+            throw e;
+        }
+    }
+
+    private void readRow() @safe
+    {
         if (format_ == CopyFormat.binary)
         {
             advanceBinary();
@@ -586,7 +608,7 @@ final class CopyOut
         import std.conv : to;
 
         if (fields.length != columnCount_)
-            throw new ProtocolException(
+            throw new ClientException(
                     "A COPY row has " ~ fields.length.to!string ~ " field(s), expected "
                     ~ columnCount_.to!string);
         auto values = new immutable(ubyte)[][fields.length];
@@ -630,11 +652,11 @@ final class CopyOut
             if (!need(19))
                 return;
             if (binaryBuffer[0 .. 11] != binarySignature[])
-                throw new ProtocolException("Invalid binary COPY signature");
+                throw new ClientException("Invalid binary COPY signature");
             at = 15; // signature, flags
             const extension = int32();
             if (extension < 0 || !need(extension))
-                throw new ProtocolException("Invalid binary COPY header");
+                throw new ClientException("Invalid binary COPY header");
             at += extension;
             binaryHeaderRead = true;
         }
@@ -650,7 +672,7 @@ final class CopyOut
             return;
         }
         if (count != columnCount_)
-            throw new ProtocolException(
+            throw new ClientException(
                     "A binary COPY row has " ~ count.to!string ~ " field(s), expected "
                     ~ columnCount_.to!string);
         auto values = new immutable(ubyte)[][count];
@@ -658,7 +680,7 @@ final class CopyOut
         foreach (i; 0 .. count)
         {
             if (!need(4))
-                throw new ProtocolException("Truncated binary COPY row");
+                throw new ClientException("Truncated binary COPY row");
             const length = int32();
             if (length == -1)
             {
@@ -666,7 +688,7 @@ final class CopyOut
                 continue;
             }
             if (length < 0 || !need(length))
-                throw new ProtocolException("Truncated binary COPY row");
+                throw new ClientException("Truncated binary COPY row");
             values[i] = binaryBuffer[at .. at + length].idup;
             at += length;
         }

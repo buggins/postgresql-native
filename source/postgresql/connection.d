@@ -6,6 +6,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module postgresql.connection;
 
+import core.thread : Thread;
 import core.time : Duration;
 
 import std.range.primitives : ElementType, empty, front, isInputRange, popFront;
@@ -76,6 +77,7 @@ final class Connection : Poolable
     package State state = State.closed;
     package ConnectionOptions options;
     private IoBackend backend;
+    private Thread owner; // fiber mode: the thread the connection belongs to
     private Transport transport;
     private TlsTransport tls;
     package MessageStream stream;
@@ -105,13 +107,17 @@ final class Connection : Poolable
 
     /++
     Called with each notice (NoticeResponse: warnings, `RAISE NOTICE`
-    output, ...); may be null.
+    output, ...); may be null. It is called while a response is being read,
+    so it must not use the connection, and an exception it throws closes the
+    connection (the response is left unread). `ConnectionPool` clears it
+    when the connection is returned.
     +/
     void delegate(ServerMessage notice) @safe onNotice;
 
     /++
     Called with each notification (`LISTEN`/`NOTIFY`) as it is read; when
     set, notifications are not kept for `takeNotifications`. May be null.
+    The rules of `onNotice` apply.
     +/
     void delegate(Notification notification) @safe onNotification;
 
@@ -126,6 +132,9 @@ final class Connection : Poolable
     this(ConnectionOptions options)
     {
         this.options = options;
+        // the caller's arrays may change later
+        this.options.hosts = options.hosts.dup;
+        this.options.runtimeParameters = options.runtimeParameters.dup;
         if (options.statementCacheSize > 0)
             cache = new StatementCache(options.statementCacheSize);
         connect();
@@ -575,24 +584,23 @@ final class Connection : Poolable
 
     private Outcome execute(StatementInfo info, ParamEncoder encode, bool mayRetry)
     {
-        Param[] params;
+        // everything is encoded before anything is sent: a value that can't be sent leaves the stream intact
+        MessageBuilder b;
         try
-            params = encode is null ? checkNoParameters(info) : encode(info.parameterTypes);
-        catch (ClientException e)
         {
-            // a Parse/Describe of this request may be waiting for its Sync
-            sync();
-            finishResponse();
+            const params = encode is null ? checkNoParameters(info) : encode(info.parameterTypes);
+            appendBindExecute(b, info, params);
+            b.begin(FrontendMessage.sync);
+            b.finish();
+        }
+        catch (Exception e)
+        {
+            abandonRequest(); // a Parse/Describe of this request may be waiting for its Sync
             throw e;
         }
         bool failed;
         guarded({
-            MessageBuilder b;
-            appendPendingCloses(b);
-            appendBindExecute(b, info, params);
-            b.begin(FrontendMessage.sync);
-            b.finish();
-            stream.send(b.data);
+            sendRequest(b.data);
 
             for (;;)
             {
@@ -678,10 +686,9 @@ final class Connection : Poolable
         StatementInfo info;
         info.name = name;
         info.sql = sql;
-        bool failed;
-        guarded({
-            MessageBuilder b;
-            appendPendingCloses(b);
+        MessageBuilder b;
+        try
+        {
             b.begin(FrontendMessage.parse);
             b.putCString(name);
             b.putCString(sql);
@@ -693,7 +700,18 @@ final class Connection : Poolable
             b.finish();
             b.begin(FrontendMessage.flush);
             b.finish();
-            stream.send(b.data);
+        }
+        catch (ClientException e) // e.g. a NUL character in the SQL
+        {
+            abandonRequest();
+            throw e;
+        }
+        // a statement parsed when the type lookup fails is closed (closing a missing one does no harm)
+        scope (failure)
+            closeStatementLater(name);
+        bool failed;
+        guarded({
+            sendRequest(b.data);
 
             // ParseComplete, ParameterDescription, then RowDescription or NoData
             for (;;)
@@ -702,14 +720,7 @@ final class Connection : Poolable
                 switch (m.type)
                 {
                 case BackendMessage.parameterDescription:
-                    auto body = m.body;
-                    const count = body.readInt16();
-                    if (count < 0)
-                        throw new ProtocolException("Invalid parameter count");
-                    info.parameterTypes = new uint[count];
-                    foreach (ref t; info.parameterTypes)
-                        t = cast(uint)
-                        body.readInt32();
+                    info.parameterTypes = parseParameterDescription(m.body);
                     break;
                 case BackendMessage.rowDescription:
                     info.columns = parseRowDescription(m.body);
@@ -738,6 +749,44 @@ final class Connection : Poolable
     private void sync()
     {
         guarded({ MessageBuilder b; b.begin(FrontendMessage.sync); b.finish(); stream.send(b.data); });
+    }
+
+    // Ends the current request after a client-side error: Sync, and the rest of the response. It throws
+    // nothing, so the caller reports its own error; a network error here has closed the connection.
+    private void abandonRequest() nothrow
+    {
+        try
+        {
+            sync();
+            finishResponse();
+        }
+        catch (Exception) // a server error for the abandoned request, or a broken stream (then closed)
+        {
+        }
+    }
+
+    // The parameter types of a ParameterDescription.
+    private static uint[] parseParameterDescription(MessageBody body)
+    {
+        const count = cast(ushort)
+        body.readInt16(); // a uint16 (up to 65535 parameters)
+        if (body.remaining != 4 * count)
+            throw new ProtocolException("Invalid ParameterDescription message");
+        auto types = new uint[count];
+        foreach (ref t; types)
+            t = cast(uint)
+            body.readInt32();
+        return types;
+    }
+
+    // Sends a composed request, after the pending Close messages.
+    private void sendRequest(scope const(ubyte)[] request)
+    {
+        MessageBuilder closes;
+        appendPendingCloses(closes);
+        if (closes.data.length)
+            stream.write(closes.data);
+        stream.send(request);
     }
 
     private void appendPendingCloses(ref MessageBuilder b)
@@ -769,6 +818,8 @@ final class Connection : Poolable
             pendingCloses = null;
             typeQueryPrepared = false;
         }
+        else if (tag == "DEALLOCATE")
+            typeQueryPrepared = false; // it may have been the type query's statement: prepared again when needed
     }
 
     // --- data types of the database ---
@@ -872,7 +923,8 @@ final class Connection : Poolable
             oids = next;
         }
 
-        PgType build(uint oid)
+        bool[uint] building;
+        const(PgType) build(uint oid)
         {
             if (auto t = builtinType(oid))
                 return t;
@@ -881,6 +933,13 @@ final class Connection : Poolable
             auto row = oid in rows;
             if (row is null)
                 return null;
+            if (oid in building)
+            {
+                // a type made of itself: PostgreSQL never reports one
+                close();
+                throw new ProtocolException("The server's type definitions contain a cycle");
+            }
+            building[oid] = true;
             TypeKind kind;
             switch (row.kind)
             {
@@ -909,10 +968,11 @@ final class Connection : Poolable
                 kind = TypeKind.base;
             }
             auto t = new PgType(oid, row.name, kind, row.element ? build(row.element) : null, row.delimiter);
-            types[oid] = t;
             t.fieldNames = row.fieldNames;
             foreach (f; row.fieldTypes)
                 t.fieldTypes ~= build(f);
+            types[oid] = t;
+            building.remove(oid);
             return t;
         }
 
@@ -1143,41 +1203,27 @@ final class Connection : Poolable
             described[sql] = i;
             toDescribe ~= i;
         }
+        // statements the cache evicts may be used by this pipeline: they are closed after it
+        string[] evicted;
         scope (exit)
-            foreach (name; temporary)
+            foreach (name; temporary ~ evicted)
                 closeStatementLater(name);
 
         if (toDescribe.length)
-            describeStatements(infos, toDescribe);
+            evicted = describeStatements(infos, toDescribe);
         foreach (i, sql; sqls)
             if (infos[i].name.length == 0 && infos[i].columns.length == 0 && infos[i].parameterTypes.length == 0)
                 if (auto first = sql in described)
                     infos[i] = infos[*first];
 
         // encode everything before sending anything
-        auto params = new Param[][sqls.length];
+        MessageBuilder b;
         try
-            foreach (i; 0 .. sqls.length)
-                params[i] = encoders[i] is null ? checkNoParameters(infos[i]) : encoders[i](infos[i].parameterTypes);
-                catch (ClientException e)
-                {
-                    if (toDescribe.length)
-                    {
-                        sync();
-                        finishResponse();
-                    }
-                    else
-                        state = State.ready;
-                    throw e;
-                }
-
-        auto results = new PipelineResult[sqls.length];
-        guarded({
-            MessageBuilder b;
-            appendPendingCloses(b);
+        {
             foreach (i, info; infos)
             {
-                appendBindExecute(b, info, params[i]);
+                const params = encoders[i] is null ? checkNoParameters(info) : encoders[i](info.parameterTypes);
+                appendBindExecute(b, info, params);
                 if (!transactional)
                 {
                     b.begin(FrontendMessage.sync);
@@ -1189,7 +1235,19 @@ final class Connection : Poolable
                 b.begin(FrontendMessage.sync);
                 b.finish();
             }
-            stream.send(b.data);
+        }
+        catch (Exception e)
+        {
+            if (toDescribe.length)
+                abandonRequest();
+            else
+                state = State.ready; // nothing was sent
+            throw e;
+        }
+
+        auto results = new PipelineResult[sqls.length];
+        guarded({
+            sendRequest(b.data);
 
             const zone = parameterStatus("TimeZone");
             bool aborted;
@@ -1207,8 +1265,8 @@ final class Connection : Poolable
                     auto m = nextMessage();
                     switch (m.type)
                     {
-                    case BackendMessage.bindComplete:
-                        break;
+                    case BackendMessage.bindComplete, BackendMessage.closeComplete:
+                        break; // CloseComplete: the pending closes sent before the first Bind
                     case BackendMessage.dataRow:
                         r.rows ~= parseDataRow(m.body, info.columns, zone);
                         break;
@@ -1264,13 +1322,22 @@ final class Connection : Poolable
         }
     }
 
-    // Parses and describes several statements in one round trip (pipelines); throws the first parse error.
-    private void describeStatements(StatementInfo[] infos, const size_t[] indexes)
+    /++
+    Parses and describes several statements in one round trip (pipelines) and
+    adds them to the cache; throws the first parse error. Returns the names of
+    the statements the cache evicted, for the caller to close once it no
+    longer needs them.
+    +/
+    private string[] describeStatements(StatementInfo[] infos, const size_t[] indexes)
     {
-        bool failed;
-        guarded({
-            MessageBuilder b;
-            appendPendingCloses(b);
+        // on failure the statements parsed so far exist on the server, uncached (closing the others does no harm)
+        scope (failure)
+            if (cache !is null)
+                foreach (i; indexes)
+                    closeStatementLater(infos[i].name);
+        MessageBuilder b;
+        try
+        {
             foreach (i; indexes)
             {
                 b.begin(FrontendMessage.parse);
@@ -1285,7 +1352,15 @@ final class Connection : Poolable
             }
             b.begin(FrontendMessage.flush);
             b.finish();
-            stream.send(b.data);
+        }
+        catch (ClientException e) // e.g. a NUL character in the SQL
+        {
+            abandonRequest();
+            throw e;
+        }
+        bool failed;
+        guarded({
+            sendRequest(b.data);
             foreach (i; indexes)
             {
                 describing: for (;;)
@@ -1294,14 +1369,7 @@ final class Connection : Poolable
                     switch (m.type)
                     {
                     case BackendMessage.parameterDescription:
-                        auto body = m.body;
-                        const count = body.readInt16();
-                        if (count < 0)
-                            throw new ProtocolException("Invalid parameter count");
-                        infos[i].parameterTypes = new uint[count];
-                        foreach (ref t; infos[i].parameterTypes)
-                            t = cast(uint)
-                            body.readInt32();
+                        infos[i].parameterTypes = parseParameterDescription(m.body);
                         break;
                     case BackendMessage.rowDescription:
                         infos[i].columns = parseRowDescription(m.body);
@@ -1328,11 +1396,12 @@ final class Connection : Poolable
         foreach (i; indexes)
             lists ~= infos[i].columns;
         resolveColumns(lists);
-        foreach (i; indexes)
-        {
-            if (cache !is null)
-                closeStatementLater(cache.put(infos[i]));
-        }
+        string[] evicted;
+        if (cache !is null)
+            foreach (i; indexes)
+                if (auto name = cache.put(infos[i]))
+                    evicted ~= name;
+        return evicted;
     }
 
     // --- transactions ---
@@ -1719,11 +1788,12 @@ final class Connection : Poolable
     +/
     Nullable!Notification waitForNotification(Duration timeout = Duration.max)
     {
-        import core.time : MonoTime;
+        import core.time : days, MonoTime;
         import dbwire.io.backend : waitForData;
 
+        enum longestWait = days(50 * 365); // as dbwire's backends: the deadline can't overflow
         const forever = timeout == Duration.max;
-        const deadline = forever ? MonoTime.max : MonoTime.currTime + timeout;
+        const deadline = forever ? MonoTime.max : MonoTime.currTime + (timeout > longestWait ? longestWait : timeout);
         const before = notificationCount;
         for (;;)
         {
@@ -1800,13 +1870,20 @@ final class Connection : Poolable
         exec("");
     }
 
-    /// Closes the connection, telling the server first when possible. Calling it again does nothing.
+    /++
+    Closes the connection, telling the server first when possible. Calling it again does nothing.
+
+    A fiber-mode connection called from another thread than the one that opened it is only marked
+    closed: its socket belongs to the other thread's event loop.
+    +/
     void close() nothrow
     {
         if (state == State.closed)
             return;
         const wasReady = state == State.ready;
         state = State.closed;
+        if (!onOwnerThread)
+            return; // the socket can't be touched from here; the connection is only marked closed
         if (wasReady)
         {
             try
@@ -2054,6 +2131,7 @@ final class Connection : Poolable
     +/
     package void guarded(scope void delegate() @safe action)
     {
+        checkThread(); // before the try: closing from here would touch another thread's event loop
         try
             action();
         catch (ServerException e)
@@ -2065,10 +2143,24 @@ final class Connection : Poolable
         }
     }
 
+    // A fiber-mode connection is used from the thread that opened it; its socket belongs to that event loop.
+    private void checkThread() const
+    {
+        if (!onOwnerThread)
+            throw new ClientException(
+                    "A fiber-mode connection was used from a thread other than the one that opened it");
+    }
+
+    private bool onOwnerThread() const nothrow
+    {
+        return owner is null || Thread.getThis() is owner;
+    }
+
     package void checkReady() const
     {
         if (state == State.closed)
             throw new ClientException("The connection is closed");
+        checkThread(); // before anything changes
         if (state == State.busy)
             throw new ClientException("The connection is busy: read or close the previous query result first");
     }
@@ -2078,6 +2170,8 @@ final class Connection : Poolable
     private void connect()
     {
         backend = backendFor(options.ioMode);
+        if (backend.name == "vibe")
+            owner = Thread.getThis();
         auto hosts = options.hosts.length ? options.hosts.dup : [
             HostPort(options.host, options.port)
         ];
@@ -2262,7 +2356,7 @@ final class Connection : Poolable
 
     private TlsOptions tlsOptions(bool direct)
     {
-        import postgresql.userfiles : userDirectory, userFile;
+        import postgresql.userfiles : checkPrivateKeyFile, userDirectory, userFile;
 
         TlsOptions t = options.tls;
         // libpq's defaults: the files in ~/.postgresql, when they exist
@@ -2276,7 +2370,10 @@ final class Connection : Poolable
 
             t.certFile = userFile("postgresql.crt");
             if (t.certFile.length && t.keyFile.length == 0)
+            {
                 t.keyFile = buildPath(userDirectory(), "postgresql.key");
+                checkPrivateKeyFile(t.keyFile); // as libpq
+            }
         }
         if (t.caFile == "system")
         {
@@ -2295,10 +2392,15 @@ final class Connection : Poolable
             t.skipNameCheck = true;
             break;
         case SslMode.verifyCa:
+            // as libpq: without a host name check, the system's CAs would accept any of their certificates
+            if (t.caFile.length == 0)
+                throw new ClientException(
+                        "sslmode=verify-ca needs a root certificate: set sslrootcert, "
+                        ~ "or create ~/.postgresql/root.crt (sslrootcert=system works with sslmode=verify-full)");
             t.skipNameCheck = true;
             break;
         case SslMode.verifyFull:
-            break;
+            break; // without a CA file: the system's trusted certificates
         }
         if (direct)
             t.alpn = ["postgresql"];
@@ -2347,6 +2449,10 @@ final class Connection : Poolable
         transport = raw;
         tls = null;
         attemptHost = nameOf(endpoint);
+        // nothing from an earlier host's session counts for this one (e.g. in_hot_standby)
+        parameters = null;
+        backendPid = 0;
+        cancelKey = null;
         state = State.busy;
         scope (failure)
             close();
@@ -2379,7 +2485,10 @@ final class Connection : Poolable
             startTls(raw, endpoint, true);
 
         stream = new MessageStream(transport);
+        // before the login completes, messages are small (libpq: 2000 bytes for authentication requests)
+        stream.maxMessageLength = 1 << 20;
         startup();
+        stream.maxMessageLength = defaultMaxMessageLength;
         transport.setTimeouts(options.receiveTimeout, options.sendTimeout);
         encryptionUsed = tls is null ? Encryption.none : encryption;
         state = State.ready;
@@ -2764,4 +2873,215 @@ unittest
     assert(parseServerVersion("18.6 (Debian 18.6-1.pgdg13+2)") == 180_006);
     assert(parseServerVersion("13.23") == 130_023 && parseServerVersion("9.6.24") == 90_624);
     assert(parseServerVersion("17beta1") == 170_000 && parseServerVersion("") == 0);
+}
+
+// A scripted server for the tests below: backend messages are fed to a MockTransport.
+version (unittest)
+{
+    import dbwire.io.mock : MockTransport;
+
+    private immutable(ubyte)[] message(char type, scope const(ubyte)[] body = null) pure
+    {
+        const length = cast(uint)(body.length + 4);
+        return [
+            cast(ubyte) type, cast(ubyte)(length >> 24), cast(ubyte)(length >> 16),
+            cast(ubyte)(length >> 8),
+            cast(ubyte) length
+        ] ~ body.idup;
+    }
+
+    private immutable(ubyte)[] wire16(int v) pure
+    {
+        return [cast(ubyte)(v >> 8), cast(ubyte) v];
+    }
+
+    private immutable(ubyte)[] wire32(int v) pure
+    {
+        return [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+    }
+
+    private immutable(ubyte)[] cstring(string s) pure
+    {
+        return cast(immutable(ubyte)[]) s ~ ubyte(0);
+    }
+
+    private enum readyIdle = message('Z', ['I']);
+
+    // Connects to `t` after feeding it a trust login.
+    private Connection mockConnection(MockTransport t, size_t cacheSize = 100)
+    {
+        t.feed(message('R', wire32(0)) ~ message('K', wire32(42) ~ wire32(7))
+                ~ message('S', cstring("server_version") ~ cstring("18.0"))
+                ~ message('S', cstring("TimeZone") ~ cstring("UTC")) ~ readyIdle);
+        ConnectionOptions o;
+        o.host = "h";
+        o.user = "u";
+        o.sslMode = SslMode.disable;
+        o.statementCacheSize = cacheSize;
+        Transport factory(string, ushort, Duration)
+        {
+            return t;
+        }
+
+        o.transportFactory = &factory;
+        return new Connection(o);
+    }
+
+    // The frontend messages in `bytes`: their types, with statement names for Close, Parse and Bind.
+    private string frontendMessages(const(ubyte)[] bytes)
+    {
+        string s;
+        while (bytes.length >= 5)
+        {
+            const type = cast(char) bytes[0];
+            const length = bytes[1] << 24 | bytes[2] << 16 | bytes[3] << 8 | bytes[4];
+            auto body = bytes[5 .. 1 + length];
+            s ~= type;
+            if (type == 'C' || type == 'P' || type == 'B')
+            {
+                if (type == 'C')
+                    body = body[1 .. $]; // 'S'
+                else if (type == 'B')
+                    while (body[0] != 0)
+                        body = body[1 .. $]; // the portal
+                size_t end = type == 'B' ? 1 : 0;
+                const start = end;
+                while (body[end] != 0)
+                    end++;
+                s ~= "(" ~ cast(string)
+                body[start .. end].idup ~ ")";
+            }
+            s ~= " ";
+            bytes = bytes[1 + length .. $];
+        }
+        return s;
+    }
+}
+
+// More than 32767 parameters: ParameterDescription's count is a uint16
+unittest
+{
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    auto description = wire16(40_000);
+    foreach (i; 0 .. 40_000)
+        description ~= wire32(Oid.int4);
+    t.feed(message('1') ~ message('t', description) ~ message('n') ~ readyIdle);
+    import std.exception : collectException;
+
+    const e = collectException!ClientException(c.exec("INSERT INTO t VALUES ($1)", 1)); // 1 value for 40000
+    assert(e !is null && c.isOpen && !c.isBusy, e is null ? "no error" : e.msg);
+}
+
+// A value that can't be encoded (here, not even as UTF-8), or a NUL in the SQL, leaves the connection ready
+unittest
+{
+    import std.exception : assertThrown, collectException;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    t.feed(message('1') ~ message('t', wire16(1) ~ wire32(Oid.text)) ~ message('n') ~ readyIdle);
+    assert(collectException(c.exec("SELECT $1", cast(dchar) 0xD800)) !is null);
+    assert(c.isOpen && !c.isBusy);
+    t.feed(readyIdle);
+    assertThrown!ClientException(c.query("SELECT 1\0"));
+    assert(c.isOpen && !c.isBusy);
+    assertThrown!ClientException(c.exec("SELECT 1\0")); // simple query: nothing sent
+    assert(c.isOpen && !c.isBusy);
+}
+
+// query!T: a value that doesn't fit its field closes the result
+unittest
+{
+    import std.exception : assertThrown;
+
+    static struct S
+    {
+        int a;
+    }
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    const columns = wire16(1) ~ cstring("a") ~ wire32(0) ~ wire16(0) ~ wire32(Oid.int4) ~ wire16(
+            4) ~ wire32(-1) ~ wire16(0);
+    t.feed(message('1') ~ message('t', wire16(0)) ~ message('T', columns) ~ message('2')
+            ~ message('D', wire16(1) ~ wire32(-1)) ~ message('C', cstring("SELECT 1")) ~ readyIdle);
+    assertThrown!ClientException({
+        foreach (s; c.query!S("SELECT a"))
+        {
+        }
+    }());
+    assert(c.isOpen && !c.isBusy);
+}
+
+// Pipelines: statements the cache evicts are closed after the pipeline; CloseComplete before the first result
+unittest
+{
+    import std.algorithm.searching : canFind;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t, 2);
+    foreach (i; 0 .. 3)
+        t.feed(message('1') ~ message('t', wire16(0)) ~ message('n'));
+    foreach (i; 0 .. 3)
+        t.feed(message('2') ~ message('C', cstring("SELECT 1")));
+    t.feed(readyIdle);
+    t.clearWritten();
+    auto p = c.pipeline();
+    p.add("SELECT 1");
+    p.add("SELECT 2");
+    p.add("SELECT 3");
+    foreach (r; p.run())
+        assert(!r.failed);
+    const sent = frontendMessages(t.written);
+    assert(!sent.canFind("C("), sent); // nothing closed before its Bind
+    assert(c.cachedStatements == 2);
+
+    // the evicted statement is closed with the next request, which reads its CloseComplete
+    t.feed(message('3') ~ message('2') ~ message('C', cstring("SELECT 1")) ~ readyIdle);
+    t.clearWritten();
+    p = c.pipeline();
+    p.add("SELECT 3");
+    foreach (r; p.run())
+        assert(!r.failed);
+    assert(frontendMessages(t.written).canFind("C(pgn_s1) B(pgn_s3)"), frontendMessages(t.written));
+    assert(c.isOpen && !c.isBusy);
+}
+
+// An exception from a callback closes the connection (the response is left unread)
+unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    void failing(ServerMessage)
+    {
+        throw new Exception("from the callback");
+    }
+
+    c.onNotice = &failing;
+    t.feed(message('N', cast(immutable(ubyte)[]) "SNOTICE\0C00000\0Mhello\0\0") ~ message('I') ~ readyIdle);
+    assertThrown!Exception(c.exec(""));
+    assert(!c.isOpen);
+}
+
+// A fiber-mode connection used from another thread: refused, and close() doesn't touch the socket
+unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto c = mockConnection(t);
+    void nothing()
+    {
+    }
+
+    c.owner = new Thread(&nothing); // as if another thread had opened it
+    t.clearWritten();
+    assertThrown!ClientException(c.exec(""));
+    assertThrown!ClientException(c.guarded(() {})); // the path of result and COPY reads
+    assert(c.isOpen && t.written.length == 0);
+    c.close();
+    assert(!c.isOpen && t.written.length == 0); // no Terminate
 }

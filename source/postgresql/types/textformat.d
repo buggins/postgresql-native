@@ -224,6 +224,8 @@ ArrayText parseArrayText(string text, char delimiter = ',') pure
 
     void group(size_t level)
     {
+        if (level >= 6) // the server's limit (MAXDIM)
+            fail();
         i++; // '{'
         skipSpaces();
         if (i < text.length && text[i] == '}')
@@ -323,6 +325,8 @@ unittest
     assert(a.elements == ["(1,1),(0,0)", "(3,3),(2,2)"]);
     a = parseArrayText(`{{{1},{2}},{{3},{4}}}`);
     assert(a.lengths == [2, 2, 1]);
+    assert(parseArrayText(`{{{{{{1}}}}}}`).lengths == [1, 1, 1, 1, 1, 1]);
+    assertThrown!ClientException(parseArrayText(`{{{{{{{1}}}}}}}`)); // more than 6 dimensions
     assertThrown!ClientException(parseArrayText(`{{1,2},{3}}`));
     assertThrown!ClientException(parseArrayText(`{1,{2}}`));
     assertThrown!ClientException(parseArrayText(`{"a}`));

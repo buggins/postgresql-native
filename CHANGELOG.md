@@ -15,6 +15,67 @@ project uses [semantic versioning](https://semver.org/).
   mean the default of 15 seconds, because dbwire 0.8 failed at once on a
   zero timeout. `ConnectionOptions.connectTimeout = Duration.zero` means the
   same.
+- `sslmode=verify-ca` needs a CA file (`sslrootcert`, or
+  `~/.postgresql/root.crt`), as in libpq (#34). It used to fall back to the
+  system's trusted CAs, which without the host name check accepts any
+  certificate they issued. `verify-full` still uses the system's CAs when no
+  CA file is given.
+- The default client key `~/.postgresql/postgresql.key` must not be
+  accessible to group or others (0600, or 0640 when owned by root), as libpq
+  checks (#34).
+- `ConnectionPool` clears `onNotice` and `onNotification` when a connection
+  is returned (#34). An exception from these callbacks closes the connection
+  (now documented).
+- `ConnectionOptions.toString` shows `password` and `tls.keyPassword` as
+  `***` (#34).
+
+### Fixed
+
+From the code review (#34):
+
+- Statements with more than 32767 parameters failed with "Invalid parameter
+  count" and closed the connection (the count is unsigned); `insert` of
+  structs with 33 or more fields reached it.
+- Pipelines: a CloseComplete (after `PreparedStatement.close`, or when the
+  statement cache evicted an entry) failed the pipeline and closed the
+  connection; an evicted statement of the same pipeline was closed before
+  its Bind. Evicted statements are now closed after the pipeline.
+- A value that fails to encode with an exception other than
+  `ClientException` (e.g. a `dchar` surrogate) left the connection busy;
+  a NUL character in the SQL or a parameter over 2 GB closed it. Both leave
+  the connection ready now.
+- `query!T`: a value that doesn't fit its field (or a missing column) left
+  the connection busy; the result is closed now.
+- COPY OUT rows that don't match the expected format throw
+  `ClientException` (was `ProtocolException`) and the rest of the copy is
+  read, so the connection is ready again. `CopyIn.abort` on a connection a
+  FATAL error closed no longer hides that error.
+- `getDouble` of a numeric beyond `double.max` returns an infinity instead
+  of throwing `ConvException`; reading invalid UTF-8 (SQL_ASCII databases)
+  as `wstring`/`dstring` throws `ClientException`.
+- Server data that nests without limit (anonymous records in records,
+  array text with more than 6 dimensions, cyclic type definitions) throws
+  instead of overflowing the stack.
+- A message length alone no longer allocates its buffer: it grows as the
+  bytes arrive, messages before the login completes are limited to 1 MiB,
+  and a buffer grown for a large message (above 1 MiB) is released after it.
+- Failover: status reported by an earlier host (e.g. `in_hot_standby`)
+  no longer counts for the next one, which could reject a primary with
+  `target_session_attrs=primary`.
+- A fiber-mode connection used from another thread (a new request, reading
+  a result, COPY) is refused before anything changes; it used to close the
+  connection from that thread. `close()` from another thread only marks it
+  closed.
+- `waitForNotification` with a timeout over 292 years returned at once.
+- Statements parsed by a failing pipeline or type lookup are closed on the
+  server; the type lookup works again after a `DEALLOCATE` of its statement.
+- `builtinType` returned the shared built-in type table's objects as
+  mutable; it returns `immutable(PgType)`, and `PgType.element` and
+  `fieldTypes` are `const`.
+- `Connection` and `ConnectionPool` copy the `hosts` and
+  `runtimeParameters` of their options, which the caller may change later.
+- Geometric values and float text no longer depend on the C library's
+  locale (`setlocale(LC_NUMERIC, ...)` with a decimal comma broke them).
 
 ## 0.5.0 (2026-11-07)
 

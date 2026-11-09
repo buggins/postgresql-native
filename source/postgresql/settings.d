@@ -43,9 +43,16 @@ enum SslMode
     is given; then as `verifyCa`, as libpq does.
     +/
     require,
-    /// Require TLS and a certificate signed by a trusted CA.
+    /++
+    Require TLS and a certificate signed by the CA of the CA file (`sslrootcert`,
+    or `~/.postgresql/root.crt`); without one the connection fails, as in libpq.
+    +/
     verifyCa,
-    /// Require TLS, a certificate signed by a trusted CA, and the host name in the certificate.
+    /++
+    Require TLS, a certificate signed by a trusted CA, and the host name in the
+    certificate. Without a CA file the system's trusted CAs are used (as
+    `sslrootcert=system` in libpq).
+    +/
     verifyFull,
 }
 
@@ -174,7 +181,8 @@ struct ConnectionOptions
     (`%APPDATA%\postgresql` on Windows) when they exist: `root.crt` (then
     `sslmode=require` verifies the certificate, as `verifyCa`),
     `root.crl` (when neither `crlFile` nor `crlDir` is set),
-    `postgresql.crt` and `postgresql.key`.
+    `postgresql.crt` and `postgresql.key` (which, as in libpq, group and
+    others must not be able to access on POSIX systems).
 
     TLS is never used over Unix-domain sockets, whatever `sslMode` says
     (as libpq).
@@ -223,6 +231,38 @@ struct ConnectionOptions
     IoMode ioMode = IoMode.auto_;
     /// Creates the raw transport instead of the I/O backend; may be null.
     TransportFactory transportFactory;
+
+    /++
+    The options as text, for logs and messages: `password` and
+    `tls.keyPassword` are shown as `***` when set.
+    +/
+    string toString() const @safe
+    {
+        return "ConnectionOptions(" ~ fieldsText(this) ~ ")";
+    }
+
+    // `name: value` of each field of `value`, without the secrets.
+    private static string fieldsText(T)(const ref T value)
+    {
+        import std.conv : to;
+        import std.traits : isDelegate;
+
+        string s;
+        foreach (i, ref field; value.tupleof)
+        {
+            enum name = __traits(identifier, T.tupleof[i]);
+            s ~= (i ? ", " : "") ~ name ~ ": ";
+            static if (name == "password" || name == "keyPassword")
+                s ~= field.length ? "***" : `""`;
+            else static if (is(typeof(field) == const(TlsOptions)))
+                s ~= "TlsOptions(" ~ fieldsText(field) ~ ")";
+            else static if (isDelegate!(typeof(field)))
+                s ~= field is null ? "null" : "set";
+            else
+                s ~= field.to!string;
+        }
+        return s;
+    }
 
     /// The port to use for `port` (0 means the default).
     static ushort effectivePort(ushort port) pure nothrow
@@ -428,6 +468,18 @@ unittest
     o = ConnectionOptions.parse("host=db1,db2 port=5433 dbname='my db' user=app sslmode=disable");
     assert(o.hosts == [HostPort("db1", 5433), HostPort("db2", 5433)] && o.database == "my db");
     assert(o.sslMode == SslMode.disable);
+}
+
+@safe unittest
+{
+    import std.algorithm.searching : canFind;
+
+    // toString hides the passwords
+    auto o = ConnectionOptions.parse("postgresql://app:s3cret@db/sales?sslpassword=k3y&connect_timeout=5");
+    const text = o.toString();
+    assert(!text.canFind("s3cret") && !text.canFind("k3y"), text);
+    assert(text.canFind("user: app") && text.canFind("password: ***") && text.canFind("keyPassword: ***"), text);
+    assert(text.canFind("host: db") && text.canFind("transportFactory: null"), text);
 }
 
 unittest
