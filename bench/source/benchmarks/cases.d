@@ -333,6 +333,11 @@ BenchCase[] valueCases()
     intsText ~= "}";
     const intArray = Column("v", Oid.int4Array, -1, bytes(intsText), ints);
     const textArray = Column("v", Oid.textArray, -1, bytes(`{"a b","c\"d",plain,NULL,"x,y"}`), null);
+    double sum = 0.1;
+    sum += 0.2;
+    const float8 = Column("v", Oid.float8, 8, bytes("0.30000000000000004"), doubleBytes(sum));
+    const float8Tiny = Column("v", Oid.float8, 8, bytes("1.2345678901234567e-300"),
+            doubleBytes(1.2345678901234567e-300));
 
     size_t sink;
     return [
@@ -346,6 +351,10 @@ BenchCase[] valueCases()
         valueCase("value/numeric getLong", Column("v", Oid.numeric, -1, bytes("12345"), be16(2) ~ be16(
                 1) ~ be16(0)
                 ~ be16(0) ~ be16(1) ~ be16(2345)), (const Row r) { sink += cast(size_t) r.getLong(0); }),
+        valueCase("value/float8 getString", float8, (const Row r) { sink += r.getString(0).length; }),
+        valueCase("value/float8 getString 1e-300", float8Tiny, (const Row r) {
+            sink += r.getString(0).length;
+        }),
         valueCase("value/timestamptz getString", timestamp, (const Row r) {
             sink += r.getString(0).length;
         }),
