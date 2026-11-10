@@ -6,6 +6,12 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.6.0 (2026-11-10)
+
+The fixes and improvements from a code review: robustness, security and
+thread safety (#34), performance and benchmarks (#35), float text (#36),
+attributes, D idioms and dip1000 (#37); and dbwire 0.9 (#32, #42).
+
 ### Added
 
 - Benchmarks (`dub run :bench -b release`, #35): queries, parameters,
