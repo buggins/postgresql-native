@@ -7,7 +7,8 @@ Ryu doesn't count on round-half-even for those, e.g. it prints
 dbwire's `shortestDigits` with `Ties.avoid`), in plain notation when the
 decimal exponent X (value = d.ddd × 10^X) is at least -4 and below 15
 (`float8`) or 6 (`float4`), else as `d.ddde+XX` with at least two exponent
-digits; `NaN`, `Infinity`, `-Infinity`, `-0`.
+digits (dbwire's `formatDigits` with `FloatLayout(-4, 15 or 6, false)`); `NaN`,
+`Infinity`, `-Infinity`, `-0`.
 
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
@@ -175,7 +176,7 @@ private string decimalPoint() @trusted
 
 private string formatShortest(T)(T value, int plainLimit)
 {
-    import dbwire.types.floattext : digits, shortestDigits, Ties;
+    import dbwire.types.floattext : FloatLayout, formatDigits, shortestDigits, Ties;
     import std.math : isInfinity, isNaN, signbit;
 
     if (isNaN(value))
@@ -185,52 +186,6 @@ private string formatShortest(T)(T value, int plainLimit)
     if (value == 0)
         return signbit(value) ? "-0" : "0";
 
-    const shortest = shortestDigits(value, Ties.avoid);
-    const significant = shortest.digits;
-    const exponent = shortest.pointPos - 1; // value = d.ddd × 10^exponent
-    // At most a sign, 17 digits, a point and "e-308", or a sign, "0.000" and 17 digits
-    char[32] text = void;
-    size_t n;
-    void put(scope const(char)[] part...)
-    {
-        text[n .. n + part.length] = part[];
-        n += part.length;
-    }
-
-    if (signbit(value))
-        put('-');
-    if (exponent < -4 || exponent >= plainLimit)
-    {
-        put(significant[0]);
-        if (significant.length > 1)
-        {
-            put('.');
-            put(significant[1 .. $]);
-        }
-        const magnitude = exponent < 0 ? -exponent : exponent;
-        put('e', exponent < 0 ? '-' : '+');
-        if (magnitude >= 100)
-            put(cast(char)('0' + magnitude / 100));
-        put(cast(char)('0' + magnitude / 10 % 10), cast(char)('0' + magnitude % 10));
-    }
-    else if (exponent < 0)
-    {
-        put('0', '.');
-        foreach (i; 0 .. -exponent - 1)
-            put('0');
-        put(significant);
-    }
-    else if (significant.length <= exponent + 1)
-    {
-        put(significant);
-        foreach (i; significant.length .. exponent + 1)
-            put('0');
-    }
-    else
-    {
-        put(significant[0 .. exponent + 1]);
-        put('.');
-        put(significant[exponent + 1 .. $]);
-    }
-    return text[0 .. n].idup;
+    // plain from 1e-4 up to below 10^plainLimit, else 1.5e+300
+    return formatDigits(shortestDigits(value, Ties.avoid), signbit(value) != 0, FloatLayout(-4, plainLimit, false));
 }

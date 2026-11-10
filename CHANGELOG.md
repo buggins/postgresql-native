@@ -69,6 +69,12 @@ project uses [semantic versioning](https://semver.org/).
   (now documented).
 - `ConnectionOptions.toString` shows `password` and `tls.keyPassword` as
   `***` (#34).
+- dbwire `~>0.9.3` (#42): a `?password=` or `sslpassword=` in a connection URI is
+  masked in error messages; a tiny positive timeout no longer means "no
+  limit"; float text 4 to 5 times faster
+  outside about 1e-20…1e35, without allocating. The float text layout
+  (`formatDigits`) and the date/time text buffer (`TextBuffer`) now come from
+  dbwire (the same text).
 
 ### Fixed
 

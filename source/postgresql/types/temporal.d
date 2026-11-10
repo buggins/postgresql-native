@@ -471,38 +471,14 @@ enum long postgresEpochStdTime = 630_822_816_000_000_000L;
 enum long minSysTimeMicros = -postgresEpochStdTime / 10;
 enum long maxSysTimeMicros = (3_155_378_975_999_999_999L - postgresEpochStdTime) / 10;
 
-// Text of up to 128 characters, written in place: one allocation for the result.
+// Text of up to 128 characters, written in place: one allocation for the result. dbwire's `TextBuffer`
+// (`put`, `number`, `length`) with the date and time parts.
 struct TextBuffer
 {
-    char[128] chars;
-    size_t length;
+    import dbwire.types.text : DbwireTextBuffer = TextBuffer;
 
-    void put(char c) pure nothrow @nogc
-    {
-        chars[length++] = c;
-    }
-
-    void put(scope const(char)[] s) pure nothrow @nogc
-    {
-        chars[length .. length + s.length] = s;
-        length += s.length;
-    }
-
-    // `value` (not negative) in decimal, zero-padded to `width` digits
-    void number(ulong value, size_t width) pure nothrow @nogc
-    {
-        char[20] digits;
-        size_t at = digits.length;
-        do
-        {
-            digits[--at] = cast(char)('0' + value % 10);
-            value /= 10;
-        }
-        while (value);
-        while (digits.length - at < width)
-            digits[--at] = '0';
-        put(digits[at .. $]);
-    }
+    DbwireTextBuffer!128 buffer;
+    alias buffer this;
 
     // yyyy-mm-dd, the year of a BC date counted from 1
     void date(CivilDate d) pure nothrow @nogc
@@ -576,7 +552,7 @@ struct TextBuffer
 
     string get() const pure nothrow
     {
-        return chars[0 .. length].idup;
+        return buffer.text;
     }
 }
 
