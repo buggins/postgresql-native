@@ -1885,17 +1885,6 @@ final class Connection : Poolable
             transport.close();
     }
 
-    /++
-    Marks the connection closed and closes its socket without telling the server, for a GC finalizer
-    (`PooledConnection`), which must neither allocate nor wait on the network.
-    +/
-    package void abandon() nothrow
-    {
-        state = State.closed;
-        if (onOwnerThread && transport !is null)
-            transport.close();
-    }
-
     // --- results ---
 
     /++
