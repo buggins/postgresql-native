@@ -4,7 +4,7 @@ A native client for **PostgreSQL** in D: the PostgreSQL frontend/backend
 protocol over TCP, written in pure D, for ordinary threads (blocking sockets)
 and vibe.d fibers. No libpq, no C libraries at build time.
 
-> **Status: 0.6.0.** The API may still change before 1.0; the plan is tracked
+> **Status: 0.6.1.** The API may still change before 1.0; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/postgresql-native/issues/11),
 > changes in the [changelog](CHANGELOG.md).
 
@@ -12,7 +12,7 @@ Add it to your `dub.json`:
 
 ```json
 "dependencies": {
-    "postgresql-native": "~>0.6.0"
+    "postgresql-native": "~>0.6.1"
 }
 ```
 

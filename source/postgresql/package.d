@@ -41,7 +41,7 @@ enum uint postgresqlVersionMajor = 0;
 /// ditto
 enum uint postgresqlVersionMinor = 6;
 /// ditto
-enum uint postgresqlVersionPatch = 0;
+enum uint postgresqlVersionPatch = 1;
 
 /// Library version as a string, e.g. `"0.1.0"`.
 enum string postgresqlVersion = versionString(postgresqlVersionMajor, postgresqlVersionMinor,
