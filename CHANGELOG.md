@@ -6,6 +6,13 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Fixed
+
+- A `PooledConnection` collected by the GC (a field of an object nobody
+  references) no longer resets its session from the finalizer, which crashed
+  with `InvalidMemoryOperationError`: the connection is dropped instead of
+  going back to the pool with the borrower's open transaction (#46).
+
 ## 0.6.0 (2026-11-10)
 
 The fixes and improvements from a code review: robustness, security and

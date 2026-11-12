@@ -151,6 +151,38 @@ void testBulkInsert()
     enforce(conn.insert("itest_bulk", new Numbered[0]) == 0, "nothing to insert");
 }
 
+private final class PoolHolder
+{
+    PooledConnection conn;
+}
+
+// A borrowed connection in a transaction, held only by an object nobody references any more; returns its pid.
+private int dropHolderInTransaction(ConnectionPool pool)
+{
+    auto holder = new PoolHolder;
+    holder.conn = pool.lockConnection();
+    holder.conn.begin();
+    holder.conn.exec("SELECT 1");
+    return holder.conn.processId;
+}
+
+// A PooledConnection collected by the GC: the connection is dropped (its session can't be reset in a
+// finalizer), so the next borrower never gets the open transaction.
+private void testPoolFinalizer(ConnectionPool pool)
+{
+    import core.memory : GC;
+
+    const idleBefore = pool.idleConnections;
+    const pid = dropHolderInTransaction(pool);
+    foreach (i; 0 .. 3)
+        GC.collect();
+    if (pool.activeConnections != 0)
+        return; // the GC still sees the holder (conservative stack scan): nothing to check
+    enforce(pool.idleConnections == idleBefore - 1, "a collected connection is not reused");
+    auto conn = pool.lockConnection();
+    enforce(conn.processId != pid && !conn.inTransaction, "the next borrower gets a clean connection");
+}
+
 /++
 The pool: connections reused with their session reset, statement caches
 kept, limits and wait timeouts, broken connections dropped.
@@ -205,6 +237,7 @@ void testPool()
         enforce(pool.idleConnections == 0 && !r.empty, "busy connection not reused");
     }
     enforce(pool.idleConnections == 1, "one idle");
+    testPoolFinalizer(pool);
 
     // pool options in a connection string
     import std.conv : to;

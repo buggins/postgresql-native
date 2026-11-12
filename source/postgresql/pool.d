@@ -135,6 +135,19 @@ struct PooledConnection
 
     ~this() @safe
     {
+        import core.memory : GC;
+
+        // in a GC finalizer (a PooledConnection inside a collected object) nothing may allocate or wait on the
+        // network, so the session can't be reset: the connection is dropped instead of going back to the pool
+        // with whatever the borrower left in it (an open transaction, temporary tables, settings)
+        if (GC.inFinalizer)
+        {
+            if (conn !is null)
+                conn.abandon();
+            conn = null;
+            lease.release();
+            return;
+        }
         release();
     }
 
