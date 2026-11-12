@@ -6,6 +6,11 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.6.1 (2026-11-12)
+
+A `PooledConnection` collected by the garbage collector no longer crashes;
+dbwire 0.9.6.
+
 ### Fixed
 
 - A `PooledConnection` finalized by the GC (a field of an object nobody
