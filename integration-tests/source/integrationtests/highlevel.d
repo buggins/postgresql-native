@@ -151,6 +151,58 @@ void testBulkInsert()
     enforce(conn.insert("itest_bulk", new Numbered[0]) == 0, "nothing to insert");
 }
 
+private shared int poolHoldersFinalized;
+
+private final class PoolHolder
+{
+    PooledConnection conn;
+
+    ~this()
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"+="(poolHoldersFinalized, 1);
+    }
+}
+
+// A borrowed connection in a transaction, held only by an object nobody references any more; returns its pid.
+private int dropHolderInTransaction(ConnectionPool pool)
+{
+    auto holder = new PoolHolder;
+    holder.conn = pool.lockConnection();
+    holder.conn.begin();
+    holder.conn.exec("SELECT 1");
+    return holder.conn.processId;
+}
+
+// Overwrites the stack below the caller, where a dropped object's address may linger for the GC to see.
+private void clearStack()
+{
+    ubyte[16_384] junk;
+    junk[] = 0;
+    if (junk[$ - 1] != 0) // keeps the array from being optimized away
+        throw new Exception("never");
+}
+
+// A PooledConnection collected by the GC touches neither the pool nor the connection (either may be finalized
+// already): the connection stays checked out, and the next borrower gets another one.
+private void testPoolFinalizer(ConnectionPool pool)
+{
+    import core.atomic : atomicLoad;
+    import core.memory : GC;
+
+    const activeBefore = pool.activeConnections;
+    const pid = dropHolderInTransaction(pool);
+    clearStack();
+    foreach (i; 0 .. 3)
+        GC.collect();
+    auto conn = pool.lockConnection();
+    enforce(conn.processId != pid && !conn.inTransaction, "the next borrower gets another connection");
+    if (atomicLoad(poolHoldersFinalized) == 0)
+        return; // the GC still sees the holder (conservative stack scan): nothing more to check
+    enforce(pool.activeConnections == activeBefore + 2, "the collected connection stays checked out");
+}
+
 /++
 The pool: connections reused with their session reset, statement caches
 kept, limits and wait timeouts, broken connections dropped.
@@ -205,6 +257,7 @@ void testPool()
         enforce(pool.idleConnections == 0 && !r.empty, "busy connection not reused");
     }
     enforce(pool.idleConnections == 1, "one idle");
+    testPoolFinalizer(pool);
 
     // pool options in a connection string
     import std.conv : to;

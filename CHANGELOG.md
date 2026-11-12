@@ -6,6 +6,15 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Fixed
+
+- A `PooledConnection` finalized by the GC (a field of an object nobody
+  references) no longer resets its session from the finalizer, which crashed
+  with `InvalidMemoryOperationError`, or with a segfault when the pool was
+  finalized first (at exit). It now touches neither the pool nor the
+  connection, which stays checked out: call `release` before dropping an
+  object that holds one (#46). Needs dbwire 0.9.6 (dbwire#79).
+
 ## 0.6.0 (2026-11-10)
 
 The fixes and improvements from a code review: robustness, security and
