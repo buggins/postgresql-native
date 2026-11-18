@@ -6,6 +6,11 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.6.2 (2026-11-18)
+
+The I/O mode keyword `io_mode` is also accepted as `io` for short, as in all
+connectors; dbwire 0.9.8.
+
 ### Added
 
 - The I/O mode keyword `io_mode` can also be given as `io` for short, as in all
