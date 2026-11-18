@@ -6,6 +6,13 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- The I/O mode keyword `io_mode` can also be given as `io` for short, as in all
+  connectors (buggins/dbwire#83, #50). Giving both with different values is an
+  error; a connection string's `io` overrides a service's `io_mode`. Requires
+  dbwire 0.9.8.
+
 ## 0.6.1 (2026-11-12)
 
 A `PooledConnection` collected by the garbage collector no longer crashes;

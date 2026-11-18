@@ -111,7 +111,7 @@ comma-separated, for failover), `service` and `servicefile` (connection services
 `max_protocol_version`, `requirepeer`, `target_session_attrs` (`any`, `read-write`,
 `read-only`, `primary`, `standby`, `prefer-standby`), `load_balance_hosts`
 (`disable`, `random`); and this library's `statement_cache_size`,
-`rewrite_placeholders`, `io_mode`. `ConnectionOptions` has them all as fields,
+`rewrite_placeholders`, `io_mode` (or `io`: `auto`, `phobos`, `vibe`). `ConnectionOptions` has them all as fields,
 plus the timeouts, `statementTimeout` and run-time parameters for the startup
 message.
 
