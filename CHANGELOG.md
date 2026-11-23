@@ -6,6 +6,11 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.6.3 (2026-11-23)
+
+`io` and `io_mode` given together: the modes are compared, not the text, with
+dbwire's shared keyword handling; dbwire 0.9.9.
+
 ### Fixed
 
 - `io` and `io_mode` given together: the modes are compared, not the text, so
