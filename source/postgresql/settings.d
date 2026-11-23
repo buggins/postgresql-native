@@ -230,6 +230,8 @@ struct ConnectionOptions
     /++
     Threads (blocking sockets) or vibe.d fibers; `auto_` picks vibe.d inside a
     vibe.d task. Keyword `io_mode`, or `io` for short: `auto`, `phobos` or `vibe`.
+    A source (the connection string, a service) may give both keywords only
+    with the same mode; the string's keyword overrides the service's.
     +/
     IoMode ioMode = IoMode.auto_;
     /// Creates the raw transport instead of the I/O backend; may be null.
@@ -278,7 +280,7 @@ struct ConnectionOptions
     `postgres://...`) or a `key=value` string.
 
     Throws: `ClientException` if the string is malformed or has an unknown
-    keyword or an invalid value.
+    keyword or an invalid value, or if `io` and `io_mode` give different modes.
     +/
     static ConnectionOptions parse(string connectionString)
     {
@@ -294,7 +296,8 @@ struct ConnectionOptions
     `sslmode`, ...), e.g. as ddbc passes them. `host` and `port` may list
     several hosts separated by commas.
 
-    Throws: `ClientException` for an unknown keyword or an invalid value.
+    Throws: `ClientException` for an unknown keyword or an invalid value, or if
+    `io` and `io_mode` give different modes.
     +/
     static ConnectionOptions fromParams(const string[string] given)
     {
@@ -587,46 +590,33 @@ Replaces the `service` keyword (and `servicefile`) by the keywords of that
 connection service, for those `params` doesn't have (see
 `postgresql.userfiles.serviceParams`).
 
-Throws: `ClientException` if the service is not defined.
+First the I/O mode keywords of each source (`params` and the service) become
+a single `io_mode` (dbwire's `normalizeIoModeKey`), so that the string's `io`
+overrides the service's `io_mode` as any keyword does. An `io` value is
+checked there, under its own name, even if the other source overrides it; a
+single `io_mode` is checked when the options are read.
+
+Throws: `ClientException` if the service is not defined, for an invalid `io`
+value, or if a source gives `io` and `io_mode` with different modes.
 +/
 private void applyService(ref string[string] params)
 {
+    import dbwire.client.dsn : normalizeIoModeKey;
     import postgresql.userfiles : serviceParams;
 
-    normalizeIoModeKey(params);
+    // `io`, the short form of `io_mode`, becomes `io_mode` in each source, so that the string's `io`
+    // overrides the service's `io_mode` as any keyword does (buggins/dbwire#95)
+    params = normalizeIoModeKey(params);
     const name = params.get("service", null);
     const file = params.get("servicefile", null);
     params.remove("service");
     params.remove("servicefile");
     if (name.length == 0)
         return;
-    auto service = serviceParams(name, file);
-    normalizeIoModeKey(service);
+    auto service = normalizeIoModeKey(serviceParams(name, file));
     foreach (key, value; service)
         if (key !in params)
             params[key] = value;
-}
-
-/++
-Replaces `io`, the short form of `io_mode` (buggins/dbwire#83), by `io_mode`,
-so that a source's `io` overrides another source's `io_mode` as any keyword
-does.
-
-Throws: `ClientException` if both are given with different values.
-+/
-private void normalizeIoModeKey(ref string[string] params) @safe
-{
-    import dbwire.client.dsn : parseIoMode;
-
-    const io = params.get("io", null);
-    if (io is null)
-        return;
-    const ioMode = params.get("io_mode", null);
-    if (ioMode !is null && ioMode != io)
-        throw new ClientException("'io' and 'io_mode' give different I/O modes ('" ~ io ~ "' and '" ~ ioMode ~ "')");
-    parseIoMode("io", io); // so that an invalid value is reported under the key given
-    params.remove("io");
-    params["io_mode"] = io;
 }
 
 /++
@@ -716,14 +706,14 @@ unittest
 unittest
 {
     import std.conv : to;
-    import std.exception : assertThrown;
+    import std.exception : assertNotThrown, assertThrown, collectExceptionMsg;
     import std.file : remove, tempDir, write;
     import std.path : buildPath;
     import std.process : environment, thisProcessID;
 
     const file = buildPath(tempDir, "pgn-settings-service-" ~ thisProcessID.to!string);
     write(file, "[sales]\nhost=svc.example\ndbname=sales\napplication_name=from-service\nsslmode=require\n"
-            ~ "io_mode=phobos\n");
+            ~ "io_mode=phobos\n[both]\nio=auto\nio_mode=auto_\n[badio]\nio=fibers\n");
     scope (exit)
         remove(file);
     import std.array : replace;
@@ -734,6 +724,11 @@ unittest
     assert(o.sslMode == SslMode.require && o.ioMode == IoMode.phobos);
     // the string's `io` (the short form) beats the service's `io_mode`, as for any keyword
     assert(ConnectionOptions.parse("service=sales servicefile=" ~ quoted ~ " io=vibe").ioMode == IoMode.vibe);
+    // a service's I/O mode keywords are normalized too (#54): the same mode under both
+    assertNotThrown(ConnectionOptions.parse("service=both servicefile=" ~ quoted));
+    // and its `io` is checked, although the string's `io_mode` overrides it (buggins/dbwire#95)
+    const badIo = collectExceptionMsg(ConnectionOptions.parse("service=badio servicefile=" ~ quoted ~ " io_mode=vibe"));
+    assert(badIo == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", badIo);
     assertThrown!ClientException(ConnectionOptions.parse("service=nope servicefile=" ~ quoted));
 
     const saved = environment.toAA();
@@ -1113,7 +1108,7 @@ ushort parsePort(string text)
 // The I/O mode: `io_mode`, or `io` for short, as in every connector (buggins/dbwire#83)
 unittest
 {
-    import std.exception : collectExceptionMsg;
+    import std.exception : assertNotThrown, collectExceptionMsg;
 
     assert(ConnectionOptions.parse("postgresql://h/db?io_mode=vibe").ioMode == IoMode.vibe);
     assert(ConnectionOptions.parse("postgresql://h/db?io=vibe").ioMode == IoMode.vibe);
@@ -1122,4 +1117,14 @@ unittest
     assert(message == "'io' and 'io_mode' give different I/O modes ('vibe' and 'phobos')", message);
     message = collectExceptionMsg(ConnectionOptions.parse("postgresql://h/db?io=fibers"));
     assert(message == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", message);
+    // the modes are compared, not the text (#54): auto and auto_ are the same mode
+    assertNotThrown(ConnectionOptions.parse("postgresql://h/db?io=auto&io_mode=auto_"));
+    assert(ConnectionOptions.parse("postgresql://h/db?io=vibe&io_mode=vibe").ioMode == IoMode.vibe);
+    // an invalid value is reported as such, not as a conflict
+    message = collectExceptionMsg(ConnectionOptions.parse("postgresql://h/db?io=fibers&io_mode=phobos"));
+    assert(message == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("postgresql://h/db?io=vibe&io_mode=threads"));
+    assert(message == "Invalid value 'threads' for 'io_mode' (auto, phobos or vibe expected)", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("postgresql://h/db?io=phobos&io_mode=fibers"));
+    assert(message == "Invalid value 'fibers' for 'io_mode' (auto, phobos or vibe expected)", message);
 }
