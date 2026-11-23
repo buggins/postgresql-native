@@ -6,6 +6,14 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Fixed
+
+- `io` and `io_mode` given together: the modes are compared, not the text, so
+  `io=auto&io_mode=auto_` is accepted, and an invalid value is reported as such
+  (`io=fibers&io_mode=phobos`: "Invalid value 'fibers' for 'io'"), not as a
+  conflict. The keywords are normalized by dbwire's `normalizeIoModeKey`
+  (buggins/dbwire#95), shared by all connectors (#54). Requires dbwire 0.9.9.
+
 ## 0.6.2 (2026-11-18)
 
 The I/O mode keyword `io_mode` is also accepted as `io` for short, as in all
