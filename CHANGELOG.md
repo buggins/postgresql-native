@@ -4,14 +4,19 @@ All notable changes to postgresql-native are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.7.0 (2026-11-25)
+
+Transactions after errors: `commit()` of a failed transaction block throws
+instead of losing the work silently, and the pool drops connections the server
+ended while they were idle (#58). The `commit()` change can break code that
+swallowed an error inside a block, hence a minor release.
 
 ### Changed
 
 - `commit()` of a failed transaction block throws `ServerException` with SQLSTATE `25P02` (after ending the
   block), instead of returning as if it had committed: the server only rolls a failed block back, and answers its
   `COMMIT` with `ROLLBACK` and no error, so the work was lost silently (#58). Code that swallowed an error inside
-  a block and then called `commit()` now gets this exception, so the next release is a minor one (0.7.0).
+  a block and then called `commit()` now gets this exception.
 
 ### Fixed
 
