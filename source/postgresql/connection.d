@@ -1409,9 +1409,25 @@ final class Connection : Poolable
         exec("BEGIN" ~ transactionModes(level, readOnly, deferrable));
     }
 
-    /// Commits the transaction block (`COMMIT`); a failed block is rolled back by the server.
+    /++
+    Commits the transaction block (`COMMIT`).
+
+    Throws: `ServerException` with SQLSTATE `25P02` (in failed SQL transaction) when the block failed after an
+    error: the server only rolls it back, and its `COMMIT` answers `ROLLBACK` without an error, so the work would be
+    lost silently (#58). The block is ended (rolled back) before the exception, as pgjdbc does. This exception is
+    made by the client: its message is English, and it has no detail, hint or position.
+    +/
     void commit()
     {
+        if (transactionFailed)
+        {
+            exec("ROLLBACK"); // what the server's COMMIT does with a failed block, but said plainly
+            ServerMessage m;
+            m.severity = m.severityNonLocalized = "ERROR";
+            m.sqlState = "25P02";
+            m.message = "The transaction failed after an error and was rolled back; nothing was committed";
+            throw new ServerException(m);
+        }
         exec("COMMIT");
     }
 
@@ -1809,7 +1825,7 @@ final class Connection : Poolable
     }
 
     // Reads what the server sent to an idle connection: notifications, notices, parameter changes, a FATAL error.
-    private void readIdleMessages()
+    package void readIdleMessages()
     {
         checkReady();
         guarded({

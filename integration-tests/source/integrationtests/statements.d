@@ -64,14 +64,15 @@ void testTransactions()
             .getString(0) == "1,10,11,12",
             "savepoint results");
 
-    // COMMIT of a failed block: the server rolls back and reports ROLLBACK
+    // COMMIT of a failed block: the server only rolls back, so commit() throws (#58) and ends the block
     conn.begin();
     conn.exec("INSERT INTO itest_tx VALUES (?)", 20);
     collectException(conn.exec("SELECT 1/0"));
-    conn.commit();
+    e = collectException!ServerException(conn.commit());
+    enforce(e !is null && e.sqlState == "25P02", "commit() of a failed block must throw");
     enforce(!conn.inTransaction && firstRow(conn, "SELECT count(*) FROM itest_tx WHERE id = 20")
             .getLong(0) == 0,
-            "a failed block is rolled back by COMMIT");
+            "a failed block is rolled back and ended");
 
     // session defaults
     conn.setSessionDefaults(IsolationLevel.repeatableRead);

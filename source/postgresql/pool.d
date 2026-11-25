@@ -22,7 +22,9 @@ tables, advisory locks and `LISTEN`s are cleared, while the prepared
 statements of its statement cache stay (which saves parsing). A connection
 whose reset fails is closed. Idle connections are checked lazily, when
 connections are taken or returned, so the pool needs no background thread or
-timer.
+timer: taking one reads what the server sent while it was idle, and drops a
+connection the server ended (a `FATAL` error, e.g. `pg_terminate_backend`);
+one idle for longer than `pool_ping_after_idle` is pinged too.
 
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
@@ -88,13 +90,42 @@ final class ConnectionPool
 
     /++
     Takes a connection from the pool, opening a new one if none is idle and
-    the limit allows it; otherwise waits up to `PoolOptions.waitTimeout`.
+    the limit allows it; otherwise waits up to `PoolOptions.waitTimeout`. An idle
+    connection the server ended meanwhile is dropped, and another one taken (#58);
+    each attempt may wait up to `waitTimeout` when other threads hold the rest.
 
     Throws: `ClientException` if the pool is closed or no connection became
     free in time; connection errors when a new connection cannot be opened.
     +/
     PooledConnection lockConnection() @safe
     {
+        import dbwire.exception : DbException;
+        import std.algorithm.mutation : move;
+
+        // A connection the server ended while it was idle (pg_terminate_backend, idle_session_timeout) has the
+        // FATAL error waiting on its socket: reading it closes the connection, which the pool then drops, instead
+        // of the first query failing; the ping after `pingAfterIdle` comes later (#58). A returned connection has
+        // stopped listening (`resetSession`), so no notifications are lost here.
+        foreach (i; 0 .. idleConnections) // only idle connections can have died
+        {
+            auto pooled = PooledConnection(core.acquire());
+            // releases the connection at once; the destructor at the end of the iteration then does nothing
+            scope (failure)
+                pooled.release(); // e.g. an interrupted vibe.d task
+            try
+            {
+                if (pooled.conn.serverDataAvailable())
+                    pooled.conn.readIdleMessages();
+            }
+            catch (DbException e)
+            {
+                // e.g. FATAL 57P01: the connection is closed
+            }
+            if (pooled.conn.isOpen)
+                return move(pooled); // (the scope guard keeps the compiler from moving it implicitly)
+            pooled.release();
+        }
+        // dead ones dropped (others may have been returned meanwhile): the next one as the pool gives it
         return PooledConnection(core.acquire());
     }
 

@@ -66,6 +66,7 @@ immutable TestCase[] allTests = [
     TestCase("struct mapping: query!T, queryRow!T, queryValue!T, insert", &testStructMapping, true),
     TestCase("bulk insert: several statements, atomic", &testBulkInsert, true),
     TestCase("pool: reuse, session reset, limits", &testPool, true),
+    TestCase("a pooled connection terminated while idle is dropped", &testPoolTerminatedWhileIdle, true),
     TestCase("target_session_attrs, load_balance_hosts", &testTargetSessionAttrs, true),
     TestCase("PG* environment, password file, ~/.postgresql files", &testEnvironmentAndUserFiles, true),
     TestCase("hostaddr and connection services", &testHostaddrAndServices, true),

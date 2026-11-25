@@ -6,6 +6,19 @@ project uses [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### Changed
+
+- `commit()` of a failed transaction block throws `ServerException` with SQLSTATE `25P02` (after ending the
+  block), instead of returning as if it had committed: the server only rolls a failed block back, and answers its
+  `COMMIT` with `ROLLBACK` and no error, so the work was lost silently (#58). Code that swallowed an error inside
+  a block and then called `commit()` now gets this exception, so the next release is a minor one (0.7.0).
+
+### Fixed
+
+- `ConnectionPool.lockConnection` drops a connection the server ended while it was idle (`pg_terminate_backend`,
+  `idle_session_timeout`) and takes another, instead of handing it out to fail on the first query; the ping
+  after `pool_ping_after_idle` came too late for that (#58).
+
 ## 0.6.3 (2026-11-23)
 
 `io` and `io_mode` given together: the modes are compared, not the text, with
