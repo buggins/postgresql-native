@@ -4,7 +4,7 @@ The high-level API: struct mapping, the connection pool, connection strings
 +/
 module integrationtests.highlevel;
 
-import core.time : seconds;
+import core.time : msecs, seconds;
 import std.datetime.date : Date, DateTime;
 import std.exception : assertThrown, collectException, enforce;
 import std.typecons : Nullable;
@@ -201,6 +201,38 @@ private void testPoolFinalizer(ConnectionPool pool)
     if (atomicLoad(poolHoldersFinalized) == 0)
         return; // the GC still sees the holder (conservative stack scan): nothing more to check
     enforce(pool.activeConnections == activeBefore + 2, "the collected connection stays checked out");
+}
+
+/// A pooled connection the server terminated while idle is dropped when taken, before the first query (#58).
+void testPoolTerminatedWhileIdle()
+{
+    import core.thread : Thread;
+
+    auto pool = new ConnectionPool(serverOptions(), PoolOptions(1));
+    scope (exit)
+        pool.close();
+    const pid = pool.lockConnection().processId; // the temporary is returned at once
+    enforce(pool.idleConnections == 1, "returned");
+    auto admin = connectToServer();
+    scope (exit)
+        admin.close();
+    enforce(admin.queryValue!bool("SELECT pg_terminate_backend(?)", pid), "terminated");
+    bool gone;
+    foreach (i; 0 .. 200) // until the backend is gone (its FATAL message is then sent)
+    {
+        gone = admin.queryValue!long("SELECT count(*) FROM pg_stat_activity WHERE pid = ?", pid) == 0;
+        if (gone)
+            break;
+        Thread.sleep(50.msecs);
+    }
+    enforce(gone, "the terminated backend is still running after 10 s");
+    // The backend sent its FATAL message and closed the socket before it left pg_stat_activity; give the bytes
+    // time to arrive. (A retry loop can't be used: returning the old connection would drop it too, through the
+    // failing session reset, so the test would pass without the check in lockConnection.)
+    Thread.sleep(500.msecs);
+    auto conn = pool.lockConnection();
+    enforce(conn.processId != pid, "the terminated connection was handed out");
+    enforce(conn.queryValue!int("SELECT 1") == 1, "the new connection works");
 }
 
 /++
