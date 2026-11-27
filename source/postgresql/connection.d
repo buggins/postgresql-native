@@ -168,6 +168,13 @@ final class Connection : Poolable
         busy,
     }
 
+    private enum CancelBy : int
+    {
+        none,
+        user, // `cancel()`
+        timeout, // the command timeout
+    }
+
     package State state = State.closed;
     package ConnectionOptions options;
     private IoBackend backend;
@@ -200,6 +207,13 @@ final class Connection : Poolable
     private bool responseDone = true; // ReadyForQuery of the current request was read
     private ServerMessage pendingError; // the first error of the current response
     private bool hasPendingError;
+    private Duration commandTimeoutValue; // `commandTimeout`: for the requests that start from now on
+    private Duration requestTimeout; // the command timeout of the current request, taken when it started
+    private Duration timeoutLeft; // what is left of the command timeout for the current request
+    private Duration ackLeft; // after the command timeout: what is left of the 5 seconds for the rest of the response
+    private bool timedOut; // the command timeout sent a CancelRequest for the current request
+    private bool awaitingAck; // the command timeout ran out: the rest of the response is due
+    private shared int cancelBy; // who sent a cancel during the current request (`CancelBy`), set by one cas
 
     /++
     Called with each notice (NoticeResponse: warnings, `RAISE NOTICE`
@@ -233,6 +247,7 @@ final class Connection : Poolable
         this.options.runtimeParameters = options.runtimeParameters.dup;
         if (options.statementCacheSize > 0)
             cache = new StatementCache(options.statementCacheSize);
+        commandTimeoutValue = options.commandTimeout;
         connect();
     }
 
@@ -240,6 +255,28 @@ final class Connection : Poolable
     this(string connectionString)
     {
         this(ConnectionOptions.parse(connectionString));
+    }
+
+    /++
+    The command timeout of the requests that start from now on
+    (`ConnectionOptions.commandTimeout` until changed); `Duration.zero` or
+    less: no limit. A request that is running keeps the timeout it started
+    with; it lasts until the response ends, so the rows of a result are read
+    under the timeout of the query. See `ConnectionOptions.commandTimeout`
+    for what it limits. `resetSession` (and so `ConnectionPool`)
+    restores the value of the options, so one borrower's setting doesn't carry
+    over to the next (#62). Like every call except `cancel()`, use it from the
+    thread or task that uses the connection.
+    +/
+    @property Duration commandTimeout() const pure nothrow @nogc
+    {
+        return commandTimeoutValue;
+    }
+
+    /// ditto
+    @property void commandTimeout(Duration timeout) pure nothrow @nogc
+    {
+        commandTimeoutValue = timeout;
     }
 
     /// Whether the connection is open (it may be busy).
@@ -540,7 +577,10 @@ final class Connection : Poolable
     {
         foreach (attempt; 0 .. 2)
         {
+            const budget = timeoutLeft; // what the first attempt left of the command timeout
             startRequest();
+            if (attempt > 0)
+                timeoutLeft = budget; // one command timeout for both attempts
             bool cached;
             StatementInfo info;
             if (cache !is null)
@@ -1171,7 +1211,7 @@ final class Connection : Poolable
     // Runs the statements of a pipeline (Pipeline.run).
     package PipelineResult[] runPipeline(string[] sqls, ParamEncoder[] encoders, bool transactional)
     {
-        startRequest();
+        startRequest(false); // no command timeout for pipelines
         auto infos = new StatementInfo[sqls.length];
         size_t[] toDescribe;
         string[] temporary; // statement names to close afterwards when there is no cache
@@ -1521,16 +1561,30 @@ final class Connection : Poolable
     while the connection is busy. It does nothing if no request is running.
     Like every PostgreSQL client's cancel, it races with the end of the
     statement: if that ends first, the cancel may hit the next statement
-    of the session, or nothing.
+    of the session, or nothing. One cancel is sent per request: a second
+    call, or a call after the command timeout cancelled the request, does
+    nothing. A cancel during a request is never reported as a
+    `StatementTimeoutException`, even when the command timeout runs out
+    after it (#62).
 
     Throws: `ConnectionException` if the server can't be reached.
     +/
     void cancel()
     {
-        import dbwire.io.backend : IoMode;
+        import core.atomic : cas;
 
         if (state != State.busy || cancelKey.length == 0)
             return;
+        if (!cas(&cancelBy, int(CancelBy.none), int(CancelBy.user)))
+            return; // a cancel of this request is out already
+        sendCancelRequest();
+    }
+
+    // Sends a CancelRequest for this session over a new connection, and waits until the server has handled it.
+    private void sendCancelRequest()
+    {
+        import dbwire.io.backend : IoMode;
+
         auto io = backendFor(IoMode.auto_); // the caller's context: another thread or task
         auto raw = openTransport(io, connectedAddress);
         Transport t = raw;
@@ -1583,7 +1637,7 @@ final class Connection : Poolable
     CopyIn copyIn(string sql, CopyFormat rowFormat = CopyFormat.text)
     {
         CopyIn result;
-        startSimpleQuery(sql);
+        startSimpleQuery(sql, false); // no command timeout for COPY
         guarded({
             for (;;)
             {
@@ -1679,7 +1733,7 @@ final class Connection : Poolable
     CopyOut copyOut(string sql, CopyFormat rowFormat = CopyFormat.text)
     {
         CopyOut result;
-        startSimpleQuery(sql);
+        startSimpleQuery(sql, false); // no command timeout for COPY
         guarded({
             for (;;)
             {
@@ -1849,13 +1903,15 @@ final class Connection : Poolable
     (closes cursors, resets the session authorization and all run-time
     parameters to their startup values, stops listening, releases advisory
     locks, drops temporary tables and sequence state). Without a statement
-    cache it runs `DISCARD ALL`. Untaken notifications are dropped.
-    `ConnectionPool` calls it when a connection is returned.
+    cache it runs `DISCARD ALL`. Untaken notifications are dropped, and
+    `commandTimeout` gets the value of `ConnectionOptions.commandTimeout`
+    back (#62). `ConnectionPool` calls it when a connection is returned.
 
     Throws: `ServerException`, `ConnectionException`.
     +/
     void resetSession()
     {
+        commandTimeoutValue = options.commandTimeout;
         if (txStatus != TransactionStatus.idle)
             exec("ROLLBACK");
         if (cache is null)
@@ -2014,22 +2070,99 @@ final class Connection : Poolable
 
     // --- message handling ---
 
-    // Marks the connection busy with a new request.
-    private void startRequest()
+    // Marks the connection busy with a new request; `timed`: under the command timeout (not COPY and pipelines).
+    private void startRequest(bool timed = true)
     {
+        import core.atomic : atomicStore;
+
         checkReady();
         state = State.busy;
         responseDone = false;
         hasPendingError = false;
+        requestTimeout = timed ? commandTimeoutValue : Duration.zero;
+        timeoutLeft = requestTimeout;
+        timedOut = false;
+        awaitingAck = false;
+        atomicStore(cancelBy, int(CancelBy.none));
     }
 
-    package void startSimpleQuery(string sql)
+    /++
+    Before each read of the server's data: with a command timeout, while a
+    request runs, waits for data within what is left of it. The timeout is the
+    sum of these waits for one request, not the time spent between reads (as
+    in mssql-native). When it runs out, cancels the request (a CancelRequest;
+    `throwPendingError` then throws `StatementTimeoutException` for its
+    SQLSTATE 57014, unless the statement had ended already), and from then on
+    closes the connection when 5 seconds pass without data (#62). After a
+    `cancel()` during the request no second cancel is sent, and its error
+    stays a plain `ServerException`; `cancelBy` decides who cancels, so the two
+    can't both send one.
+
+    The cancel is sent synchronously: the server has handled it (signalled the
+    session) before the response is read on, and the client sends nothing
+    more before the response ends. A cancel that comes too late finds the
+    session waiting for a command, and the server ignores it there; it can't
+    hit the next statement, short of a signal delivered later than that next
+    statement takes to arrive.
+    +/
+    private void awaitResponseData()
+    {
+        import core.atomic : cas;
+        import core.time : seconds;
+
+        if (requestTimeout <= Duration.zero || state != State.busy)
+            return;
+        if (!awaitingAck)
+        {
+            if (waitWithin(timeoutLeft))
+                return;
+            enum ranOut = "The statement ran into the command timeout (";
+            if (cancelKey.length == 0)
+                throw new ConnectionException(
+                        ranOut ~ requestTimeout.toString() ~ "), and the server gave no key to cancel it");
+            // (when the user's cancel is out already: no second one, and no timeout reported)
+            if (cas(&cancelBy, int(CancelBy.none), int(CancelBy.timeout)))
+            {
+                timedOut = true;
+                try
+                    sendCancelRequest();
+                catch (Exception e)
+                    throw new ConnectionException(
+                            ranOut ~ requestTimeout.toString() ~ "), and the cancel couldn't be sent: " ~ e.msg);
+            }
+            awaitingAck = true;
+            ackLeft = 5.seconds;
+        }
+        if (!waitWithin(ackLeft))
+        {
+            enum noAnswer = "the server sent nothing for 5 seconds after the cancel";
+            throw new ConnectionException(timedOut ? "The statement ran into the command timeout, and " ~ noAnswer
+                    : "The command timeout ran out after a cancel, and " ~ noAnswer);
+        }
+        ackLeft = 5.seconds; // data came: the rest of a large result may still be on its way
+    }
+
+    /// Waits for the server's data within `budget`; subtracts the time waited from it.
+    private bool waitWithin(ref Duration budget)
+    {
+        import core.time : MonoTime;
+        import dbwire.io.backend : waitForData;
+
+        if (budget <= Duration.zero)
+            return transport.dataAvailable();
+        const start = MonoTime.currTime;
+        scope (exit)
+            budget -= MonoTime.currTime - start;
+        return waitForData(transport, budget, backend);
+    }
+
+    package void startSimpleQuery(string sql, bool timed = true)
     {
         MessageBuilder b;
         b.begin(FrontendMessage.query);
         b.putCString(sql);
         b.finish();
-        startRequest();
+        startRequest(timed);
         guarded({ stream.send(b.data); });
     }
 
@@ -2136,6 +2269,11 @@ final class Connection : Poolable
         if (hasPendingError)
         {
             hasPendingError = false;
+            if (timedOut && pendingError.sqlState == "57014")
+            {
+                timedOut = false;
+                throw new StatementTimeoutException(pendingError, requestTimeout.toString());
+            }
             throw new ServerException(pendingError);
         }
     }
@@ -2506,7 +2644,7 @@ final class Connection : Poolable
         else if (encryption == Encryption.direct)
             startTls(raw, endpoint, true);
 
-        stream = new MessageStream(transport);
+        stream = new MessageStream(new TimedReads(transport, &awaitResponseData));
         // before the login completes, messages are small (libpq: 2000 bytes for authentication requests)
         stream.maxMessageLength = 1 << 20;
         startup();
@@ -2821,6 +2959,50 @@ final class Connection : Poolable
 
 @safe:
 
+// The connection's transport for its message stream: each read first waits as the command timeout allows (#62).
+private final class TimedReads : Transport
+{
+    private Transport inner;
+    private void delegate() @safe beforeRead;
+
+    this(Transport inner, void delegate() @safe beforeRead) @safe pure nothrow
+    {
+        this.inner = inner;
+        this.beforeRead = beforeRead;
+    }
+
+    override size_t read(scope ubyte[] buffer) @safe
+    {
+        beforeRead();
+        return inner.read(buffer);
+    }
+
+    override void write(scope const(ubyte)[] data) @safe
+    {
+        inner.write(data);
+    }
+
+    override bool dataAvailable() @safe
+    {
+        return inner.dataAvailable();
+    }
+
+    override void close() @safe nothrow
+    {
+        inner.close();
+    }
+
+    override bool connected() const @safe nothrow
+    {
+        return inner.connected;
+    }
+
+    override void setTimeouts(Duration receive, Duration send) @safe
+    {
+        inner.setTimeouts(receive, send);
+    }
+}
+
 /// Thrown internally when the TLS handshake fails, so `sslmode=prefer` can retry without TLS.
 private class TlsHandshakeFailed : ConnectionException
 {
@@ -3027,6 +3209,249 @@ version (unittest)
         }
         return s;
     }
+}
+
+// The command timeout's scripted server (#62): the session's transport `mock`, whose waits run the actions of
+// `onWait` in turn (a wait returns whether data is there after its action); each CancelRequest arrives on a new
+// transport and runs `onCancel`.
+version (unittest)
+{
+    import dbwire.io.transport : WaitableTransport;
+
+    private final class TimeoutServer : Transport, WaitableTransport
+    {
+        MockTransport mock;
+        void delegate()[] onWait;
+        void delegate() onCancel;
+        const(ubyte)[][] cancelRequests;
+
+        this()
+        {
+            mock = new MockTransport;
+        }
+
+        override size_t read(scope ubyte[] buffer)
+        {
+            return mock.read(buffer);
+        }
+
+        override void write(scope const(ubyte)[] data)
+        {
+            mock.write(data);
+        }
+
+        override bool dataAvailable()
+        {
+            return mock.dataAvailable;
+        }
+
+        override void close() nothrow
+        {
+            mock.close();
+        }
+
+        override bool connected() const nothrow
+        {
+            return mock.connected;
+        }
+
+        override void setTimeouts(Duration receive, Duration send)
+        {
+        }
+
+        @property bool canWaitForData()
+        {
+            return true;
+        }
+
+        bool waitForData(Duration timeout)
+        {
+            cast(void) timeout; // nothing arrives while waiting, except what the action feeds
+            if (onWait.length)
+            {
+                auto action = onWait[0];
+                onWait = onWait[1 .. $];
+                if (action !is null)
+                    action();
+            }
+            return mock.dataAvailable;
+        }
+
+        // The connection a CancelRequest is sent over: the server handles it and closes.
+        Transport cancelTransport()
+        {
+            final class CancelPeer : Transport
+            {
+                override size_t read(scope ubyte[] buffer)
+                {
+                    return 0;
+                }
+
+                override void write(scope const(ubyte)[] data)
+                {
+                    cancelRequests ~= data.idup;
+                    if (onCancel !is null)
+                        onCancel();
+                }
+
+                override bool dataAvailable()
+                {
+                    return false;
+                }
+
+                override void close() nothrow
+                {
+                }
+
+                override bool connected() const nothrow
+                {
+                    return true;
+                }
+
+                override void setTimeouts(Duration receive, Duration send)
+                {
+                }
+            }
+
+            return new CancelPeer;
+        }
+    }
+
+    // A connection to `server` after a trust login (process 42, cancel key 7).
+    private Connection timeoutConnection(TimeoutServer server)
+    {
+        server.mock.feed(message('R', wire32(0)) ~ message('K', wire32(42) ~ wire32(7))
+                ~ message('S', cstring("server_version") ~ cstring("18.0")) ~ readyIdle);
+        ConnectionOptions o;
+        o.host = "h";
+        o.user = "u";
+        o.sslMode = SslMode.disable;
+        bool connected;
+        Transport factory(string, ushort, Duration)
+        {
+            if (connected)
+                return server.cancelTransport();
+            connected = true;
+            return server;
+        }
+
+        o.transportFactory = &factory;
+        return new Connection(o);
+    }
+
+    private immutable(ubyte)[] errorMessage(string sqlState, string text)
+    {
+        return message('E', cstring("SERROR") ~ cstring("VERROR") ~ cstring("C" ~ sqlState) ~ cstring(
+                "M" ~ text)
+                ~ ubyte(0));
+    }
+
+    private enum cancelled = errorMessage("57014", "canceling statement due to user request") ~ readyIdle;
+}
+
+// The command timeout cancels the request: StatementTimeoutException (57014), the connection stays usable (#62)
+unittest
+{
+    import core.time : msecs;
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    assert(conn.commandTimeout == Duration.zero);
+    conn.commandTimeout = 1.msecs;
+    server.onCancel = () { server.mock.feed(cancelled); };
+    const e = collectException!StatementTimeoutException(conn.exec("SELECT pg_sleep(10)"));
+    assert(e !is null && e.sqlState == "57014" && e.msg.canFind("(the command timeout of 1 ms ran out)"));
+    assert(server.cancelRequests == [[0, 0, 0, 16, 0x04, 0xD2, 0x16, 0x2E, 0, 0, 0, 42, 0, 0, 0, 7]]);
+    assert(conn.isOpen && !conn.isBusy);
+    server.mock.feed(message('C', cstring("SELECT 1")) ~ readyIdle);
+    assert(conn.exec("SELECT 1") == 1 && server.cancelRequests.length == 1); // the data was there: no cancel
+}
+
+// A statement that ends before the cancel reaches the server keeps its result (#62)
+unittest
+{
+    import core.time : msecs;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    conn.commandTimeout = 1.msecs;
+    server.onCancel = () { server.mock.feed(message('C', cstring("UPDATE 3")) ~ readyIdle); };
+    assert(conn.exec("UPDATE t SET n = 1") == 3);
+    assert(server.cancelRequests.length == 1 && conn.isOpen && !conn.isBusy);
+}
+
+// No answer within 5 seconds after the cancel: the connection is closed (#62)
+unittest
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    conn.commandTimeout = 1.msecs;
+    const e = collectException!ConnectionException(conn.exec("SELECT pg_sleep(10)"));
+    assert(e !is null && e.msg == "The statement ran into the command timeout, and the server sent nothing for 5 "
+            ~ "seconds after the cancel", e is null ? "no exception" : e.msg);
+    assert(!conn.isOpen);
+}
+
+// A user's cancel before the timeout runs out: no second cancel, and its error stays a plain ServerException (#62)
+unittest
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    conn.commandTimeout = 1.msecs;
+    server.onWait = [() { conn.cancel(); }, () { server.mock.feed(cancelled); }];
+    const e = collectException!ServerException(conn.exec("SELECT pg_sleep(10)"));
+    assert(e !is null && e.sqlState == "57014" && cast(const(StatementTimeoutException)) e is null);
+    assert(server.cancelRequests.length == 1 && conn.isOpen && !conn.isBusy);
+}
+
+// A user's cancel after the timeout's cancel sends nothing; the error is the timeout's (#62)
+unittest
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    conn.commandTimeout = 1.msecs;
+    server.onWait = [null, () { conn.cancel(); server.mock.feed(cancelled); }];
+    assert(collectException!StatementTimeoutException(conn.exec("SELECT pg_sleep(10)")) !is null);
+    assert(server.cancelRequests.length == 1 && conn.isOpen && !conn.isBusy);
+}
+
+// A request keeps the command timeout it started with; a change applies from the next one, and resetSession
+// restores the options' value (#62)
+unittest
+{
+    import core.time : msecs, seconds;
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    auto server = new TimeoutServer;
+    auto conn = timeoutConnection(server);
+    conn.commandTimeout = 1.msecs;
+    // changed after the first statement's answer; the second statement still has the timeout
+    server.onWait = [
+        () {
+            conn.commandTimeout = Duration.zero;
+            server.mock.feed(message('C', cstring("SELECT 1")));
+        }
+    ];
+    server.onCancel = () { server.mock.feed(cancelled); };
+    const e = collectException!StatementTimeoutException(conn.exec("SELECT 1; SELECT pg_sleep(10)"));
+    assert(e !is null && e.msg.canFind("1 ms"));
+    assert(conn.commandTimeout == Duration.zero);
+    conn.commandTimeout = 5.seconds;
+    server.mock.feed(readyIdle);
+    conn.resetSession();
+    assert(conn.commandTimeout == Duration.zero && server.cancelRequests.length == 1);
 }
 
 // More than 32767 parameters: ParameterDescription's count is a uint16

@@ -21,11 +21,11 @@
         "./bench"
     ],
     "dependencies": {
-        "dbwire:types": "~>0.9.9",
-        "dbwire:io": "~>0.9.9",
-        "dbwire:tls": "~>0.9.9",
-        "dbwire:client": "~>0.9.9",
-        "dbwire:crypto": "~>0.9.9",
+        "dbwire:types": "~>0.9.10",
+        "dbwire:io": "~>0.9.10",
+        "dbwire:tls": "~>0.9.10",
+        "dbwire:client": "~>0.9.10",
+        "dbwire:crypto": "~>0.9.10",
         "vibe-core": {
             "version": ">=1.22.0 <3.0.0",
             "optional": true

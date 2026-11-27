@@ -226,6 +226,23 @@ struct ConnectionOptions
     stays usable. Zero keeps the server's setting.
     +/
     Duration statementTimeout;
+    /++
+    The client's command timeout (keyword `command_timeout`, seconds, may be
+    fractional): how long a request may wait for the server's data, summed
+    over its reads (the caller's time between rows doesn't count). When it
+    runs out, the client cancels the statement (a CancelRequest) and throws
+    `StatementTimeoutException` (SQLSTATE 57014); the connection stays usable.
+    A statement that ended before the cancel reached the server keeps its
+    result. After the cancel, 5 seconds without data close the connection
+    (`ConnectionException`); so does a timeout when the server gave no cancel
+    key (some poolers) or the cancel can't be sent. It limits waiting for the
+    server's data only: sending is limited by `sendTimeout`. Not for COPY and
+    pipelines. Zero: no limit. The
+    initial value of `Connection.commandTimeout`, which can change it on an
+    open connection; `Connection.resetSession` (and so `ConnectionPool`)
+    restores it (#62).
+    +/
+    Duration commandTimeout;
 
     /++
     Threads (blocking sockets) or vibe.d fibers; `auto_` picks vibe.d inside a
@@ -434,6 +451,9 @@ struct ConnectionOptions
             case "connect_timeout":
                 o.connectTimeout = parseSeconds(key, value); // 0: no limit
                 break;
+            case "command_timeout":
+                o.commandTimeout = parseSeconds(key, value); // 0: no limit
+                break;
             case "client_encoding":
                 if (!equalsIgnoringCase(value, "utf8") && !equalsIgnoringCase(value, "utf-8"))
                     throw new ClientException("Only client_encoding=UTF8 is supported");
@@ -511,6 +531,7 @@ unittest
 
 unittest
 {
+    import core.time : msecs;
     import std.exception : assertThrown;
 
     auto o = ConnectionOptions.parse("postgres://h1:1,h2:2/");
@@ -523,6 +544,9 @@ unittest
     o = ConnectionOptions.parse("postgresql://[::1]:5432/x?max_protocol_version=latest&connect_timeout=3");
     assert(o.host == "::1" && o.maxProtocolVersion == ProtocolVersion.v32 && o.connectTimeout == 3.seconds);
     assert(ConnectionOptions.parse("postgresql://h?connect_timeout=0").connectTimeout == Duration.zero);
+    assert(ConnectionOptions.parse("postgresql://h?command_timeout=1.5").commandTimeout == 1500.msecs);
+    assert(ConnectionOptions.parse("host=h command_timeout=0").commandTimeout == Duration.zero);
+    assertThrown!ClientException(ConnectionOptions.parse("postgresql://h?command_timeout=-1"));
     o = ConnectionOptions.parse("postgresql://h?sslnegotiation=direct&sslmode=require&require_auth=!password,!md5");
     assert(o.sslNegotiation == SslNegotiation.direct && o.requireAuth == "!password,!md5");
     assertThrown!ClientException(ConnectionOptions.parse("postgresql://h?sslmode=sometimes"));

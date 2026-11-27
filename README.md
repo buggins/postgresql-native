@@ -111,7 +111,7 @@ comma-separated, for failover), `service` and `servicefile` (connection services
 `max_protocol_version`, `requirepeer`, `target_session_attrs` (`any`, `read-write`,
 `read-only`, `primary`, `standby`, `prefer-standby`), `load_balance_hosts`
 (`disable`, `random`); and this library's `statement_cache_size`,
-`rewrite_placeholders`, `io_mode` (or `io`: `auto`, `phobos`, `vibe`). `ConnectionOptions` has them all as fields,
+`rewrite_placeholders`, `command_timeout` (seconds), `io_mode` (or `io`: `auto`, `phobos`, `vibe`). `ConnectionOptions` has them all as fields,
 plus the timeouts, `statementTimeout` and run-time parameters for the startup
 message.
 
@@ -175,6 +175,13 @@ conn.commit();
 
 // from another thread or vibe.d task: stops the running statement (SQLSTATE 57014)
 conn.cancel();
+
+// the client's timeout: a request waiting longer for the server is cancelled
+conn.commandTimeout = 30.seconds;                // also the option command_timeout
+try
+    conn.exec("SELECT slow_report()");
+catch (StatementTimeoutException e)              // SQLSTATE 57014; the connection stays usable
+    writeln(e.msg);
 
 auto p = conn.pipeline();                        // one round trip for all
 p.add("INSERT INTO notes VALUES (?, ?)", 30, "y");

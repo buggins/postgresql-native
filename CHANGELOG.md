@@ -4,6 +4,26 @@ All notable changes to postgresql-native are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- A client-side command timeout: `command_timeout` (`ConnectionOptions.commandTimeout`, seconds, may be
+  fractional), changed on an open connection through `Connection.commandTimeout` from the next request. It limits
+  how long a request waits for the server's data, summed over its reads. When it runs out, the statement is
+  cancelled (a CancelRequest) and `StatementTimeoutException` (a `ServerException`, SQLSTATE 57014) is thrown; the
+  connection stays usable. A statement that ended before the cancel reached the server keeps its result. After the
+  cancel, 5 seconds without data close the connection, as does a timeout when the server gave no cancel key. Sending
+  is limited by `sendTimeout`, not by this timeout. Not for COPY and pipelines.
+  `resetSession` (and so `ConnectionPool`) restores the value of the options. Unlike the server's
+  `statement_timeout`, it can be told apart from a cancel, and it also covers a server that stops sending. For
+  ddbc's `Statement.setQueryTimeout` (#62).
+
+### Changed
+
+- Requires dbwire `~>0.9.10`, whose TLS transport sees data it has already received (buggins/dbwire#103), which
+  the command timeout's wait needs over TLS.
+
 ## 0.7.0 (2026-11-25)
 
 Transactions after errors: `commit()` of a failed transaction block throws

@@ -218,6 +218,35 @@ class ServerException : DbException
     }
 }
 
+/++
+A statement ran into the command timeout it started with
+(`Connection.commandTimeout`, initially `ConnectionOptions.commandTimeout`):
+the client cancelled it, and the server stopped it with SQLSTATE 57014
+(query_canceled), as for any cancel, so code that checks the SQLSTATE keeps
+working. The connection stays usable; an open transaction block has failed,
+as after any error (#62).
++/
+class StatementTimeoutException : ServerException
+{
+    /// Creates the exception from the server's error and the timeout's text.
+    this(ServerMessage error, string timeout, string file = __FILE__, size_t line = __LINE__) @safe pure
+    {
+        super(error, file, line);
+        msg ~= " (the command timeout of " ~ timeout ~ " ran out)";
+    }
+}
+
+@safe unittest
+{
+    ServerMessage m;
+    m.severity = m.severityNonLocalized = "ERROR";
+    m.sqlState = "57014";
+    m.message = "canceling statement due to user request";
+    const e = new StatementTimeoutException(m, "2 secs");
+    assert(e.sqlState == "57014" && e.error.message == m.message);
+    assert(e.msg == "ERROR:  canceling statement due to user request (the command timeout of 2 secs ran out)", e.msg);
+}
+
 ///
 @safe unittest
 {
