@@ -101,6 +101,86 @@ void testStatementTimeout()
     enforce(firstRow(conn, "SELECT 'idle cancel'").getString(0) == "idle cancel", "cancel when idle");
 }
 
+/// The client's command timeout: a cancel reported as `StatementTimeoutException`, the connection kept; a change
+/// applies from the next request; not for COPY; `resetSession` and the pool restore the options' value (#62).
+void testCommandTimeout()
+{
+    import core.time : Duration, MonoTime, msecs, seconds;
+    import std.algorithm.searching : canFind;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    enforce(conn.commandTimeout == Duration.zero, "a timeout without the option");
+    conn.commandTimeout = 300.msecs;
+    auto start = MonoTime.currTime;
+    auto e = collectException!StatementTimeoutException(conn.exec("SELECT pg_sleep(5)"));
+    enforce(e !is null && e.sqlState == "57014" && e.msg.canFind("300 ms"), e is null ? "no timeout" : e.msg);
+    enforce(MonoTime.currTime - start < 3.seconds, "the timeout took too long");
+    enforce(firstRow(conn, "SELECT 'after'").getString(0) == "after", "unusable after the timeout");
+
+    // extended protocol, in a transaction block: the block fails, as after any error
+    conn.begin();
+    conn.exec("SELECT 1");
+    enforce(collectException!StatementTimeoutException(conn.query("SELECT pg_sleep(?)", 5)
+            .close()) !is null,
+            "no timeout with the extended protocol");
+    enforce(conn.transactionFailed, "the block didn't fail");
+    conn.rollback();
+
+    // a quick statement keeps its result; a change while a request runs applies from the next one
+    enforce(firstRow(conn, "SELECT pg_sleep(0.1)::text || 'quick'").getString(0) == "quick", "a quick statement");
+    conn.commandTimeout = 5.seconds;
+    auto r = conn.querySimple("SELECT 1; SELECT pg_sleep(1); SELECT 2");
+    conn.commandTimeout = 300.msecs;
+    r.close(); // reads the rest of the response, pg_sleep(1) included, under the 5 seconds
+    enforce(!conn.isBusy, "the request didn't end");
+    enforce(collectException!StatementTimeoutException(conn.exec("SELECT pg_sleep(1)")) !is null,
+            "the change didn't apply to the next request");
+
+    // a user's cancel stays a plain ServerException
+    conn.commandTimeout = 5.seconds;
+    {
+        import core.thread : Thread;
+
+        auto canceller = new Thread({ Thread.sleep(300.msecs); conn.cancel(); });
+        canceller.start();
+        auto c = collectException!ServerException(conn.exec("SELECT pg_sleep(3)"));
+        canceller.join();
+        enforce(c !is null && c.sqlState == "57014" && cast(StatementTimeoutException) c is null,
+                c is null ? "not cancelled" : c.msg);
+    }
+
+    // COPY has no command timeout
+    conn.commandTimeout = 100.msecs;
+    auto copy = conn.copyOut("COPY (SELECT 'row' FROM pg_sleep(0.5)) TO STDOUT");
+    size_t rows;
+    foreach (line; copy)
+        rows++;
+    enforce(rows == 1 && !conn.isBusy, "COPY");
+
+    conn.resetSession();
+    enforce(conn.commandTimeout == Duration.zero, "resetSession kept the timeout");
+
+    // the option, and the pool
+    auto o = serverOptions();
+    o.commandTimeout = 1.seconds;
+    auto pool = new ConnectionPool(o, PoolOptions(1));
+    scope (exit)
+        pool.close();
+    {
+        auto p = pool.lockConnection();
+        enforce(p.commandTimeout == 1.seconds, "the option");
+        start = MonoTime.currTime;
+        enforce(collectException!StatementTimeoutException(p.exec("SELECT pg_sleep(5)")) !is null,
+                "the option's timeout");
+        enforce(MonoTime.currTime - start < 4.seconds, "the option's timeout took too long");
+        p.commandTimeout = Duration.zero;
+    }
+    enforce(pool.idleConnections == 1, "the connection wasn't returned for reuse");
+    enforce(pool.lockConnection().commandTimeout == 1.seconds, "the pool kept the borrower's timeout");
+}
+
 /// Pipelines: one round trip, results in order, error semantics of both modes, no cache.
 void testPipelines()
 {

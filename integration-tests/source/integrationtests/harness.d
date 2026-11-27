@@ -62,6 +62,7 @@ immutable TestCase[] allTests = [
     TestCase("several result sets", &testMultipleResults, true),
     TestCase("transactions and savepoints", &testTransactions, true),
     TestCase("statement_timeout, idle cancel", &testStatementTimeout, true),
+    TestCase("command timeout (client side)", &testCommandTimeout, true),
     TestCase("pipelines", &testPipelines, true),
     TestCase("struct mapping: query!T, queryRow!T, queryValue!T, insert", &testStructMapping, true),
     TestCase("bulk insert: several statements, atomic", &testBulkInsert, true),
