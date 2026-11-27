@@ -4,7 +4,11 @@ All notable changes to postgresql-native are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.8.0 (2026-11-27)
+
+A client-side command timeout that cancels the statement and keeps the
+connection, reported as `StatementTimeoutException` (#62); dbwire 0.9.10.
+A minor release: new API.
 
 ### Added
 
